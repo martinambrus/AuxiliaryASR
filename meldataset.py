@@ -6,7 +6,6 @@ import time
 import random
 import numpy as np
 import random
-import soundfile as sf
 
 import torch
 from torch import nn
@@ -14,8 +13,9 @@ import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
 
-from g2p_en import G2p
-
+from nltk.tokenize import word_tokenize
+#import phonemizer
+import torchaudio.functional as AF
 import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -23,69 +23,122 @@ from text_utils import TextCleaner
 np.random.seed(1)
 random.seed(1)
 DEFAULT_DICT_PATH = osp.join(osp.dirname(__file__), 'word_index_dict.txt')
-SPECT_PARAMS = {
-    "n_fft": 2048,
-    "win_length": 1200,
-    "hop_length": 300
-}
-MEL_PARAMS = {
-    "n_mels": 80,
-    "n_fft": 2048,
-    "win_length": 1200,
-    "hop_length": 300
-}
+# SPECT_PARAMS = {
+#     "n_fft": 2048,
+#     "win_length": 1200,
+#     "hop_length": 300
+# }
+# MEL_PARAMS = {
+#     "n_mels": 80,
+#     "n_fft": 2048,
+#     "win_length": 1200,
+#     "hop_length": 300
+# }
 
+#global_phonemizer = phonemizer.backend.EspeakBackend(language='en-us', preserve_punctuation=True,  with_stress=True)
 class MelDataset(torch.utils.data.Dataset):
     def __init__(self,
                  data_list,
                  dict_path=DEFAULT_DICT_PATH,
-                 sr=24000
+                 sr=24000,
+                 spect_params={
+                     "n_fft": 2048,
+                     "win_length": 1200,
+                     "hop_length": 300
+                 },
+                 mel_params={
+                     "n_mels": 80
+                 }
                 ):
 
-        spect_params = SPECT_PARAMS
-        mel_params = MEL_PARAMS
-
-        _data_list = [l[:-1].split('|') for l in data_list]
-        self.data_list = [data if len(data) == 3 else (*data, 0) for data in _data_list]
+        self.data_list = data_list
         self.text_cleaner = TextCleaner(dict_path)
         self.sr = sr
 
-        self.to_melspec = torchaudio.transforms.MelSpectrogram(**MEL_PARAMS)
+        self.to_melspec = torchaudio.transforms.MelSpectrogram(**mel_params)
+
+        # https://github.com/yl4579/StyleTTS/issues/57
         self.mean, self.std = -4, 4
-        
-        self.g2p = G2p()
 
     def __len__(self):
         return len(self.data_list)
 
     def __getitem__(self, idx):
-        data = self.data_list[idx]
-        wave, text_tensor, speaker_id = self._load_tensor(data)
-        wave_tensor = torch.from_numpy(wave).float()
-        mel_tensor = self.to_melspec(wave_tensor)
+        try:
+            data = self.data_list[idx]
+            wave, text_tensor, speaker_id = self._load_tensor(data)
+            wave_tensor = torch.from_numpy(wave).float()
+            mel_tensor = self.to_melspec(wave_tensor)
 
-        if (text_tensor.size(0)+1) >= (mel_tensor.size(1) // 3):
-            mel_tensor = F.interpolate(
-                mel_tensor.unsqueeze(0), size=(text_tensor.size(0)+1)*3, align_corners=False,
-                mode='linear').squeeze(0)
+            if (text_tensor.size(0)+1) >= (mel_tensor.size(1) // 3):
+                mel_tensor = F.interpolate(
+                    mel_tensor.unsqueeze(0), size=(text_tensor.size(0)+1)*3, align_corners=False,
+                    mode='linear').squeeze(0)
 
-        acoustic_feature = (torch.log(1e-5 + mel_tensor) - self.mean)/self.std
+            acoustic_feature = (torch.log(1e-5 + mel_tensor) - self.mean)/self.std
 
-        length_feature = acoustic_feature.size(1)
-        acoustic_feature = acoustic_feature[:, :(length_feature - length_feature % 2)]
+            length_feature = acoustic_feature.size(1)
+            acoustic_feature = acoustic_feature[:, :(length_feature - length_feature % 2)]
 
-        return wave_tensor, acoustic_feature, text_tensor, data[0]
+            return wave_tensor, acoustic_feature, text_tensor, data[0]
+        except Exception as e:
+            try:
+                wave_path, text, speaker_id = data
+                print(f"Error for wave path: {wave_path}, skipping - {e}")
+            except Exception as e2:
+                print(f"Error for wave data: {data}, skipping - {e2}")
+
+            # Fallback to another index to keep training going
+            new_idx = (idx + 1) % len(self.data_list)
+            return self.__getitem__(new_idx)
 
     def _load_tensor(self, data):
         wave_path, text, speaker_id = data
-        speaker_id = int(speaker_id)
-        wave, sr = sf.read(wave_path)
+        speaker_id = int(speaker_id) if speaker_id else 0
 
-        # phonemize the text
-        ps = self.g2p(text.replace('-', ' '))
-        if "'" in ps:
-            ps.remove("'")
+        wave_tensor, sr = torchaudio.load(wave_path)
+
+        if wave_tensor.size(0) > 1:
+            wave_tensor = wave_tensor.mean(dim=0)
+            print("using mono track from stereo WAV file: ", wave_path)
+        else:
+            wave_tensor = wave_tensor.squeeze(0)
+
+        # convert into the correct sample rate, if not correct yet
+        if sr != self.sr:
+            wave_tensor = AF.resample(wave_tensor, sr, self.sr)
+            print("resampling: ", wave_path, ", from: ", sr, ", to: ", self.sr)
+        wave = wave_tensor.numpy()
+
+        # # phonemize the text
+        # ps = self.g2p(text.replace('-', ' '))
+        # if "'" in ps:
+        #     ps.remove("'")
+
+        # if wave.shape[-1] == 2:
+        #     wave = wave[:, 0].squeeze()
+        # if sr != 24000:
+        #     wave = librosa.resample(wave, orig_sr=sr, target_sr=24000)
+        #     print(wave_path, sr)
+
+        #ps = global_phonemizer.phonemize([text])
+        #print(ps[0])
+        # print("-----------phonemized------------")
+        #ps = word_tokenize(ps[0])
+        #print(text)
+        ps = word_tokenize(text)
+        #print(ps)
+        ps = ' '.join(ps)
+        #print(ps)
+          # phonemize the text
+        ps = ps.replace("(", "-")
+        ps = ps.replace(")", "-")
+
+
         text = self.text_cleaner(ps)
+        #print(text)
+        #exit()
+        # print("-----------cleaned----------------")
         blank_index = self.text_cleaner.word_index_dictionary[" "]
         text.insert(0, blank_index) # add a blank at the beginning (silence)
         text.append(blank_index) # add a blank at the end (silence)

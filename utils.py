@@ -12,6 +12,7 @@ from torch import nn
 import jiwer
 
 import matplotlib.pylab as plt
+from pathlib import Path
 
 def calc_wer(target, pred, ignore_indexes=[0]):
     target_chars = drop_duplicated(list(filter(lambda x: x not in ignore_indexes, map(str, list(target)))))
@@ -28,22 +29,20 @@ def drop_duplicated(chars):
             ret_chars.append(curr)
     return ret_chars
 
-def build_criterion(critic_params={}):
+def build_criterion(critic_params={}, entropy_params={}):
     criterion = {
-        "ce": nn.CrossEntropyLoss(ignore_index=-1),
+        "ce": nn.CrossEntropyLoss(ignore_index=-1, **entropy_params),
         "ctc": torch.nn.CTCLoss(**critic_params.get('ctc', {})),
     }
     return criterion
 
 def get_data_path_list(train_path=None, val_path=None):
-    if train_path is None:
-        train_path = "Data/train_list.txt"
-    if val_path is None:
-        val_path = "Data/val_list.txt"
+    train_path = Path(train_path) if train_path is not None else Path("Data") / "train_list.txt"
+    val_path = Path(val_path) if val_path is not None else Path("Data") / "val_list.txt"
 
-    with open(train_path, 'r') as f:
+    with train_path.open('r') as f:
         train_list = f.readlines()
-    with open(val_path, 'r') as f:
+    with val_path.open('r') as f:
         val_list = f.readlines()
 
     return train_list, val_list
@@ -55,6 +54,21 @@ def plot_image(image):
                    interpolation='none')
 
     fig.canvas.draw()
-    plt.close()
+    plt.close(fig)
 
     return fig
+
+def diagonal_attention_prior(attn, text_lengths, mel_lengths, sigma=0.5):
+    """Calculate diagonal attention loss."""
+    B, T_text, T_mel = attn.size()  # usually [B, T_text, T_mel]
+    device = attn.device
+
+    # Normalize indices
+    text_pos = torch.arange(T_text, device=device).unsqueeze(1).float() / T_text
+    mel_pos = torch.arange(T_mel, device=device).unsqueeze(0).float() / T_mel
+    expected = torch.exp(-((text_pos - mel_pos) ** 2) / (2 * sigma ** 2))  # [T_text, T_mel]
+    expected = expected / expected.max()  # Normalize
+
+    expected = expected.unsqueeze(0).expand(B, -1, -1)  # [B, T_text, T_mel]
+    loss = torch.mean(attn * (1.0 - expected))  # Encourage attention mass to lie on the diagonal
+    return loss

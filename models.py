@@ -17,7 +17,7 @@ class ASRCNN(nn.Module):
                  n_token=35,
                  n_layers=6,
                  token_embedding_dim=256,
-
+                 location_kernel_size=63,
     ):
         super().__init__()
         self.n_token = n_token
@@ -37,7 +37,8 @@ class ASRCNN(nn.Module):
         self.asr_s2s = ASRS2S(
             embedding_dim=token_embedding_dim,
             hidden_dim=hidden_dim//2,
-            n_token=n_token)
+            n_token=n_token,
+            location_kernel_size=location_kernel_size)
 
     def forward(self, x, src_key_padding_mask=None, text_input=None):
         x = self.to_mfcc(x)
@@ -62,8 +63,13 @@ class ASRCNN(nn.Module):
         return x
 
     def length_to_mask(self, lengths):
-        mask = torch.arange(lengths.max()).unsqueeze(0).expand(lengths.shape[0], -1).type_as(lengths)
-        mask = torch.gt(mask+1, lengths.unsqueeze(1)).to(lengths.device)
+        mask = (
+            torch.arange(lengths.max(), device=lengths.device)
+            .unsqueeze(0)
+            .expand(lengths.shape[0], -1)
+            .type_as(lengths)
+        )
+        mask = torch.gt(mask + 1, lengths.unsqueeze(1))
         return mask
 
     def get_future_mask(self, out_length, unmask_future_steps=0):

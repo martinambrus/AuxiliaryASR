@@ -4,14 +4,16 @@ device: "cuda"
 epochs: 200
 batch_size: 64
 pretrained_model: ""
+load_only_params: false
 train_data: "Data/train_list.txt"
 val_data: "Data/val_list.txt"
+phoneme_maps_path: "Data/word_index_dict.txt"
 
 preprocess_parasm:
   sr: 24000
   spect_params:
-    n_fft: 2048
-    win_length: 1200
+    n_fft: 1024
+    win_length: 1024
     hop_length: 300
   mel_params:
     n_mels: 80
@@ -19,8 +21,26 @@ preprocess_parasm:
 model_params:
    input_dim: 80
    hidden_dim: 256
-   n_token: 80
-   token_embedding_dim: 256
+   token_embedding_dim: 512
+   n_layers: 5
+   location_kernel_size: 31
 
 optimizer_params:
   lr: 0.0005
+  pct_start: 0.0
+
+# this is a very basic early stopping based off learning rate - when it falls to 0 and remains there for 3 epochs, the training stops
+enable_early_stopping: True
+
+# for more stable learning, first X epochs should be trained with audio files of similar lengths grouped together
+# this option determines epoch during which the sorted dataset will be swapped for a shuffled one
+# default: 10
+sortagrad_switch_to_shuffled_dataset_epoch: 10
+
+# make ASR learn to read phonemes from left to right, not randomly
+use_diagonal_attention_prior: True
+diagonal_attention_prior_weight: 0.1
+
+# stabilizes ASR training for smaller datasets
+entropy_params:
+  label_smoothing: 0.1

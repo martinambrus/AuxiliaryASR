@@ -1,34 +1,30 @@
-LJSpeech-1.1/wavs/LJ047-0044.wav|Oswald was, however, willing to discuss his contacts with Soviet authorities. He denied having any involvement with Soviet intelligence agencies|0
-LJSpeech-1.1/wavs/LJ031-0038.wav|The first physician to see the President at Parkland Hospital was Dr. Charles J. Carrico, a resident in general surgery.|0
-LJSpeech-1.1/wavs/LJ049-0026.wav|On occasion the Secret Service has been permitted to have an agent riding in the passenger compartment with the President.|0
-LJSpeech-1.1/wavs/LJ009-0114.wav|Mr. Wakefield winds up his graphic but somewhat sensational account by describing another religious service, which may appropriately be inserted here.|0
-LJSpeech-1.1/wavs/LJ028-0506.wav|A modern artist would have difficulty in doing such accurate work.|0
-LJSpeech-1.1/wavs/LJ031-0070.wav|Dr. Clark, who most closely observed the head wound,|0
-LJSpeech-1.1/wavs/LJ034-0198.wav|Euins, who was on the southwest corner of Elm and Houston Streets testified that he could not describe the man he saw in the window.|0
-LJSpeech-1.1/wavs/LJ026-0068.wav|Energy enters the plant, to a small extent,|0
-LJSpeech-1.1/wavs/LJ004-0096.wav|the fatal consequences whereof might be prevented if the justices of the peace were duly authorized|0
-LJSpeech-1.1/wavs/LJ018-0239.wav|His disappearance gave color and substance to evil reports already in circulation that the will and conveyance above referred to|0
-LJSpeech-1.1/wavs/LJ036-0103.wav|The police asked him whether he could pick out his passenger from the lineup.|0
-LJSpeech-1.1/wavs/LJ017-0131.wav|even when the high sheriff had told him there was no possibility of a reprieve, and within a few hours of execution.|0
-LJSpeech-1.1/wavs/LJ046-0184.wav|but there is a system for the immediate notification of the Secret Service by the confining institution when a subject is released or escapes.|0
-LJSpeech-1.1/wavs/LJ014-0263.wav|When other pleasures palled he took a theatre, and posed as a munificent patron of the dramatic art.|0
-LJSpeech-1.1/wavs/LJ012-0235.wav|While they were in a state of insensibility the murder was committed.|0
-LJSpeech-1.1/wavs/LJ036-0077.wav|Roger D. Craig, a deputy sheriff of Dallas County,|0
-LJSpeech-1.1/wavs/LJ013-0164.wav|who came from his room ready dressed, a suspicious circumstance, as he was always late in the morning.|0
-LJSpeech-1.1/wavs/LJ031-0202.wav|Mrs. Kennedy chose the hospital in Bethesda for the autopsy because the President had served in the Navy.|0
-LJSpeech-1.1/wavs/LJ021-0145.wav|From those willing to join in establishing this hoped-for period of peace,|0
-LJSpeech-1.1/wavs/LJ021-0066.wav|together with a great increase in the payrolls, there has come a substantial rise in the total of industrial profits|0
-LJSpeech-1.1/wavs/LJ009-0238.wav|After this the sheriffs sent for another rope, but the spectators interfered, and the man was carried back to jail.|0
-LJSpeech-1.1/wavs/LJ035-0019.wav|drove to the northwest corner of Elm and Houston, and parked approximately ten feet from the traffic signal.|0
-LJSpeech-1.1/wavs/LJ017-0044.wav|and the deepest anxiety was felt that the crime, if crime there had been, should be brought home to its perpetrator.|0
-LJSpeech-1.1/wavs/LJ016-0020.wav|He never reached the cistern, but fell back into the yard, injuring his legs severely.|0
-LJSpeech-1.1/wavs/LJ008-0294.wav|nearly indefinitely deferred.|0
-LJSpeech-1.1/wavs/LJ012-0035.wav|the number and names on watches, were carefully removed or obliterated after the goods passed out of his hands.|0
-LJSpeech-1.1/wavs/LJ016-0179.wav|contracted with sheriffs and conveners to work by the job.|0
-LJSpeech-1.1/wavs/LJ016-0138.wav|at a distance from the prison.|0
-LJSpeech-1.1/wavs/LJ027-0052.wav|These principles of homology are essential to a correct interpretation of the facts of morphology.|0
-LJSpeech-1.1/wavs/LJ014-0010.wav|yet he could not overcome the strange fascination it had for him, and remained by the side of the corpse till the stretcher came.|0
-LJSpeech-1.1/wavs/LJ033-0047.wav|I noticed when I went out that the light was on, end quote,|0
-LJSpeech-1.1/wavs/LJ040-0027.wav|He was never satisfied with anything.|0
-LJSpeech-1.1/wavs/LJ048-0228.wav|and others who were present say that no agent was inebriated or acted improperly.|0
-LJSpeech-1.1/wavs/LJ003-0111.wav|He was in consequence put out of the protection of their internal law, end quote. Their code was a subject of some curiosity.|0
+AudioData/T-0000218.wav|bˌʌt ɪf juː lˈænd səksˈɛsfəli , juː kæn ɡɛt ɹᵻpˈɛɹz ænd mˈoːɹ ˈæmoʊ ænd fjˈuːəl wɪðˌaʊt lˈuːzɪŋ ɐ plˈeɪn . ænd ðˈɛn ðɛɹz ˈɑːpʃən fˈoːɹ , ðə pˈænzi wˈeɪ ˈaʊt : ˈɔːɾoʊlˈænd. «|0
+AudioData/T-0008297.wav|ænd aɪm ɡˌənə ɡˌoʊ ɪnðɪ ˈɑːpəzˌɪt dᵻɹˈɛkʃən wɪððə kˈʌlɚɹ ʌvðə tˈɛkst . jˈɛh , blˈæk wɪð wˈaɪt ɚɹˈaʊnd ðɪ ˈɛdʒᵻz. «|0
+AudioData/T-0002650.wav|wˈɜːθ ɐ ʃˈɑːt , ðˌoʊ . nˈɛkst ˌʌp ɪz jˈɛt ɐnˈʌðɚ ɡˈʊdwɪl wˌɪtʃ aɪ dˈɪdnt ɡˌoʊ tʊ ɪnðə lˈæst vˈɪdɪoʊ . ænd jˈɛh , ðɪs wˈʌnz ɐ pɹˈɪɾi tˈɪpɪkəl ɡˈʊdwɪl fɔːɹ ɚɹˈaʊnd hˈɪɹ. «|0
+AudioData/T-0000047.wav|ɪf sˈʌmθɪŋ ɪz ɪnðə wˈeɪ ʌv sˈʌmθɪŋ juː wˈɔnt tə sˈiː , wˈɛl ðæts dʒˈʌst tˈuː dˈɑːɹn bˈæd bɪkˈʌz juː kˈænt mˈuːv ðə kˈæmɹə bˌʌt ˈoʊnli sˈoʊ mˌʌtʃ . ænd ðɛɹ ɪz nˈoʊ bˈɪld mˈoʊd , sˌoʊ juː kˈænt ɹᵻmˈɑːdəl jʊɹ kˈæsəl vˈɛɹi mˈʌtʃ , ˈiːðɚ. «|0
+AudioData/T-0009540.wav|aɪ wɪl ˌæbsəlˈuːtli biː ɡˌoʊɪŋ bˈæk θɹˈɪftɪŋ ɪnpˈɜːsən wɛnˌɛvɚɹ ɪt mˌeɪks sˈɛns , bˌʌt jˈɛh , aɪm dʒˈʌst nˌɑːt dˌuːɪŋ ðæt ɹˈaɪt nˈaʊ . θˈɪŋz ɑːɹ tˈuː wˈɪɹd. «|0
+AudioData/T-0013765.wav|sˌoʊ jˈɛh , ðɛɹz ðə kˈɑːɹd ɪtsˈɛlf , ðɪ ɚɹˈɪdʒɪnəl ˌaɪˌɛsˈeɪ mˈɑːdəl . ðæt ɪz ɐ ˈæstɚɹˌɪsk tˈʌn ˈæstɚɹˌɪsk ʌv swˈɪtʃ kəmˈændz ðɛɹ fɔːɹ ðiːz ˈʌ , lˈɪɾəl dʒˈʌmpɚz . ˌɛmˌɛmˈɛm , pɹˈɑːdʌkt lˈaɪsəns. «|0
+AudioData/T-0005129.wav|ðeɪ nˈoʊ aɪ wʌz ˈɪntɹɛstᵻd ɪn ðiːz kˈaɪnd ʌv θˈɪŋz , hˌævɪŋ sˈiːn maɪ pɹˈiːviəs vˈɪdɪoʊz , sˌoʊ ðeɪ hˈʊkt mˌiː ˌʌp wɪð ɐ fjˈuː mˈɑːdəlz , nˈoʊ stɹˈɪŋz ɐtˈætʃt . ænd juː nˈoʊ , aɪ kæn dˈuː wʌtˈɛvɚɹ aɪ wˈɔnt wɪð ˈɛm. «|0
+AudioData/T-0027241.wav|aɪ pɹɪfˈɜː ðɪ ˌoʊvɚhˈɛd vjˈuː , bˌʌt ðɪ ɪnsˈaɪd vjˈuː ɪz tˈoʊɾəli ˈɔːsʌm ænd ɪt fˈiːlz ɐ lˈɪɾəl bˈɪt kwˈɪkɚ . ænd ɪf ɪts lˈʊkɪŋ ɐ bˈɪt fəmˈɪlɪɹ tə juː , tˈeɪk ɐ lˈʊk æt tˈɛst dɹˈaɪv ɹˌoʊmən θɹˈiː ɔnðə pˌiːsˈiː. «|0
+AudioData/T-0013653.wav|bˈɜːdz . bˈɜːdz . ðɪs wʌzðɪ ɛɡzˈæmpəl kˌɑːmpəzˈɪʃən. «|0
+AudioData/T-0012519.wav|ɡɑːt wˈʌn hˈɪɹ fɹʌm vˈɪns . `` ɛndʒˈɔɪ jʊɹ mˈɑːkɪŋbˌoːɹd . mˈoʊst sˈɔftwɛɹ ɛkspˈɛkts ɪɾ ɪn slˈɑːt nˈʌmbɚ fˈoːɹ . '' ɡˈʊd tə nˈoʊ. «|0
+AudioData/T-0033400.wav|aɪ hˈoʊp juː ɛndʒˈɔɪd ɪt , ænd ɪf nˈɑːt , aɪm ʃˈʊɹ juːl lˈɛt mˌiː nˈoʊ ɪnðə kˈɑːmɛnts . ænd ˈɔːl ðə ɡˈeɪmz ðæt aɪ mˈɪst ɔːɹ , juː nˈoʊ , hˈævənt plˈeɪd jˈɛt. «|0
+AudioData/T-0045076.wav|jˈɛh . sˌoʊ hˈɪɹz ɐn ˌɪntɚplˈeɪ mˈʌɡ . ðæt lˈʊks lədʒˈɪt ˈoʊld . ðæts ˈɔːsʌm . lˈʌv ˌɪntɚplˈeɪ stˈʌf . ɡɑːt sˌʌm dˈɪsks. «|0
+AudioData/T-0022678.wav|lˈʊk æt ðæt θˈɪŋ , mˈæn . aɪ lˈʌv ðiːz fˈoʊn dɪvˈaɪsᵻz , ænd ðɪs ɪz wˈʌn ðæt aɪ nˈɛvɚ jˈuːzd , dʒˈʌst ðə pˈɑːm pˈaɪlət pɹˈoʊ . vˈɛɹi kˈuːl , θˈæŋks sˈoʊ mˌʌtʃ. «|0
+AudioData/T-0038762.wav|ˈeɪ , wˈɛl ... ðə vˈɪdɪoʊ kˌeɪpəbˈɪlᵻɾiz ʌvðə sˈɪstəm sˈiːmd təbi ɐ bˈɪt lˈɛs ðɐn hˈoʊpt fɔːɹ . aɪ mˈiːn , aɪ ɡˈɛs ðæts kˈaɪndə wʌt juː ɡɛt fɔːɹ bˌiːɪŋ æz ˈoʊld ˌæzɪtˈɪz , bˌʌt wʌt ðə hˈɛk ɪz ðˈɪs , ðˌoʊ ? «|0
+AudioData/T-0031720.wav|aɪ lˈʌv ðiːz tˈuː , ðˌoʊ ! ðˈɪswˌʌn lˈʊks vˈɛɹi lədʒˈɪt , bˌʌt aɪ ˈɔːlsoʊ ɹˈiəli ɛndʒˈɔɪ ðə ɹˈeɪnboʊ ætˈɑːɹɹi lˈoʊɡoʊ ˌɔn ðˈætwˌʌn . ɡɑːt ɐ kˈʌstəm ˌɛlˌɑːɹdʒˈiː mˈɑːdəl ænd sˈɪɹiəl nˈʌmbɚ ænd ˈɛvɹɪθˌɪŋ ðˈɛɹ , kˈɔːz jˈɛh , ˈɑːbviəsli ˌɪzənt ɡˌənə biː ðɪ ɚɹˈɪdʒɪnəl sˈɪɹiəl nˈʌmbɚ. «|0
+AudioData/T-0013422.wav|bˌʌt , jˈɛh , fɚðə mˈoʊst pˈɑːɹt , aɪm dʒˈʌst kˈʌɾɪŋ ˈɔf ˈɔːl θˈɪŋz . ænd , ɪn fˈækt , tə ðæt ˈɛnd , sˈʌmθɪŋ ˈɛls ðæt ɹˈiəli sˈʌks ɪz maɪ sˌɪtʃuːˈeɪʃən wɪð ˈiːvən ɹᵻsˈiːvɪŋ pˈækɪdʒᵻz. «|0
+AudioData/T-0019673.wav|ˌɛldʒˌiːˈɑːɹ ʌnbˈɑːksɪŋ θˈɪŋz juː sˈɛnt vˈɪdɪoʊ . hˈævənt dˈʌn wˈʌn ʌv ðiːz ˈɪn , ˈoʊ mˈæn , ˈɔːlmoʊst hˈæf ɐ jˈɪɹ , aɪ ɡˈɛs ! lˈæst wˈʌn aɪ dˈɪd wʌz ɪn ˈeɪpɹəl , sˌoʊ ðiːz θˈɪŋz hɐvbɪn pˈaɪlɪŋ ˈʌp. «|0
+AudioData/T-0031030.wav|ɪt hɐz tə ɹᵻmˈaɪnd juː . mˌeɪks mˌiː wˈɔnə ɡˌoʊ ˈaʊt ɹˈaɪt nˈaʊ . ænd bˈaɪ pˈoʊstɚz ʌv ðˌɛm. «|0
+AudioData/T-0003508.wav|aɪ wɛnt θɹuː ðə sˈɜːvɪs mˈænjuːəl . ɪɾ ɪz nˌɑːt mˈɛnʃənd æɾ ˈɔːl ɪn hˈɪɹ . sˌoʊ aɪ θˈɪŋk mˈeɪbiː ðɪs ɪz lˈaɪk sˈʌmθɪŋ wʌz ɹˈɔŋ fɹʌmðə fˈæktɚɹi. «|0
+AudioData/T-0017568.wav|ɪts lˈaɪk ɐ sˈaɪfˌaɪ kˈɜːs wˈɜːd , lˈaɪk hˈɜːmən ænd ðə fɹˈɑːks . hˌaʊ fɹˈɑːkɪn ˈɔːsʌm ɪz ðˈæt ? «|0
+AudioData/T-0000688.wav|ænd ɪt ɡɑːt ðæt ˈɔːdɪˌoʊ ˈaʊt fɔːɹ mˈɪks , ɹˈɪðəm , kˈɔːɹd , bˈeɪs , ænd mˈɛlədi ˈɔːl sˈɛpɹətli æz wˈɛl æz ɐ klˈɑːk ɪn ænd ˈaʊt . θɹˈiː ænd ɐ hˈæf mˈɪl kənˈɛkʃənz , ɪts sˌoʊ kˈuːl. «|0
+AudioData/T-0036446.wav|ɪn fˈækt , ðɛɹz nˌɑːt ˈiːvən ˌɛni ɡˈoʊld ɔːɹ sˈɛlɪŋ ʌv ˈaɪɾəmz æɾ ˈɔːl , sˌoʊ ðæts ɐ bˈɪɡ pˈɑːɹt ʌv ˈɛldɚ skɹˈoʊlz dʒˈʌst ɡɔn ɹˈaɪt ðˈɛɹ . sˈoʊ , ˈʌ ... wˌʌts lˈɛft ? «|0
+AudioData/T-0042132.wav|ˈɛnɪwˌeɪ pˈaʊɚɹɪŋ ɔnðə dˈɪdʒɪˌoʊ bˈuːts ˌʌp ðɪs nˈɪfti splˈæʃ skɹˈiːn , fˈɑːloʊd baɪ ɐ lˈaɪv fˈiːd ˈæktɪŋ æz ɐ vjˈuːfaɪndɚ . jˈɛp , ðɛɹz nˈoʊ ˈɑːptɪkəl vjˈuːfaɪndɚɹ æɾ ˈɔːl ˌɔn hˈɪɹ , ˈoʊnli ɐn ˌɛlsˌiːdˈiː. «|0
+AudioData/T-0029509.wav|wˌaɪl aɪ dˈoʊnt hæv ˌɛni mˈɛmɚɹiz ʌv plˈeɪɪŋ ðɪs æz ɐ jˈʌŋɡɪn , ɪt ʃˈʊɹ sˈiːmz lˈaɪk ðə kˈaɪnd ʌv θˈɪŋ aɪ mˌaɪɾəv ɛndʒˈɔɪd . aɪ mˈiːn dʒˈʌst lˈʊk æt ðæt kˈʌvɚɹ ˈɑːɹt , aɪ wˌʊdəv bˌɪn ˈɔːl ˌoʊvɚ ðɪs wɛn aɪ wʌz sˈɛvən ɔːɹ ˈeɪt jˈɪɹz ˈoʊld. «|0
+AudioData/T-0043600.wav|sˈʌtʃ ɐ ɡɹˈeɪt tˈaɪm ʌv jˈɪɹ tə ɡˌoʊ θɹˈɪftɪŋ . spɹˈɪŋ , ˈɛvɹɪbˌɑːdiz dˌuːɪŋ ðɛɹ klˈiːnɪŋ , ˈɔːl ðæt stˈʌf . sˈoʊ ... «|0
+AudioData/T-0042891.wav|aɪ wʌz wˈʌndɚɹɪŋ kˈɔːz aɪ hæv tˈuː sˈaʊnd kˈɑːɹdz ɪn ðɛɹ ænd ˌeɪdˌʌbəljˌuːˈiː sˈɪksti fˈoːɹ ɡˈoʊld ænd ðə vˈɔːɹtɛks tˈuː . aɪ hæv ðə ɡˈeɪm pˈoːɹt dˌɪsˈeɪbəld ɪn ðˈætwˌʌn ænd ɪts ɛnˈeɪbəld ˌɔn ˌeɪdˌʌbəljˌuːˈiː sˈɪksti fˈoːɹ ænd ɪt kˈɛpt ðæt tˈuː. «|0
+AudioData/T-0013784.wav|sˌoʊ ɚɹˈaʊnd ðə bˈæk ʌvðə vˌiːsˌiːˈɑːɹ hˈɪɹ ɪz wˌɛɹ ðə bˈɪznəs ɪz ɡˌənə hˈæpən . ænd ɪt sˈɛz tə jˈuːz ðə hˈaɪɪst kwˈɔlᵻɾi kəmpˈɑːzɪt kˈeɪbəlz juː kæn ɡˈɛt . ˈʌ , ðiːz ɑːɹ ðə hˈaɪɪst kwˈɔlᵻɾi wˈʌnz aɪ hæv ˈʌ , fɹʌm ɐkˈuːstɪk ɹᵻsˈɜːtʃ. «|0
+AudioData/T-0031825.wav|ænd ɪts ɡɑːt ðˈɪs , ɪt lˈʊks lˈaɪk , plˈʌɡd ˌɪntʊ ðə pˈaʊɚ θˈɪŋ , aɪ dˈoʊnt nˈoʊ wˈʌt ... wʊd ðɪs plˈʌɡ ˌɪntʊ sˌʌm ˈʌðɚ kˈaɪnd ʌv ɐdˈæptɚɹ ɔːɹ ... «|0
+AudioData/T-0025466.wav|æz juː kæn sˈiː hˈɪɹ , aɪ kæn klˈɪk lˈaɪk klˈɪk klˈɪk klˈɪk klˈɪkɪŋ ɚɹˈaʊnd . ðæts fˈaɪn ! «|0
+AudioData/T-0002640.wav|ɪɾ ˈɔːlsoʊ hɐz ɐ fˈoːɹplˈeɪɚ splˈɪtskɹˈiːn mˌʌltɪplˈeɪɚ mˈoʊd , wˌɪtʃ ɪz nˈaɪs , sˈɪns ðɛɹz nˈoʊ ˈɑːnlaɪn ɡˈeɪmɪŋ . ˈɔːlsoʊ wˈɜːθ nˈoʊɾɪŋ ɪz ɐ vˈɜːʒən fɚðɪ ɚɹˈɪdʒɪnəl ˈɛksbˈɑːks. «|0

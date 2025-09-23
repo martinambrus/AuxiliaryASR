@@ -29,10 +29,15 @@ class Trainer(object):
                  config={},
                  device=torch.device("cpu"),
                  logger=logger,
-                 train_dataloader=None,
-                 val_dataloader=None,
+                 sorted_train_dataloader=None,
+                 shuffled_train_dataloader=None,
+                 sorted_val_dataloader=None,
+                 shuffled_val_dataloader=None,
                  initial_steps=0,
-                 initial_epochs=0):
+                 initial_epochs=0,
+                 switch_sortagrad_dataset_epoch = 10,
+                 use_diagonal_attention_prior = True,
+                 diagonal_attention_prior_weight = 0.1):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -40,13 +45,21 @@ class Trainer(object):
         self.criterion = criterion
         self.optimizer = optimizer
         self.scheduler = scheduler
-        self.train_dataloader = train_dataloader
-        self.val_dataloader = val_dataloader
+        self.sorted_train_dataloader = sorted_train_dataloader
+        self.shuffled_train_dataloader = shuffled_train_dataloader
+        self.train_dataloader = sorted_train_dataloader
+        self.sorted_val_dataloader = sorted_val_dataloader
+        self.shuffled_val_dataloader = shuffled_val_dataloader
+        self.val_dataloader = sorted_val_dataloader
         self.config = config
         self.device = device
         self.finish_train = False
         self.logger = logger
         self.fp16_run = False
+        self.switch_sortagrad_dataset_epoch = switch_sortagrad_dataset_epoch
+        self.use_diagonal_attention_prior = use_diagonal_attention_prior
+        self.diagonal_attention_prior_weight = diagonal_attention_prior_weight
+        self.maxm_mem_usage = 0
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -73,6 +86,7 @@ class Trainer(object):
             load_only_params (bool): Whether to load only model parameters.
 
         """
+        self.logger.info("Loading checkpoint from: %s" % checkpoint_path)
         state_dict = torch.load(checkpoint_path, map_location="cpu")
         self._load(state_dict["model"], self.model)
 
@@ -80,10 +94,13 @@ class Trainer(object):
             self.steps = state_dict["steps"]
             self.epochs = state_dict["epochs"]
             self.optimizer.load_state_dict(state_dict["optimizer"])
+            self.logger.info("Starting training from epoch %i" % state_dict["epochs"])
 
             # overwrite schedular argument parameters
             state_dict["scheduler"].update(**self.config.get("scheduler_params", {}))
             self.scheduler.load_state_dict(state_dict["scheduler"])
+
+        return self.epochs
 
     def _load(self, states, model, force_load=True):
         model_states = model.state_dict()
@@ -121,8 +138,13 @@ class Trainer(object):
 
     @staticmethod
     def length_to_mask(lengths):
-        mask = torch.arange(lengths.max()).unsqueeze(0).expand(lengths.shape[0], -1).type_as(lengths)
-        mask = torch.gt(mask+1, lengths.unsqueeze(1))
+        mask = (
+            torch.arange(lengths.max(), device=lengths.device)
+            .unsqueeze(0)
+            .expand(lengths.shape[0], -1)
+            .type_as(lengths)
+        )
+        mask = torch.gt(mask + 1, lengths.unsqueeze(1))
         return mask
 
     def _get_lr(self):
@@ -152,6 +174,8 @@ class Trainer(object):
         return palette
 
     def run(self, batch):
+        # FIX: trying to fix OOM errors
+        #torch.cuda.empty_cache()
         self.optimizer.zero_grad()
         batch = [b.to(self.device) for b in batch]
         text_input, text_input_length, mel_input, mel_input_length = batch
@@ -162,7 +186,10 @@ class Trainer(object):
         text_mask = self.model.length_to_mask(text_input_length)
         ppgs, s2s_pred, s2s_attn = self.model(
             mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
-        
+
+        if self.use_diagonal_attention_prior:
+            loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, mel_input_length)
+
         loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
                                       text_input, mel_input_length, text_input_length)
 
@@ -171,7 +198,10 @@ class Trainer(object):
             loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
         loss_s2s /= text_input.size(0)
 
-        loss = loss_ctc + loss_s2s
+        if self.use_diagonal_attention_prior:
+            loss = loss_ctc + loss_s2s + self.diagonal_attention_prior_weight * loss_diagonal
+        else:
+            loss = loss_ctc + loss_s2s
         loss.backward()
         torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
         self.optimizer.step()
@@ -181,6 +211,14 @@ class Trainer(object):
                 's2s': loss_s2s.item()}
 
     def _train_epoch(self):
+        # switch dataloader if we're above configured epoch
+        if ( self.epochs == self.switch_sortagrad_dataset_epoch) or ( self.epochs == 0 and self.switch_sortagrad_dataset_epoch <= 0 ) :
+            self.train_dataloader = self.shuffled_train_dataloader
+            self.val_dataloader = self.shuffled_val_dataloader
+            self.logger.info("")
+            self.logger.info("[SortaGrad]: switching sorted to shuffled dataloader at configured epoch %i" % self.epochs)
+            self.logger.info("")
+
         train_losses = defaultdict(list)
         self.model.train()
         for train_steps_per_epoch, batch in enumerate(tqdm(self.train_dataloader, desc="[train]"), 1):
@@ -190,6 +228,15 @@ class Trainer(object):
 
         train_losses = {key: np.mean(value) for key, value in train_losses.items()}
         train_losses['train/learning_rate'] = self._get_lr()
+        self.epochs += 1
+
+        gpu_id = 0
+        allocated = torch.cuda.memory_allocated(gpu_id) / 1024**2
+        if allocated > self.maxm_mem_usage:
+            self.maxm_mem_usage = allocated
+
+        train_losses['gpu/max_allocation_recorded'] = self.maxm_mem_usage
+        train_losses['gpu/current_allocation'] = allocated
         return train_losses
 
     @torch.no_grad()
