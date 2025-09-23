@@ -101,7 +101,9 @@ class MelDataset(torch.utils.data.Dataset):
         self.text_cleaner = TextCleaner(dict_path)
         self.sr = sr
 
-        self.to_melspec = torchaudio.transforms.MelSpectrogram(**mel_params)
+        mel_opts = {**{'sample_rate': sr}, **mel_params, **spect_params}
+        print("Options for MEL spectrogram calculations:", mel_opts)
+        self.to_melspec = torchaudio.transforms.MelSpectrogram(**mel_opts)
 
         self.spec_augment = None
         if spec_augment_params and not validation:
