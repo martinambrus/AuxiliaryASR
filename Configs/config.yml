@@ -25,6 +25,18 @@ model_params:
    token_embedding_dim: 512
    n_layers: 5
    location_kernel_size: 31
+   feature_extractor:
+     type: mfcc  # options: mfcc, log_mel, learnable_filterbank
+     mfcc:
+       n_mfcc: 40
+       n_mels: 80
+     log_mel:
+       n_mels: 80
+     learnable_filterbank:
+       n_mels: 80
+       n_filters: 40
+       init: dct
+       bias: false
 
 optimizer_params:
   lr: 0.0005

@@ -3,7 +3,58 @@ import torch
 from torch import nn
 from torch.nn import TransformerEncoder
 import torch.nn.functional as F
-from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
+from typing import Tuple, Dict, Any
+from layers import MFCC, LearnableFilterbank, Attention, LinearNorm, ConvNorm, ConvBlock
+
+
+def _build_feature_extractor(input_dim: int,
+                             feature_config: Dict[str, Any] = None) -> Tuple[nn.Module, int, str]:
+    if feature_config is None:
+        feature_config = {}
+
+    if isinstance(feature_config, str):
+        feature_config = {'type': feature_config}
+
+    feature_type = feature_config.get('type', 'mfcc')
+    if not isinstance(feature_type, str):
+        raise ValueError("feature_extractor 'type' must be a string")
+    feature_type = feature_type.lower()
+
+    if feature_type == 'mfcc':
+        mfcc_cfg = feature_config.get('mfcc', {}) or {}
+        n_mels = int(mfcc_cfg.get('n_mels', input_dim))
+        n_mfcc = int(mfcc_cfg.get('n_mfcc', max(1, n_mels // 2)))
+        feature_module = MFCC(n_mfcc=n_mfcc, n_mels=n_mels)
+        feature_dim = n_mfcc
+    elif feature_type == 'log_mel':
+        log_cfg = feature_config.get('log_mel', {}) or {}
+        expected_mels = int(log_cfg.get('n_mels', input_dim))
+        if expected_mels != input_dim:
+            raise ValueError(
+                f"Log-mel feature extractor expects input_dim ({input_dim}) to match the number of mel bins "
+                f"({expected_mels}). Please update the configuration to keep them in sync.")
+        feature_module = nn.Identity()
+        feature_dim = expected_mels
+    elif feature_type == 'learnable_filterbank':
+        fb_cfg = feature_config.get('learnable_filterbank', {}) or {}
+        n_mels = int(fb_cfg.get('n_mels', input_dim))
+        if n_mels != input_dim:
+            raise ValueError(
+                f"Learnable filterbank expects input_dim ({input_dim}) to match the configured number of mel bins "
+                f"({n_mels}). Please update the configuration to keep them in sync.")
+        n_filters = int(fb_cfg.get('n_filters', n_mels))
+        init_type = fb_cfg.get('init', 'dct')
+        bias = bool(fb_cfg.get('bias', True))
+        feature_module = LearnableFilterbank(
+            in_channels=n_mels,
+            out_channels=n_filters,
+            bias=bias,
+            init_type=init_type)
+        feature_dim = n_filters
+    else:
+        raise ValueError(f"Unsupported feature extractor type: {feature_type}")
+
+    return feature_module, feature_dim, feature_type
 
 def build_model(model_params={}, model_type='asr'):
     model = ASRCNN(**model_params)
@@ -18,12 +69,17 @@ class ASRCNN(nn.Module):
                  n_layers=6,
                  token_embedding_dim=256,
                  location_kernel_size=63,
+                 feature_extractor=None,
     ):
         super().__init__()
         self.n_token = n_token
         self.n_down = 1
-        self.to_mfcc = MFCC()
-        self.init_cnn = ConvNorm(input_dim//2, hidden_dim, kernel_size=7, padding=3, stride=2)
+        self.feature_extractor, feature_dim, feature_type = _build_feature_extractor(
+            input_dim=input_dim,
+            feature_config=feature_extractor)
+        self.feature_type = feature_type
+        self.feature_dim = feature_dim
+        self.init_cnn = ConvNorm(feature_dim, hidden_dim, kernel_size=7, padding=3, stride=2)
         self.cnns = nn.Sequential(
             *[nn.Sequential(
                 ConvBlock(hidden_dim),
@@ -41,7 +97,7 @@ class ASRCNN(nn.Module):
             location_kernel_size=location_kernel_size)
 
     def forward(self, x, src_key_padding_mask=None, text_input=None):
-        x = self.to_mfcc(x)
+        x = self.feature_extractor(x)
         x = self.init_cnn(x)
         x = self.cnns(x)
 
@@ -55,7 +111,7 @@ class ASRCNN(nn.Module):
             return ctc_logit
 
     def get_feature(self, x):
-        x = self.to_mfcc(x)
+        x = self.feature_extractor(x)
         x = self.init_cnn(x)
         x = self.cnns(x)
         x = self.instance_norm(x)

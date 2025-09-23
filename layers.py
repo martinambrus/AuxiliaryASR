@@ -6,6 +6,7 @@ from torch import Tensor
 import torch.nn.functional as F
 import torchaudio
 import torchaudio.functional as audio_F
+import warnings
 
 import random
 random.seed(0)
@@ -269,3 +270,68 @@ class MFCC(nn.Module):
         if unsqueezed:
             mfcc = mfcc.squeeze(0)
         return mfcc
+
+
+class LearnableFilterbank(nn.Module):
+    """Learnable linear projection over the mel dimension."""
+
+    def __init__(self,
+                 in_channels: int,
+                 out_channels: int,
+                 bias: bool = True,
+                 init_type: str = 'dct',
+                 norm: str = 'ortho'):
+        super().__init__()
+        if in_channels <= 0 or out_channels <= 0:
+            raise ValueError("in_channels and out_channels must be positive integers")
+
+        self.in_channels = int(in_channels)
+        self.out_channels = int(out_channels)
+        self.norm = norm
+        self.conv = nn.Conv1d(self.in_channels, self.out_channels, kernel_size=1, bias=bias)
+        self.reset_parameters(init_type)
+
+    def reset_parameters(self, init_type: str = 'dct'):
+        init_type = (init_type or '').lower()
+        if init_type == 'dct':
+            if self.out_channels > self.in_channels:
+                warnings.warn(
+                    "Cannot initialise learnable filterbank with DCT when "
+                    "out_channels > in_channels. Falling back to Kaiming uniform initialisation.")
+                nn.init.kaiming_uniform_(self.conv.weight, a=math.sqrt(5))
+                if self.conv.bias is not None:
+                    fan_in = self.in_channels
+                    bound = 1 / math.sqrt(fan_in)
+                    nn.init.uniform_(self.conv.bias, -bound, bound)
+            else:
+                dct_mat = audio_F.create_dct(self.out_channels, self.in_channels, self.norm)
+                with torch.no_grad():
+                    self.conv.weight.copy_(dct_mat.unsqueeze(-1))
+                    if self.conv.bias is not None:
+                        self.conv.bias.zero_()
+        elif init_type == 'identity':
+            with torch.no_grad():
+                self.conv.weight.zero_()
+                diag = torch.arange(min(self.out_channels, self.in_channels))
+                self.conv.weight[diag, diag, 0] = 1.0
+                if self.conv.bias is not None:
+                    self.conv.bias.zero_()
+        else:
+            nn.init.kaiming_uniform_(self.conv.weight, a=math.sqrt(5))
+            if self.conv.bias is not None:
+                fan_in = self.in_channels
+                bound = 1 / math.sqrt(fan_in)
+                nn.init.uniform_(self.conv.bias, -bound, bound)
+
+    def forward(self, mel_features: torch.Tensor) -> torch.Tensor:
+        unsqueezed = False
+        if mel_features.dim() == 2:
+            mel_features = mel_features.unsqueeze(0)
+            unsqueezed = True
+
+        projected = self.conv(mel_features)
+
+        if unsqueezed:
+            projected = projected.squeeze(0)
+
+        return projected
