@@ -37,7 +37,9 @@ class Trainer(object):
                  initial_epochs=0,
                  switch_sortagrad_dataset_epoch = 10,
                  use_diagonal_attention_prior = True,
-                 diagonal_attention_prior_weight = 0.1):
+                 diagonal_attention_prior_weight = 0.1,
+                 ctc_weight=1.0,
+                 s2s_weight=1.0):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -60,6 +62,8 @@ class Trainer(object):
         self.use_diagonal_attention_prior = use_diagonal_attention_prior
         self.diagonal_attention_prior_weight = diagonal_attention_prior_weight
         self.maxm_mem_usage = 0
+        self.ctc_weight = ctc_weight
+        self.s2s_weight = s2s_weight
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -198,10 +202,10 @@ class Trainer(object):
             loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
         loss_s2s /= text_input.size(0)
 
+        total_loss = self.ctc_weight * loss_ctc + self.s2s_weight * loss_s2s
         if self.use_diagonal_attention_prior:
-            loss = loss_ctc + loss_s2s + self.diagonal_attention_prior_weight * loss_diagonal
-        else:
-            loss = loss_ctc + loss_s2s
+            total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
+        loss = total_loss
         loss.backward()
         torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
         self.optimizer.step()

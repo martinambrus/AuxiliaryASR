@@ -28,7 +28,7 @@ model_params:
 
 optimizer_params:
   lr: 0.0005
-  pct_start: 0.0
+  pct_start: 0.1
 
 # this is a very basic early stopping based off learning rate - when it falls to 0 and remains there for 3 epochs, the training stops
 enable_early_stopping: True
@@ -45,3 +45,20 @@ diagonal_attention_prior_weight: 0.1
 # stabilizes ASR training for smaller datasets
 entropy_params:
   label_smoothing: 0.1
+
+dataset_params:
+  # SpecAugment parameters applied only on the training split.
+  spec_augment:
+    apply_prob: 0.5
+    freq_mask_param: 13
+    time_mask_param: 50
+    num_freq_masks: 2
+    num_time_masks: 2
+
+dataloader_params:
+  train_num_workers: 8
+  val_num_workers: 2
+
+loss_weights:
+  ctc: 0.8
+  s2s: 1.0

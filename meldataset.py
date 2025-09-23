@@ -12,6 +12,7 @@ from torch import nn
 import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader
+from torchaudio import transforms as T
 
 from nltk.tokenize import word_tokenize
 #import phonemizer
@@ -36,6 +37,49 @@ DEFAULT_DICT_PATH = osp.join(osp.dirname(__file__), 'word_index_dict.txt')
 # }
 
 #global_phonemizer = phonemizer.backend.EspeakBackend(language='en-us', preserve_punctuation=True,  with_stress=True)
+
+
+class SpecAugment:
+    """Simple SpecAugment implementation for log-mel spectrograms."""
+
+    def __init__(self,
+                 freq_mask_param=27,
+                 time_mask_param=40,
+                 num_freq_masks=2,
+                 num_time_masks=2,
+                 apply_prob=1.0):
+        self.freq_mask_param = int(freq_mask_param)
+        self.time_mask_param = int(time_mask_param)
+        self.num_freq_masks = int(num_freq_masks)
+        self.num_time_masks = int(num_time_masks)
+        self.apply_prob = float(apply_prob)
+
+        self._freq_mask = T.FrequencyMasking(freq_mask_param=self.freq_mask_param)
+        self._time_mask = T.TimeMasking(time_mask_param=self.time_mask_param)
+
+    def __call__(self, mel_tensor: torch.Tensor) -> torch.Tensor:
+        if self.apply_prob < 1.0 and random.random() > self.apply_prob:
+            return mel_tensor
+
+        squeeze = False
+        if mel_tensor.dim() == 2:
+            mel_tensor = mel_tensor.unsqueeze(0)
+            squeeze = True
+
+        augmented = mel_tensor.clone()
+
+        for _ in range(max(0, self.num_freq_masks)):
+            augmented = self._freq_mask(augmented)
+
+        for _ in range(max(0, self.num_time_masks)):
+            augmented = self._time_mask(augmented)
+
+        if squeeze:
+            augmented = augmented.squeeze(0)
+
+        return augmented
+
+
 class MelDataset(torch.utils.data.Dataset):
     def __init__(self,
                  data_list,
@@ -48,7 +92,9 @@ class MelDataset(torch.utils.data.Dataset):
                  },
                  mel_params={
                      "n_mels": 80
-                 }
+                 },
+                 spec_augment_params=None,
+                 validation=False
                 ):
 
         self.data_list = data_list
@@ -56,6 +102,14 @@ class MelDataset(torch.utils.data.Dataset):
         self.sr = sr
 
         self.to_melspec = torchaudio.transforms.MelSpectrogram(**mel_params)
+
+        self.spec_augment = None
+        if spec_augment_params and not validation:
+            try:
+                self.spec_augment = SpecAugment(**spec_augment_params)
+            except TypeError:
+                logger.warning(f"Invalid SpecAugment configuration: {spec_augment_params}. Skipping augmentation.")
+                self.spec_augment = None
 
         # https://github.com/yl4579/StyleTTS/issues/57
         self.mean, self.std = -4, 4
@@ -75,7 +129,12 @@ class MelDataset(torch.utils.data.Dataset):
                     mel_tensor.unsqueeze(0), size=(text_tensor.size(0)+1)*3, align_corners=False,
                     mode='linear').squeeze(0)
 
-            acoustic_feature = (torch.log(1e-5 + mel_tensor) - self.mean)/self.std
+            log_mel_tensor = torch.log(1e-5 + mel_tensor)
+
+            if self.spec_augment is not None:
+                log_mel_tensor = self.spec_augment(log_mel_tensor)
+
+            acoustic_feature = (log_mel_tensor - self.mean)/self.std
 
             length_feature = acoustic_feature.size(1)
             acoustic_feature = acoustic_feature[:, :(length_feature - length_feature % 2)]
@@ -203,7 +262,7 @@ def build_dataloader(path_list,
                      collate_config={},
                      dataset_config={}):
 
-    dataset = MelDataset(path_list, **dataset_config)
+    dataset = MelDataset(path_list, validation=validation, **dataset_config)
     collate_fn = Collater(**collate_config)
     data_loader = DataLoader(dataset,
                              batch_size=batch_size,

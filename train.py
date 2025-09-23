@@ -141,6 +141,16 @@ def main(config_path):
         'mel_params': cfg_get_nested( config, 'preprocess_params.mel_params', { 'n_mels': 80 })
     }
 
+    dataset_additional_params = cfg_get_nested(config, 'dataset_params', {})
+    if isinstance(dataset_additional_params, dict):
+        for override_key in ('dict_path', 'sr', 'spect_params', 'mel_params'):
+            if override_key in dataset_additional_params:
+                dataset_params[override_key] = dataset_additional_params[override_key]
+
+        spec_augment_config = dataset_additional_params.get('spec_augment')
+        if spec_augment_config:
+            dataset_params['spec_augment_params'] = spec_augment_config
+
     train_list, val_list = get_data_path_list(train_path, val_path)
 
     # sort data list by duration for consistent bucketing and batching
@@ -152,27 +162,31 @@ def main(config_path):
     train_list = [l[:-1].split('|') for l in train_list]
     val_list = [l[:-1].split('|') for l in val_list]
 
+    dataloader_params = cfg_get_nested(config, 'dataloader_params', {})
+    train_num_workers = int(dataloader_params.get('train_num_workers', 8))
+    val_num_workers = int(dataloader_params.get('val_num_workers', 2))
+
     sorted_train_dataloader = build_dataloader(train_list_sorted,
                                         batch_size=batch_size,
-                                        num_workers=8,
+                                        num_workers=train_num_workers,
                                         dataset_config=dataset_params,
                                         device=device)
     shuffled_train_dataloader = build_dataloader(train_list,
                                             batch_size=batch_size,
-                                            num_workers=8,
+                                            num_workers=train_num_workers,
                                             dataset_config=dataset_params,
                                             device=device)
 
     sorted_val_dataloader = build_dataloader(val_list_sorted,
                                       batch_size=batch_size,
                                       validation=True,
-                                      num_workers=2,
+                                      num_workers=val_num_workers,
                                       device=device,
                                       dataset_config=dataset_params)
     shuffled_val_dataloader = build_dataloader(val_list,
                                           batch_size=batch_size,
                                           validation=True,
-                                          num_workers=2,
+                                          num_workers=val_num_workers,
                                           device=device,
                                           dataset_config=dataset_params)
 
@@ -199,7 +213,7 @@ def main(config_path):
 
     scheduler_params = {
             'max_lr': float(cfg_get_nested( config, 'optimizer_params.lr', 5e-4)),
-            'pct_start': float(cfg_get_nested( config, 'optimizer_params.pct_start', 0.0)),
+            'pct_start': float(cfg_get_nested( config, 'optimizer_params.pct_start', 0.1)),
             'epochs': epochs,
             'steps_per_epoch': len(sorted_train_dataloader),
         }
@@ -220,6 +234,10 @@ def main(config_path):
     else:
         early_stopping = None
 
+    loss_weight_config = cfg_get_nested(config, 'loss_weights', {}) or {}
+    ctc_weight = float(loss_weight_config.get('ctc', 1.0))
+    s2s_weight = float(loss_weight_config.get('s2s', 1.0))
+
     trainer = Trainer(model=model,
                     criterion=criterion,
                     optimizer=optimizer,
@@ -233,6 +251,8 @@ def main(config_path):
                     switch_sortagrad_dataset_epoch=cfg_get_nested( config, 'sortagrad_switch_to_shuffled_dataset_epoch', 10),
                     use_diagonal_attention_prior=cfg_get_nested( config, 'use_diagonal_attention_prior', True),
                     diagonal_attention_prior_weight=cfg_get_nested( config, 'diagonal_attention_prior_weight', 0.1),
+                    ctc_weight=ctc_weight,
+                    s2s_weight=s2s_weight,
                     )
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )
