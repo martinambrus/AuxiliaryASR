@@ -16,6 +16,8 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import click
+import importlib
+import importlib.util
 
 # enable better memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -31,41 +33,125 @@ logger.addHandler(handler)
 torch.backends.cudnn.benchmark = True
 
 
-def sort_data_list_by_duration(raw_data_list, root_path="/"):
-    """
-    raw_data_list: list of strings like "path/to.wav|some text|speaker_id"
-    root_path:     base directory for your wav files
+def _load_optional_tqdm():
+    """Return tqdm.tqdm if available, otherwise ``None``."""
+    spec = importlib.util.find_spec("tqdm")
+    if spec is None:
+        return None
+    module = importlib.import_module("tqdm")
+    return getattr(module, "tqdm", None)
 
-    returns: list of tuples (path, text, speaker_id),
-             sorted by ascending duration
+
+_OPTIONAL_TQDM = _load_optional_tqdm()
+
+
+def prepare_data_list(raw_data_list, root_path=""):
+    """Parse metadata lines and compute WAV durations.
+
+    Args:
+        raw_data_list: Iterable with entries in the format
+            ``path|phoneme sequence|speaker_id``.
+        root_path: Base directory of the audio files.
+
+    Returns:
+        Tuple ``(prepared_list, durations)`` where ``prepared_list`` contains
+        ``[path, text, speaker_id]`` entries and ``durations`` is a list with
+        their corresponding durations (in seconds).
     """
+    raw_data_sequence = list(raw_data_list)
+    total_items = len(raw_data_sequence)
+    prepared_list = []
     durations = []
-    for line in raw_data_list:
-        try:
-            path, text, speaker_id = line.strip().split('|')
-            wav_path = os.path.join(root_path, path)
-        except Exception as e:
-            print(f"Parse error for line: {line}, {e}")
+
+    if total_items == 0:
+        return prepared_list, durations
+
+    progress_desc = "Computing audio durations"
+    iterator = raw_data_sequence
+    use_tqdm = _OPTIONAL_TQDM is not None
+
+    if use_tqdm:
+        iterator = _OPTIONAL_TQDM(raw_data_sequence,
+                                  desc=progress_desc,
+                                  total=total_items,
+                                  unit="files")
+    else:
+        print(f"{progress_desc} for {total_items} files...")
+        update_interval = max(1, total_items // 20)
+
+    for index, line in enumerate(iterator):
+        cleaned_line = line.rstrip('\n')
+        if not cleaned_line.strip():
             continue
 
-        # read header only (fast)
+        parts = cleaned_line.split('|')
+        if len(parts) < 2:
+            print(f"Parse error for line: {cleaned_line}")
+            continue
+
+        path = parts[0].strip()
+        if len(parts) == 2:
+            text = parts[1]
+            speaker_id = ""
+        else:
+            text = '|'.join(parts[1:-1])
+            speaker_id = parts[-1].strip()
+
+        wav_path = os.path.join(root_path, path)
+
         try:
             with wave.open(wav_path, 'rb') as wf:
                 frames = wf.getnframes()
-                rate   = wf.getframerate()
-                dur    = frames / float(rate)
-
-            durations.append((dur, path, text, speaker_id))
+                rate = wf.getframerate()
+                duration = frames / float(rate) if rate else 0.0
         except Exception as e:
             print(f"Error for wave path: {wav_path}, {e}")
+            continue
 
-    # sort by duration
-    durations.sort(key=lambda x: x[0])
+        prepared_list.append([path, text, speaker_id])
+        durations.append(duration)
 
-    # drop the duration, return only the data triples
-    #sorted_list = [(path, text, speaker_id) for _, path, text, speaker_id in durations]
-    sorted_list = [[path, text, speaker_id] for _, path, text, speaker_id in durations]
-    return sorted_list
+        if not use_tqdm:
+            should_update = ((index + 1) % update_interval == 0) or ((index + 1) == total_items)
+            if should_update:
+                print(f"Computed durations for {index + 1}/{total_items} files", flush=True)
+
+    return prepared_list, durations
+
+
+def sort_prepared_data_list(data_list, durations):
+    if len(data_list) != len(durations):
+        raise ValueError("data_list and durations must have the same length")
+
+    paired = sorted(zip(durations, data_list), key=lambda x: x[0])
+    sorted_list = [item for _, item in paired]
+    sorted_durations = [duration for duration, _ in paired]
+    return sorted_list, sorted_durations
+
+
+def sort_data_list_by_duration(raw_data_list=None, root_path="", precomputed=None):
+    """
+    Sort metadata entries by ascending audio duration.
+
+    Args:
+        raw_data_list: Iterable with raw metadata lines. Optional when
+            ``precomputed`` is provided.
+        root_path: Base directory of the audio files (used when parsing the
+            raw metadata).
+        precomputed: Optional tuple ``(prepared_list, durations)`` as returned
+            by :func:`prepare_data_list`.
+
+    Returns:
+        A tuple ``(sorted_list, sorted_durations)``.
+    """
+    if precomputed is not None:
+        data_list, durations = precomputed
+    else:
+        if raw_data_list is None:
+            raise ValueError("Either raw_data_list or precomputed must be provided")
+        data_list, durations = prepare_data_list(raw_data_list, root_path=root_path)
+
+    return sort_prepared_data_list(data_list, durations)
 
 def cfg_get_nested(cfg: dict, path, default=None, sep="."):
     """
@@ -151,31 +237,33 @@ def main(config_path):
         if spec_augment_config:
             dataset_params['spec_augment_params'] = spec_augment_config
 
-    train_list, val_list = get_data_path_list(train_path, val_path)
+    raw_train_list, raw_val_list = get_data_path_list(train_path, val_path)
+
+    train_entries, train_durations = prepare_data_list(raw_train_list, root_path="")
+    val_entries, val_durations = prepare_data_list(raw_val_list, root_path="")
 
     # sort data list by duration for consistent bucketing and batching
     # to reduce padding, improving both training stability and alignment accuracy
-    train_list_sorted = sort_data_list_by_duration(train_list, root_path="")
-    val_list_sorted = sort_data_list_by_duration(val_list, root_path="")
-
-    # split original train and val lists CSV lines by |
-    train_list = [l[:-1].split('|') for l in train_list]
-    val_list = [l[:-1].split('|') for l in val_list]
+    train_list_sorted, _ = sort_data_list_by_duration(precomputed=(train_entries, train_durations))
+    val_list_sorted, _ = sort_data_list_by_duration(precomputed=(val_entries, val_durations))
 
     dataloader_params = cfg_get_nested(config, 'dataloader_params', {})
     train_num_workers = int(dataloader_params.get('train_num_workers', 8))
     val_num_workers = int(dataloader_params.get('val_num_workers', 2))
+    train_bucket_sampler_config = dataloader_params.get('train_bucket_sampler', {})
 
     sorted_train_dataloader = build_dataloader(train_list_sorted,
                                         batch_size=batch_size,
                                         num_workers=train_num_workers,
                                         dataset_config=dataset_params,
                                         device=device)
-    shuffled_train_dataloader = build_dataloader(train_list,
+    shuffled_train_dataloader = build_dataloader(train_entries,
                                             batch_size=batch_size,
                                             num_workers=train_num_workers,
                                             dataset_config=dataset_params,
-                                            device=device)
+                                            device=device,
+                                            lengths=train_durations,
+                                            bucket_sampler_config=train_bucket_sampler_config)
 
     sorted_val_dataloader = build_dataloader(val_list_sorted,
                                       batch_size=batch_size,
@@ -183,7 +271,7 @@ def main(config_path):
                                       num_workers=val_num_workers,
                                       device=device,
                                       dataset_config=dataset_params)
-    shuffled_val_dataloader = build_dataloader(val_list,
+    shuffled_val_dataloader = build_dataloader(val_entries,
                                           batch_size=batch_size,
                                           validation=True,
                                           num_workers=val_num_workers,

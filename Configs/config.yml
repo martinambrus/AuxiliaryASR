@@ -58,6 +58,11 @@ dataset_params:
 dataloader_params:
   train_num_workers: 8
   val_num_workers: 2
+  train_bucket_sampler:
+    enabled: true
+    bucket_size_multiplier: 20  # bucket = batch_size * multiplier
+    shuffle_within_bucket: true
+    shuffle_batches: true
 
 loss_weights:
   ctc: 0.8
