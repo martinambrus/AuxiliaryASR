@@ -16,6 +16,8 @@ import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import click
+import importlib
+import importlib.util
 
 # enable better memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -31,6 +33,18 @@ logger.addHandler(handler)
 torch.backends.cudnn.benchmark = True
 
 
+def _load_optional_tqdm():
+    """Return tqdm.tqdm if available, otherwise ``None``."""
+    spec = importlib.util.find_spec("tqdm")
+    if spec is None:
+        return None
+    module = importlib.import_module("tqdm")
+    return getattr(module, "tqdm", None)
+
+
+_OPTIONAL_TQDM = _load_optional_tqdm()
+
+
 def prepare_data_list(raw_data_list, root_path=""):
     """Parse metadata lines and compute WAV durations.
 
@@ -44,10 +58,28 @@ def prepare_data_list(raw_data_list, root_path=""):
         ``[path, text, speaker_id]`` entries and ``durations`` is a list with
         their corresponding durations (in seconds).
     """
+    raw_data_sequence = list(raw_data_list)
+    total_items = len(raw_data_sequence)
     prepared_list = []
     durations = []
 
-    for line in raw_data_list:
+    if total_items == 0:
+        return prepared_list, durations
+
+    progress_desc = "Computing audio durations"
+    iterator = raw_data_sequence
+    use_tqdm = _OPTIONAL_TQDM is not None
+
+    if use_tqdm:
+        iterator = _OPTIONAL_TQDM(raw_data_sequence,
+                                  desc=progress_desc,
+                                  total=total_items,
+                                  unit="files")
+    else:
+        print(f"{progress_desc} for {total_items} files...")
+        update_interval = max(1, total_items // 20)
+
+    for index, line in enumerate(iterator):
         cleaned_line = line.rstrip('\n')
         if not cleaned_line.strip():
             continue
@@ -78,6 +110,11 @@ def prepare_data_list(raw_data_list, root_path=""):
 
         prepared_list.append([path, text, speaker_id])
         durations.append(duration)
+
+        if not use_tqdm:
+            should_update = ((index + 1) % update_interval == 0) or ((index + 1) == total_items)
+            if should_update:
+                print(f"Computed durations for {index + 1}/{total_items} files", flush=True)
 
     return prepared_list, durations
 
