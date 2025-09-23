@@ -25,6 +25,35 @@ model_params:
    token_embedding_dim: 512
    n_layers: 5
    location_kernel_size: 31
+   encoder_type: "conformer"
+   encoder_heads: 4
+   encoder_dropout: 0.1
+   encoder_ffn_expansion: 4.0
+   encoder_conv_kernel_size: 31
+   encoder_block_sequence:
+     - type: "conformer"
+       enabled: true
+       layers: 5
+   encoder_block_config:
+     conformer:
+       use_macaron: true
+       use_conv_module: true
+     emformer:
+       use_conv_module: true
+       chunk_size: 64
+       left_context: 64
+       right_context: 16
+     branchformer:
+       enable_attn_branch: true
+       enable_conv_branch: true
+       enable_ffn_branch: true
+       branch_dropout: 0.1
+       post_ffn: true
+     zipformer:
+       use_attention: true
+       use_convolution: true
+       use_ffn_stream: true
+       post_ffn: true
 
 optimizer_params:
   lr: 0.0005

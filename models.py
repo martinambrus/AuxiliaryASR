@@ -1,9 +1,8 @@
 import math
 import torch
 from torch import nn
-from torch.nn import TransformerEncoder
 import torch.nn.functional as F
-from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
+from layers import MFCC, Attention, LinearNorm, ConvNorm, HybridEncoder
 
 def build_model(model_params={}, model_type='asr'):
     model = ASRCNN(**model_params)
@@ -18,17 +17,56 @@ class ASRCNN(nn.Module):
                  n_layers=6,
                  token_embedding_dim=256,
                  location_kernel_size=63,
+                 encoder_type='conformer',
+                 encoder_heads=4,
+                 encoder_dropout=0.1,
+                 encoder_ffn_expansion=4.0,
+                 encoder_conv_kernel_size=31,
+                 encoder_block_config=None,
+                 encoder_block_sequence=None,
     ):
         super().__init__()
         self.n_token = n_token
         self.n_down = 1
         self.to_mfcc = MFCC()
         self.init_cnn = ConvNorm(input_dim//2, hidden_dim, kernel_size=7, padding=3, stride=2)
-        self.cnns = nn.Sequential(
-            *[nn.Sequential(
-                ConvBlock(hidden_dim),
-                nn.GroupNorm(num_groups=1, num_channels=hidden_dim)
-            ) for n in range(n_layers)])
+        block_defaults = encoder_block_config or {}
+        if encoder_block_sequence is None:
+            encoder_block_sequence = [
+                {
+                    'type': encoder_type,
+                    'layers': n_layers,
+                }
+            ]
+        prepared_blocks = []
+        for block in encoder_block_sequence:
+            if isinstance(block, str):
+                block_entry = {'type': block, 'layers': 1, 'params': {}}
+            else:
+                block_entry = dict(block)
+            block_type = block_entry.get('type', encoder_type).lower()
+            if not block_entry.get('enabled', True):
+                continue
+            merged_params = dict(block_defaults.get(block_type, {}))
+            merged_params.update(block_entry.get('params', {}))
+            block_entry['params'] = merged_params
+            layers = int(block_entry.get('layers', 1))
+            if layers <= 0:
+                continue
+            block_entry['layers'] = layers
+            prepared_blocks.append(block_entry)
+
+        encoder_global_params = {
+            'num_heads': encoder_heads,
+            'dropout': encoder_dropout,
+            'expansion_factor': encoder_ffn_expansion,
+            'conv_kernel_size': encoder_conv_kernel_size,
+        }
+        self.encoder = HybridEncoder(
+            hidden_dim=hidden_dim,
+            block_settings=prepared_blocks,
+            global_params=encoder_global_params,
+        )
         self.projection = ConvNorm(hidden_dim, hidden_dim // 2)
         self.ctc_linear = nn.Sequential(
             LinearNorm(hidden_dim//2, hidden_dim),
@@ -43,7 +81,11 @@ class ASRCNN(nn.Module):
     def forward(self, x, src_key_padding_mask=None, text_input=None):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
-        x = self.cnns(x)
+        x = x.transpose(1, 2)
+        if src_key_padding_mask is not None:
+            src_key_padding_mask = src_key_padding_mask.to(dtype=torch.bool)
+        x = self.encoder(x, key_padding_mask=src_key_padding_mask)
+        x = x.transpose(1, 2)
 
         x = self.projection(x)
         x = x.transpose(1, 2)
@@ -57,8 +99,9 @@ class ASRCNN(nn.Module):
     def get_feature(self, x):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
-        x = self.cnns(x)
-        x = self.instance_norm(x)
+        x = x.transpose(1, 2)
+        x = self.encoder(x)
+        x = x.transpose(1, 2)
         x = self.projection(x)
         return x
 
