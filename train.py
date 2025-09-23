@@ -188,17 +188,17 @@ def main(config_path):
         'token_embedding_dim': 512,
         'n_layers': 5,
         'location_kernel_size': 31
-    }
+    })
     model = build_model(model_params=model_params)
 
     scheduler_params = {
             'max_lr': float(cfg_get_nested( config, 'optimizer_params.lr', 5e-4)),
             'pct_start': float(cfg_get_nested( config, 'optimizer_params.pct_start', 0.0)),
             'epochs': epochs,
-            'steps_per_epoch': len(train_dataloader),
+            'steps_per_epoch': len(sorted_train_dataloader),
         }
 
-    entropy_params = cfg_get_nested( config, 'entropy_params.label_smoothing': 0.1)
+    entropy_params = cfg_get_nested( config, 'entropy_params', { "label_smoothing": 0.1 })
 
     model.to(device)
     optimizer, scheduler = build_optimizer(
