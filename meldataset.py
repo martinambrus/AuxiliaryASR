@@ -16,6 +16,8 @@ from torch.utils.data import DataLoader
 from nltk.tokenize import word_tokenize
 #import phonemizer
 import torchaudio.functional as AF
+import math
+from typing import Iterator, List
 import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -54,6 +56,20 @@ class MelDataset(torch.utils.data.Dataset):
         self.data_list = data_list
         self.text_cleaner = TextCleaner(dict_path)
         self.sr = sr
+
+        # make a copy so the caller's dictionary is not modified
+        mel_params = dict(mel_params) if mel_params is not None else {}
+
+        # Ensure that the mel spectrogram configuration matches the audio
+        # processing configuration.  In the default configuration this keeps the
+        # hop length and FFT size consistent with the resampled waveform.  Using
+        # mismatched parameters previously led to unstable behaviour,
+        # particularly on shorter datasets where every frame matters.
+        mel_params.setdefault("sample_rate", sr)
+        if spect_params is not None:
+            for key in ("n_fft", "win_length", "hop_length"):
+                if key in spect_params and key not in mel_params:
+                    mel_params[key] = spect_params[key]
 
         self.to_melspec = torchaudio.transforms.MelSpectrogram(**mel_params)
 
@@ -194,6 +210,50 @@ class Collater(object):
         return texts, input_lengths, mels, output_lengths
 
 
+class LengthBucketBatchSampler(torch.utils.data.Sampler[List[int]]):
+    """Batch sampler that keeps similarly long items together.
+
+    The dataset is expected to be pre-sorted by utterance duration.  During
+    iteration the order of the batches (and optionally the order inside a
+    batch) is shuffled which preserves the SortaGrad curriculum while still
+    providing enough randomness for robust training.
+    """
+
+    def __init__(self,
+                 dataset: torch.utils.data.Dataset,
+                 batch_size: int,
+                 drop_last: bool,
+                 shuffle: bool = True,
+                 seed: int = None) -> None:
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.drop_last = drop_last
+        self.shuffle = shuffle
+        self._random = random.Random(seed)
+
+    def __len__(self) -> int:
+        length = len(self.dataset)
+        if self.drop_last:
+            return length // self.batch_size
+        return math.ceil(length / self.batch_size)
+
+    def __iter__(self) -> Iterator[List[int]]:
+        indices = list(range(len(self.dataset)))
+        batches = [indices[i:i + self.batch_size]
+                   for i in range(0, len(indices), self.batch_size)]
+
+        if self.drop_last and batches and len(batches[-1]) < self.batch_size:
+            batches = batches[:-1]
+
+        if self.shuffle:
+            self._random.shuffle(batches)
+            for batch in batches:
+                self._random.shuffle(batch)
+
+        for batch in batches:
+            yield batch
+
+
 
 def build_dataloader(path_list,
                      validation=False,
@@ -201,16 +261,32 @@ def build_dataloader(path_list,
                      num_workers=1,
                      device='cpu',
                      collate_config={},
-                     dataset_config={}):
+                     dataset_config={},
+                     bucket_sampler=False,
+                     bucket_sampler_shuffle=True,
+                     bucket_sampler_seed=None):
 
     dataset = MelDataset(path_list, **dataset_config)
     collate_fn = Collater(**collate_config)
-    data_loader = DataLoader(dataset,
-                             batch_size=batch_size,
-                             shuffle=(not validation),
-                             num_workers=num_workers,
-                             drop_last=(not validation),
-                             collate_fn=collate_fn,
-                             pin_memory=(device != 'cpu'))
+    if bucket_sampler and (not validation):
+        sampler = LengthBucketBatchSampler(
+            dataset,
+            batch_size=batch_size,
+            drop_last=True,
+            shuffle=bucket_sampler_shuffle,
+            seed=bucket_sampler_seed)
+        data_loader = DataLoader(dataset,
+                                 batch_sampler=sampler,
+                                 num_workers=num_workers,
+                                 collate_fn=collate_fn,
+                                 pin_memory=(device != 'cpu'))
+    else:
+        data_loader = DataLoader(dataset,
+                                 batch_size=batch_size,
+                                 shuffle=(not validation),
+                                 num_workers=num_workers,
+                                 drop_last=(not validation),
+                                 collate_fn=collate_fn,
+                                 pin_memory=(device != 'cpu'))
 
     return data_loader

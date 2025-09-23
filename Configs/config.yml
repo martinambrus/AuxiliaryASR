@@ -33,6 +33,13 @@ optimizer_params:
 # this is a very basic early stopping based off learning rate - when it falls to 0 and remains there for 3 epochs, the training stops
 enable_early_stopping: True
 
+# keep batches length-homogeneous even after SortaGrad switching
+# this significantly stabilizes CTC training on short datasets
+bucket_sampler:
+  enabled: True
+  shuffle: True
+  seed: 1234
+
 # for more stable learning, first X epochs should be trained with audio files of similar lengths grouped together
 # this option determines epoch during which the sorted dataset will be swapped for a shuffled one
 # default: 10

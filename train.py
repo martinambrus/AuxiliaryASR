@@ -130,6 +130,9 @@ def main(config_path):
     train_path = cfg_get_nested( config, 'train_data', None)
     val_path = cfg_get_nested( config, 'val_data', None)
     enable_early_stopping = cfg_get_nested( config, 'enable_early_stopping', True)
+    bucket_sampler_enabled = cfg_get_nested( config, 'bucket_sampler.enabled', True)
+    bucket_sampler_shuffle = cfg_get_nested( config, 'bucket_sampler.shuffle', True)
+    bucket_sampler_seed = cfg_get_nested( config, 'bucket_sampler.seed', None)
     dataset_params = {
         'dict_path': cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'),
         'sr': cfg_get_nested( config, 'preprocess_params.sr', 24000),
@@ -156,25 +159,33 @@ def main(config_path):
                                         batch_size=batch_size,
                                         num_workers=8,
                                         dataset_config=dataset_params,
-                                        device=device)
-    shuffled_train_dataloader = build_dataloader(train_list,
+                                        device=device,
+                                        bucket_sampler=False)
+
+    shuffled_dataloader_source = train_list_sorted if bucket_sampler_enabled else train_list
+    shuffled_train_dataloader = build_dataloader(shuffled_dataloader_source,
                                             batch_size=batch_size,
                                             num_workers=8,
                                             dataset_config=dataset_params,
-                                            device=device)
+                                            device=device,
+                                            bucket_sampler=bucket_sampler_enabled,
+                                            bucket_sampler_shuffle=bucket_sampler_shuffle,
+                                            bucket_sampler_seed=bucket_sampler_seed)
 
     sorted_val_dataloader = build_dataloader(val_list_sorted,
                                       batch_size=batch_size,
                                       validation=True,
                                       num_workers=2,
                                       device=device,
-                                      dataset_config=dataset_params)
+                                      dataset_config=dataset_params,
+                                      bucket_sampler=False)
     shuffled_val_dataloader = build_dataloader(val_list,
                                           batch_size=batch_size,
                                           validation=True,
                                           num_workers=2,
                                           device=device,
-                                          dataset_config=dataset_params)
+                                          dataset_config=dataset_params,
+                                          bucket_sampler=False)
 
     word_indexes = set(
         line.strip() for line in open(cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'))
