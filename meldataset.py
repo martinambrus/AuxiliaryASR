@@ -3,6 +3,7 @@
 import os
 import os.path as osp
 import time
+import math
 import random
 import numpy as np
 import random
@@ -11,7 +12,7 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 import torchaudio
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Sampler
 from torchaudio import transforms as T
 
 from nltk.tokenize import word_tokenize
@@ -78,6 +79,70 @@ class SpecAugment:
             augmented = augmented.squeeze(0)
 
         return augmented
+
+
+class LengthAwareBatchSampler(Sampler):
+    """Batch sampler that groups items with similar lengths together."""
+
+    def __init__(self,
+                 lengths,
+                 batch_size,
+                 bucket_size=None,
+                 shuffle_batches=True,
+                 shuffle_within_bucket=True,
+                 drop_last=False,
+                 seed=None):
+        if batch_size <= 0:
+            raise ValueError("batch_size must be a positive integer")
+        self.lengths = list(lengths)
+        if len(self.lengths) == 0:
+            raise ValueError("lengths must not be empty")
+
+        self.batch_size = int(batch_size)
+        if bucket_size is None:
+            bucket_size = self.batch_size * 50
+        self.bucket_size = max(self.batch_size, int(bucket_size))
+        self.shuffle_batches = bool(shuffle_batches)
+        self.shuffle_within_bucket = bool(shuffle_within_bucket)
+        self.drop_last = bool(drop_last)
+        self.seed = seed
+        self._epoch = 0
+
+    def __iter__(self):
+        if self.seed is not None:
+            rng = random.Random(self.seed + self._epoch)
+        else:
+            rng = random.Random()
+        self._epoch += 1
+
+        indices = list(range(len(self.lengths)))
+        indices.sort(key=lambda idx: self.lengths[idx])
+
+        buckets = [indices[i:i + self.bucket_size] for i in range(0, len(indices), self.bucket_size)]
+        if self.shuffle_batches:
+            rng.shuffle(buckets)
+
+        batches = []
+        for bucket in buckets:
+            if self.shuffle_within_bucket:
+                rng.shuffle(bucket)
+
+            for start in range(0, len(bucket), self.batch_size):
+                batch = bucket[start:start + self.batch_size]
+                if len(batch) < self.batch_size and self.drop_last:
+                    continue
+                batches.append(batch)
+
+        if self.shuffle_batches:
+            rng.shuffle(batches)
+
+        for batch in batches:
+            yield batch
+
+    def __len__(self):
+        if self.drop_last:
+            return len(self.lengths) // self.batch_size
+        return math.ceil(len(self.lengths) / self.batch_size)
 
 
 class MelDataset(torch.utils.data.Dataset):
@@ -262,16 +327,59 @@ def build_dataloader(path_list,
                      num_workers=1,
                      device='cpu',
                      collate_config={},
-                     dataset_config={}):
+                     dataset_config={},
+                     lengths=None,
+                     bucket_sampler_config=None):
 
     dataset = MelDataset(path_list, validation=validation, **dataset_config)
     collate_fn = Collater(**collate_config)
-    data_loader = DataLoader(dataset,
-                             batch_size=batch_size,
-                             shuffle=(not validation),
-                             num_workers=num_workers,
-                             drop_last=(not validation),
-                             collate_fn=collate_fn,
-                             pin_memory=(device != 'cpu'))
+
+    use_bucket_sampler = False
+    batch_sampler = None
+
+    if (not validation) and bucket_sampler_config and lengths is not None:
+        lengths = list(lengths)
+        if len(lengths) != len(dataset):
+            raise ValueError("lengths must have the same length as path_list when using a bucket sampler")
+
+        enabled = bucket_sampler_config.get('enabled', True)
+        if enabled:
+            bucket_size = bucket_sampler_config.get('bucket_size')
+            if bucket_size is not None:
+                bucket_size = int(bucket_size)
+            else:
+                multiplier = int(bucket_sampler_config.get('bucket_size_multiplier', 50))
+                bucket_size = batch_size * max(1, multiplier)
+
+            shuffle_batches = bucket_sampler_config.get('shuffle_batches', True)
+            shuffle_within_bucket = bucket_sampler_config.get('shuffle_within_bucket', True)
+            drop_last = bucket_sampler_config.get('drop_last', not validation)
+            seed = bucket_sampler_config.get('seed')
+
+            batch_sampler = LengthAwareBatchSampler(
+                lengths=lengths,
+                batch_size=batch_size,
+                bucket_size=bucket_size,
+                shuffle_batches=shuffle_batches,
+                shuffle_within_bucket=shuffle_within_bucket,
+                drop_last=drop_last,
+                seed=seed,
+            )
+            use_bucket_sampler = True
+
+    if use_bucket_sampler and batch_sampler is not None:
+        data_loader = DataLoader(dataset,
+                                 batch_sampler=batch_sampler,
+                                 num_workers=num_workers,
+                                 collate_fn=collate_fn,
+                                 pin_memory=(device != 'cpu'))
+    else:
+        data_loader = DataLoader(dataset,
+                                 batch_size=batch_size,
+                                 shuffle=(not validation),
+                                 num_workers=num_workers,
+                                 drop_last=(not validation),
+                                 collate_fn=collate_fn,
+                                 pin_memory=(device != 'cpu'))
 
     return data_loader

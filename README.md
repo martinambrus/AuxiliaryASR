@@ -22,6 +22,19 @@ Please specify the training and validation data in `config.yml` file. The data l
 
 Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take - but not beyond 64, as anything beyond this value did not yield desired results in my testing. Please note that `batch_size = 64` will take around 10G GPU RAM.
 
+### Length-aware batching
+
+The default configuration now keeps batches balanced by grouping utterances with comparable durations. This prevents training from oscillating between very short and very long batches once SortaGrad switches to shuffled data. You can tweak or disable the sampler in `Configs/config.yml`:
+
+```yaml
+dataloader_params:
+  train_bucket_sampler:
+    enabled: true          # set to false to revert to the old uniform sampler
+    bucket_size_multiplier: 20  # bucket = batch_size * multiplier
+    shuffle_within_bucket: true # reshuffle items inside a bucket every epoch
+    shuffle_batches: true       # randomize bucket order for each epoch
+```
+
 ### Training on smaller datasets
 
 Fine-tuning on very small corpora (a few hours of speech or less) tends to overfit quickly. The default `config.yml` now enables a light SpecAugment policy and a slightly smaller weight for the CTC branch (`loss_weights.ctc`). You can tweak those options to better fit your use case:
