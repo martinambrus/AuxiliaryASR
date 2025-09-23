@@ -189,6 +189,12 @@ def main(config_path):
         'n_layers': 5,
         'location_kernel_size': 31
     })
+
+    if not 'n_token' in model_params:
+        model_params['n_token'] = len( word_indexes )
+
+    print("Using model parameters:", model_params)
+
     model = build_model(model_params=model_params)
 
     scheduler_params = {
