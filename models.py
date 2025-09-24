@@ -75,19 +75,21 @@ class ASRCNN(nn.Module):
             if not torch.is_tensor(feature_lengths):
                 feature_lengths = torch.tensor(feature_lengths, device=x.device, dtype=torch.long)
             else:
-                feature_lengths = feature_lengths.to(device=x.device)
-            encoder_lengths = feature_lengths // (2 ** self.n_down)
+                feature_lengths = feature_lengths.to(device=x.device, dtype=torch.long)
+            encoder_lengths = self._downsample_lengths(feature_lengths)
         x = self.cnns(x)
 
         x = self.projection(x)
         if encoder_lengths is not None:
             max_time = x.size(-1)
-            encoder_lengths = encoder_lengths.clamp(max=max_time)
+            max_time_tensor = torch.full_like(encoder_lengths, max_time)
+            encoder_lengths = torch.minimum(encoder_lengths, max_time_tensor)
+            encoder_lengths = torch.clamp(encoder_lengths, min=0)
         x = x.transpose(1, 2)
         ctc_logit = self.ctc_linear(x)
         if text_input is not None:
             if src_key_padding_mask is None and encoder_lengths is not None:
-                src_key_padding_mask = self.length_to_mask(encoder_lengths)
+                src_key_padding_mask = self.length_to_mask(encoder_lengths, max_len=x.size(1))
             _, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
             return ctc_logit, s2s_logit, s2s_attn, encoder_lengths
         else:
@@ -120,14 +122,33 @@ class ASRCNN(nn.Module):
         features = self.projection(features)
         return features
 
-    def length_to_mask(self, lengths):
-        mask = (
-            torch.arange(lengths.max(), device=lengths.device)
-            .unsqueeze(0)
-            .expand(lengths.shape[0], -1)
-            .type_as(lengths)
-        )
-        mask = torch.gt(mask + 1, lengths.unsqueeze(1))
+    def _downsample_lengths(self, lengths):
+        if lengths is None:
+            return None
+        conv = self.init_cnn.conv
+        kernel = conv.kernel_size[0]
+        stride = conv.stride[0]
+        padding = conv.padding[0]
+        dilation = conv.dilation[0]
+        numerator = lengths + 2 * padding - dilation * (kernel - 1) - 1
+        downsampled = torch.floor_divide(numerator, stride) + 1
+        downsampled = torch.clamp(downsampled, min=0)
+        return downsampled.to(dtype=torch.long)
+
+    def length_to_mask(self, lengths, max_len=None):
+        if lengths.numel() == 0:
+            return lengths.new_zeros((0, 0), dtype=torch.bool)
+
+        if max_len is None:
+            max_len = int(lengths.max().item())
+        else:
+            max_len = int(max_len)
+
+        if max_len <= 0:
+            return lengths.new_zeros((lengths.size(0), 0), dtype=torch.bool)
+
+        range_tensor = torch.arange(max_len, device=lengths.device, dtype=lengths.dtype)
+        mask = range_tensor.unsqueeze(0) >= lengths.unsqueeze(1)
         return mask
 
     def get_future_mask(self, out_length, unmask_future_steps=0):
