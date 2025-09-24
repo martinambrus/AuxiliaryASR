@@ -39,7 +39,9 @@ class Trainer(object):
                  use_diagonal_attention_prior = True,
                  diagonal_attention_prior_weight = 0.1,
                  ctc_weight=1.0,
-                 s2s_weight=1.0):
+                 s2s_weight=1.0,
+                 ssl_frontend_config=None,
+                 input_sample_rate=None):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -64,6 +66,9 @@ class Trainer(object):
         self.maxm_mem_usage = 0
         self.ctc_weight = ctc_weight
         self.s2s_weight = s2s_weight
+        self.ssl_frontend_config = ssl_frontend_config or {}
+        self.use_ssl_frontend = getattr(self.model, 'use_ssl_frontend', False) and bool(self.ssl_frontend_config.get('enabled', getattr(self.model, 'use_ssl_frontend', False)))
+        self.input_sample_rate = input_sample_rate
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -181,21 +186,45 @@ class Trainer(object):
         # FIX: trying to fix OOM errors
         #torch.cuda.empty_cache()
         self.optimizer.zero_grad()
-        batch = [b.to(self.device) for b in batch]
-        text_input, text_input_length, mel_input, mel_input_length = batch
-        mel_input_length = mel_input_length // (2 ** self.model.n_down)
-        future_mask = self.model.get_future_mask(
-            mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
-        mel_mask = self.model.length_to_mask(mel_input_length)
-        text_mask = self.model.length_to_mask(text_input_length)
-        ppgs, s2s_pred, s2s_attn = self.model(
-            mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+        if self.use_ssl_frontend:
+            text_input, text_input_length, _, _, wave_input, wave_lengths = batch
+            text_input = text_input.to(self.device)
+            text_input_length = text_input_length.to(self.device)
+            wave_input = wave_input.to(self.device)
+            wave_lengths = wave_lengths.to(self.device)
+            ppgs, s2s_pred, s2s_attn, encoder_lengths = self.model(
+                wave_input,
+                src_key_padding_mask=None,
+                text_input=text_input,
+                input_lengths=wave_lengths,
+                sampling_rate=self.input_sample_rate,
+            )
+        else:
+            text_input, text_input_length, mel_input, mel_input_length = batch
+            text_input = text_input.to(self.device)
+            text_input_length = text_input_length.to(self.device)
+            mel_input = mel_input.to(self.device)
+            mel_input_length = mel_input_length.to(self.device)
+            ppgs, s2s_pred, s2s_attn, encoder_lengths = self.model(
+                mel_input,
+                src_key_padding_mask=None,
+                text_input=text_input,
+                input_lengths=mel_input_length,
+            )
+
+        if encoder_lengths is None:
+            encoder_lengths = torch.full(
+                (ppgs.size(0),),
+                ppgs.size(1),
+                device=ppgs.device,
+                dtype=torch.long,
+            )
 
         if self.use_diagonal_attention_prior:
-            loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, mel_input_length)
+            loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, encoder_lengths)
 
         loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
-                                      text_input, mel_input_length, text_input_length)
+                                      text_input, encoder_lengths, text_input_length)
 
         loss_s2s = 0
         for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
@@ -249,17 +278,42 @@ class Trainer(object):
         eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
         for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
-            batch = [b.to(self.device) for b in batch]
-            text_input, text_input_length, mel_input, mel_input_length = batch
-            mel_input_length = mel_input_length // (2 ** self.model.n_down)
-            future_mask = self.model.get_future_mask(
-                mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
-            mel_mask = self.model.length_to_mask(mel_input_length)
-            text_mask = self.model.length_to_mask(text_input_length)
-            ppgs, s2s_pred, s2s_attn = self.model(
-                mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+            if self.use_ssl_frontend:
+                text_input, text_input_length, _, _, wave_input, wave_lengths = batch
+                text_input = text_input.to(self.device)
+                text_input_length = text_input_length.to(self.device)
+                wave_input = wave_input.to(self.device)
+                wave_lengths = wave_lengths.to(self.device)
+                ppgs, s2s_pred, s2s_attn, encoder_lengths = self.model(
+                    wave_input,
+                    src_key_padding_mask=None,
+                    text_input=text_input,
+                    input_lengths=wave_lengths,
+                    sampling_rate=self.input_sample_rate,
+                )
+            else:
+                text_input, text_input_length, mel_input, mel_input_length = batch
+                text_input = text_input.to(self.device)
+                text_input_length = text_input_length.to(self.device)
+                mel_input = mel_input.to(self.device)
+                mel_input_length = mel_input_length.to(self.device)
+                ppgs, s2s_pred, s2s_attn, encoder_lengths = self.model(
+                    mel_input,
+                    src_key_padding_mask=None,
+                    text_input=text_input,
+                    input_lengths=mel_input_length,
+                )
+
+            if encoder_lengths is None:
+                encoder_lengths = torch.full(
+                    (ppgs.size(0),),
+                    ppgs.size(1),
+                    device=ppgs.device,
+                    dtype=torch.long,
+                )
+
             loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
-                                          text_input, mel_input_length, text_input_length)
+                                          text_input, encoder_lengths, text_input_length)
             loss_s2s = 0
             for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
                 loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
@@ -275,7 +329,7 @@ class Trainer(object):
                              pred[:mel_length],
                              ignore_indexes=list(range(5))) \
                     for target, pred, text_length, mel_length in zip(
-                            text_input.cpu(), amax_ppgs.cpu(), text_input_length.cpu(), mel_input_length.cpu())]
+                            text_input.cpu(), amax_ppgs.cpu(), text_input_length.cpu(), encoder_lengths.cpu())]
             eval_losses["eval/wer"].extend(wers)
 
             _, amax_s2s = torch.max(s2s_pred, dim=2)

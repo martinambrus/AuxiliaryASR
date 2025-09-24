@@ -4,8 +4,13 @@ from torch import nn
 from torch.nn import TransformerEncoder
 import torch.nn.functional as F
 from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
+from ssl_frontend import SSLFrontend
 
-def build_model(model_params={}, model_type='asr'):
+
+def build_model(model_params={}, model_type='asr', ssl_frontend_config=None):
+    if ssl_frontend_config is not None:
+        model_params = dict(model_params)
+        model_params['ssl_frontend_config'] = ssl_frontend_config
     model = ASRCNN(**model_params)
     return model
 
@@ -18,12 +23,34 @@ class ASRCNN(nn.Module):
                  n_layers=6,
                  token_embedding_dim=256,
                  location_kernel_size=63,
+                 ssl_frontend_config=None,
     ):
         super().__init__()
         self.n_token = n_token
         self.n_down = 1
-        self.to_mfcc = MFCC()
-        self.init_cnn = ConvNorm(input_dim//2, hidden_dim, kernel_size=7, padding=3, stride=2)
+        self.ssl_frontend_config = ssl_frontend_config or {}
+        self.use_ssl_frontend = bool(self.ssl_frontend_config.get('enabled', False))
+        self.ssl_frontend = None
+        self.ssl_target_sample_rate = None
+
+        if self.use_ssl_frontend:
+            self.ssl_frontend = SSLFrontend(
+                architecture=self.ssl_frontend_config.get('architecture'),
+                pretrained_model_name=self.ssl_frontend_config.get('pretrained_model_name'),
+                fine_tune=self.ssl_frontend_config.get('fine_tune', False),
+                output_layer=self.ssl_frontend_config.get('output_layer', -1),
+                layer_norm=self.ssl_frontend_config.get('layer_norm', True),
+                feature_projection_dim=self.ssl_frontend_config.get('feature_projection_dim'),
+                target_sample_rate=self.ssl_frontend_config.get('target_sample_rate'),
+            )
+            frontend_dim = self.ssl_frontend.output_dim
+            self.ssl_target_sample_rate = self.ssl_frontend.target_sample_rate
+            self.to_mfcc = None
+        else:
+            self.to_mfcc = MFCC(n_mfcc=input_dim // 2, n_mels=input_dim)
+            frontend_dim = input_dim // 2
+
+        self.init_cnn = ConvNorm(frontend_dim, hidden_dim, kernel_size=7, padding=3, stride=2)
         self.cnns = nn.Sequential(
             *[nn.Sequential(
                 ConvBlock(hidden_dim),
@@ -40,27 +67,55 @@ class ASRCNN(nn.Module):
             n_token=n_token,
             location_kernel_size=location_kernel_size)
 
-    def forward(self, x, src_key_padding_mask=None, text_input=None):
-        x = self.to_mfcc(x)
+    def forward(self, x, src_key_padding_mask=None, text_input=None, input_lengths=None, sampling_rate=None):
+        x, feature_lengths = self._preprocess_input(x, input_lengths=input_lengths, sampling_rate=sampling_rate)
         x = self.init_cnn(x)
+        encoder_lengths = None
+        if feature_lengths is not None:
+            if not torch.is_tensor(feature_lengths):
+                feature_lengths = torch.tensor(feature_lengths, device=x.device, dtype=torch.long)
+            else:
+                feature_lengths = feature_lengths.to(device=x.device)
+            encoder_lengths = feature_lengths // (2 ** self.n_down)
         x = self.cnns(x)
 
         x = self.projection(x)
         x = x.transpose(1, 2)
         ctc_logit = self.ctc_linear(x)
         if text_input is not None:
+            if src_key_padding_mask is None and encoder_lengths is not None:
+                src_key_padding_mask = self.length_to_mask(encoder_lengths)
             _, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
-            return ctc_logit, s2s_logit, s2s_attn
+            return ctc_logit, s2s_logit, s2s_attn, encoder_lengths
         else:
-            return ctc_logit
+            return ctc_logit, encoder_lengths
 
-    def get_feature(self, x):
-        x = self.to_mfcc(x)
-        x = self.init_cnn(x)
-        x = self.cnns(x)
-        x = self.instance_norm(x)
-        x = self.projection(x)
-        return x
+    def _preprocess_input(self, x, input_lengths=None, sampling_rate=None):
+        if self.use_ssl_frontend:
+            return self.ssl_frontend(x, lengths=input_lengths, sampling_rate=sampling_rate)
+        else:
+            features = self.to_mfcc(x)
+            if input_lengths is None:
+                feature_lengths = torch.full(
+                    (features.size(0),),
+                    features.size(2),
+                    device=features.device,
+                    dtype=torch.long,
+                )
+            else:
+                feature_lengths = torch.as_tensor(
+                    input_lengths,
+                    device=features.device,
+                    dtype=torch.long,
+                )
+            return features, feature_lengths
+
+    def get_feature(self, x, input_lengths=None, sampling_rate=None):
+        features, _ = self._preprocess_input(x, input_lengths=input_lengths, sampling_rate=sampling_rate)
+        features = self.init_cnn(features)
+        features = self.cnns(features)
+        features = self.projection(features)
+        return features
 
     def length_to_mask(self, lengths):
         mask = (

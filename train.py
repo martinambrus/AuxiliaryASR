@@ -227,6 +227,37 @@ def main(config_path):
         'mel_params': cfg_get_nested( config, 'preprocess_params.mel_params', { 'n_mels': 80 })
     }
 
+    ssl_frontend_config = cfg_get_nested(config, 'ssl_frontend', {}) or {}
+    ssl_frontend_enabled = bool(ssl_frontend_config.get('enabled', False))
+    if ssl_frontend_enabled:
+        default_models = {
+            'wav2vec2': 'facebook/wav2vec2-base',
+            'hubert': 'facebook/hubert-base-ls960',
+            'wavlm': 'microsoft/wavlm-base',
+            'xlsr': 'facebook/wav2vec2-large-xlsr-53',
+        }
+        selected_architecture = ssl_frontend_config.get('architecture')
+        selected_model_name = ssl_frontend_config.get('pretrained_model_name')
+
+        for candidate in ('wav2vec2', 'hubert', 'wavlm', 'xlsr'):
+            candidate_cfg = ssl_frontend_config.get(candidate)
+            if isinstance(candidate_cfg, dict) and candidate_cfg.get('enabled'):
+                selected_architecture = candidate
+                candidate_model = candidate_cfg.get('pretrained_model_name') or candidate_cfg.get('model_name')
+                if candidate_model:
+                    selected_model_name = candidate_model
+                break
+
+        if selected_architecture is None:
+            selected_architecture = 'wav2vec2'
+        if not selected_model_name:
+            selected_model_name = default_models.get(selected_architecture)
+
+        ssl_frontend_config['architecture'] = selected_architecture
+        ssl_frontend_config['pretrained_model_name'] = selected_model_name
+    else:
+        ssl_frontend_config = {'enabled': False}
+
     dataset_additional_params = cfg_get_nested(config, 'dataset_params', {})
     if isinstance(dataset_additional_params, dict):
         for override_key in ('dict_path', 'sr', 'spect_params', 'mel_params'):
@@ -252,31 +283,39 @@ def main(config_path):
     val_num_workers = int(dataloader_params.get('val_num_workers', 2))
     train_bucket_sampler_config = dataloader_params.get('train_bucket_sampler', {})
 
+    collate_config = {}
+    if ssl_frontend_config.get('enabled', False):
+        collate_config['return_wave'] = True
+
     sorted_train_dataloader = build_dataloader(train_list_sorted,
                                         batch_size=batch_size,
                                         num_workers=train_num_workers,
                                         dataset_config=dataset_params,
-                                        device=device)
+                                        device=device,
+                                        collate_config=collate_config)
     shuffled_train_dataloader = build_dataloader(train_entries,
                                             batch_size=batch_size,
                                             num_workers=train_num_workers,
                                             dataset_config=dataset_params,
                                             device=device,
                                             lengths=train_durations,
-                                            bucket_sampler_config=train_bucket_sampler_config)
+                                            bucket_sampler_config=train_bucket_sampler_config,
+                                            collate_config=collate_config)
 
     sorted_val_dataloader = build_dataloader(val_list_sorted,
                                       batch_size=batch_size,
                                       validation=True,
                                       num_workers=val_num_workers,
                                       device=device,
-                                      dataset_config=dataset_params)
+                                      dataset_config=dataset_params,
+                                      collate_config=collate_config)
     shuffled_val_dataloader = build_dataloader(val_entries,
                                           batch_size=batch_size,
                                           validation=True,
                                           num_workers=val_num_workers,
                                           device=device,
-                                          dataset_config=dataset_params)
+                                          dataset_config=dataset_params,
+                                          collate_config=collate_config)
 
     word_indexes = set(
         line.strip() for line in open(cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'))
@@ -296,8 +335,10 @@ def main(config_path):
         model_params['n_token'] = len( word_indexes )
 
     print("Using model parameters:", model_params)
+    if ssl_frontend_config.get('enabled', False):
+        print("Using SSL frontend configuration:", ssl_frontend_config)
 
-    model = build_model(model_params=model_params)
+    model = build_model(model_params=model_params, ssl_frontend_config=ssl_frontend_config)
 
     scheduler_params = {
             'max_lr': float(cfg_get_nested( config, 'optimizer_params.lr', 5e-4)),
@@ -341,6 +382,8 @@ def main(config_path):
                     diagonal_attention_prior_weight=cfg_get_nested( config, 'diagonal_attention_prior_weight', 0.1),
                     ctc_weight=ctc_weight,
                     s2s_weight=s2s_weight,
+                    ssl_frontend_config=ssl_frontend_config,
+                    input_sample_rate=dataset_params.get('sr', 24000),
                     )
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )

@@ -67,3 +67,51 @@ dataloader_params:
 loss_weights:
   ctc: 0.8
   s2s: 1.0
+
+ssl_frontend:
+  enabled: false
+  # Toggle individual pretrained encoders below. The first enabled entry
+  # determines which encoder configuration will be used when
+  # ``ssl_frontend.enabled`` is true. Leave all disabled to rely on the
+  # default mel-spectrogram front-end.
+  wav2vec2:
+    enabled: false
+    pretrained_model_name: "facebook/wav2vec2-base"
+  hubert:
+    enabled: false
+    pretrained_model_name: "facebook/hubert-base-ls960"
+  wavlm:
+    enabled: false
+    pretrained_model_name: "microsoft/wavlm-base"
+  xlsr:
+    enabled: false
+    pretrained_model_name: "facebook/wav2vec2-large-xlsr-53"
+
+  # ``architecture`` and ``pretrained_model_name`` can be used to override the
+  # automatically selected encoder from the toggles above. Supported
+  # architectures: wav2vec2, hubert, wavlm, xlsr.
+  architecture: null
+  pretrained_model_name: null
+
+  # When ``fine_tune`` is false the encoder is kept frozen and gradients are
+  # not computed, allowing the rest of the model to benefit from pretrained
+  # representations with negligible overhead. Set to true to update the
+  # encoder weights during training.
+  fine_tune: false
+
+  # Layer index from which to read hidden states. Negative values follow the
+  # Python indexing convention (``-1`` selects the last layer).
+  output_layer: -1
+
+  # Optional dimensionality reduction applied on top of the SSL features. Use
+  # ``null`` to keep the native hidden size produced by the encoder.
+  feature_projection_dim: null
+
+  # Apply LayerNorm to the extracted features (recommended when combining
+  # with randomly initialized decoders).
+  layer_norm: true
+
+  # Desired sample rate for the encoder. When ``null`` the dataset sample rate
+  # will be used. Set this explicitly if the selected checkpoint expects a
+  # specific value (e.g. 16000 for most wav2vec2-family models).
+  target_sample_rate: null

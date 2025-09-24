@@ -315,7 +315,13 @@ class Collater(object):
 
         if self.return_wave:
             waves = [b[0] for b in batch]
-            return texts, input_lengths, mels, output_lengths, paths, waves
+            wave_lengths = torch.LongTensor([wave.size(0) for wave in waves])
+            max_wave_length = int(wave_lengths.max().item()) if wave_lengths.numel() > 0 else 0
+            wave_tensor = torch.zeros((batch_size, max_wave_length)).float()
+            for bid, wave in enumerate(waves):
+                wave_tensor[bid, :wave_lengths[bid]] = wave
+
+            return texts, input_lengths, mels, output_lengths, wave_tensor, wave_lengths
 
         return texts, input_lengths, mels, output_lengths
 
