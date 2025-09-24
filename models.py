@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.nn import TransformerEncoder
 import torch.nn.functional as F
-from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
+from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock, VarianceAdaptor
 
 def build_model(model_params={}, model_type='asr'):
     model = ASRCNN(**model_params)
@@ -18,6 +18,8 @@ class ASRCNN(nn.Module):
                  n_layers=6,
                  token_embedding_dim=256,
                  location_kernel_size=63,
+                 enable_variance_adaptor=False,
+                 variance_adaptor_params=None,
     ):
         super().__init__()
         self.n_token = n_token
@@ -38,9 +40,12 @@ class ASRCNN(nn.Module):
             embedding_dim=token_embedding_dim,
             hidden_dim=hidden_dim//2,
             n_token=n_token,
-            location_kernel_size=location_kernel_size)
+            location_kernel_size=location_kernel_size,
+            enable_variance_adaptor=enable_variance_adaptor,
+            variance_adaptor_params=variance_adaptor_params)
+        self.enable_variance_adaptor = enable_variance_adaptor
 
-    def forward(self, x, src_key_padding_mask=None, text_input=None):
+    def forward(self, x, src_key_padding_mask=None, text_input=None, text_mask=None):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
         x = self.cnns(x)
@@ -48,11 +53,21 @@ class ASRCNN(nn.Module):
         x = self.projection(x)
         x = x.transpose(1, 2)
         ctc_logit = self.ctc_linear(x)
+        outputs = {
+            "logits_ctc": ctc_logit,
+        }
         if text_input is not None:
-            _, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
-            return ctc_logit, s2s_logit, s2s_attn
-        else:
-            return ctc_logit
+            hidden, s2s_logit, s2s_attn, duration_pred = self.asr_s2s(
+                x, src_key_padding_mask, text_input, text_mask=text_mask)
+            outputs.update({
+                "logits_s2s": s2s_logit,
+                "alignments": s2s_attn,
+            })
+            if duration_pred is not None:
+                outputs["duration_pred"] = duration_pred
+            outputs["decoder_hidden"] = hidden
+            return outputs
+        return outputs
 
     def get_feature(self, x):
         x = self.to_mfcc(x)
@@ -67,10 +82,10 @@ class ASRCNN(nn.Module):
             torch.arange(lengths.max(), device=lengths.device)
             .unsqueeze(0)
             .expand(lengths.shape[0], -1)
-            .type_as(lengths)
+            .to(lengths.device)
         )
         mask = torch.gt(mask + 1, lengths.unsqueeze(1))
-        return mask
+        return mask.to(dtype=torch.bool)
 
     def get_future_mask(self, out_length, unmask_future_steps=0):
         """
@@ -90,7 +105,9 @@ class ASRS2S(nn.Module):
                  hidden_dim=512,
                  n_location_filters=32,
                  location_kernel_size=63,
-                 n_token=40):
+                 n_token=40,
+                 enable_variance_adaptor=False,
+                 variance_adaptor_params=None):
         super(ASRS2S, self).__init__()
         self.embedding = nn.Embedding(n_token, embedding_dim)
         val_range = math.sqrt(6 / hidden_dim)
@@ -111,6 +128,13 @@ class ASRS2S(nn.Module):
             nn.Tanh())
         self.sos = 1
         self.eos = 2
+        self.enable_variance_adaptor = enable_variance_adaptor
+        self.variance_adaptor = None
+        if self.enable_variance_adaptor:
+            adaptor_params = variance_adaptor_params or {}
+            self.variance_adaptor = VarianceAdaptor(
+                in_dim=hidden_dim,
+                predictor_params=adaptor_params.get("duration", adaptor_params))
 
     def initialize_decoder_states(self, memory, mask):
         """
@@ -128,7 +152,7 @@ class ASRS2S(nn.Module):
         self.unk_index = 3
         self.random_mask = 0.1
 
-    def forward(self, memory, memory_mask, text_input):
+    def forward(self, memory, memory_mask, text_input, text_mask=None):
         """
         moemory.shape = (B, L, H) = (Batchsize, Maxtimestep, Hiddendim)
         moemory_mask.shape = (B, L, )
@@ -160,7 +184,15 @@ class ASRS2S(nn.Module):
             self.parse_decoder_outputs(
                 hidden_outputs, logit_outputs, alignments)
 
-        return hidden_outputs, logit_outputs, alignments
+        duration_pred = None
+        if self.variance_adaptor is not None:
+            target_length = text_input.size(1)
+            token_hidden = hidden_outputs[:, 1:target_length + 1, :]
+            if text_mask is not None and text_mask.size(1) > target_length:
+                text_mask = text_mask[:, :target_length]
+            duration_pred = self.variance_adaptor(token_hidden, text_mask=text_mask)
+
+        return hidden_outputs, logit_outputs, alignments, duration_pred
 
 
     def decode(self, decoder_input):

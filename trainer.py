@@ -12,7 +12,9 @@ from torch import nn
 from PIL import Image
 from tqdm import tqdm
 
-from utils import calc_wer
+import torch.nn.functional as F
+
+from utils import calc_wer, diagonal_attention_prior, attention_to_duration_targets
 
 import logging
 logger = logging.getLogger(__name__)
@@ -39,7 +41,8 @@ class Trainer(object):
                  use_diagonal_attention_prior = True,
                  diagonal_attention_prior_weight = 0.1,
                  ctc_weight=1.0,
-                 s2s_weight=1.0):
+                 s2s_weight=1.0,
+                 aux_alignment_config=None):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -64,6 +67,7 @@ class Trainer(object):
         self.maxm_mem_usage = 0
         self.ctc_weight = ctc_weight
         self.s2s_weight = s2s_weight
+        self.aux_alignment_config = aux_alignment_config or {}
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -146,10 +150,69 @@ class Trainer(object):
             torch.arange(lengths.max(), device=lengths.device)
             .unsqueeze(0)
             .expand(lengths.shape[0], -1)
-            .type_as(lengths)
+            .to(lengths.device)
         )
         mask = torch.gt(mask + 1, lengths.unsqueeze(1))
-        return mask
+        return mask.to(dtype=torch.bool)
+
+    def _compute_duration_loss(self, duration_pred, alignments, text_lengths, mel_lengths, text_mask):
+        if duration_pred is None or alignments is None:
+            return None
+
+        if not self.aux_alignment_config.get('enabled', False):
+            return None
+
+        with torch.no_grad():
+            duration_targets = attention_to_duration_targets(
+                alignments,
+                text_lengths=text_lengths,
+                mel_lengths=mel_lengths,
+                detach_attention=self.aux_alignment_config.get('detach_attention', True)
+            )
+
+        if duration_targets is None:
+            return None
+
+        duration_targets = duration_targets.to(duration_pred.device)
+        if text_mask is not None and duration_targets.size(1) > text_mask.size(1):
+            text_mask = F.pad(text_mask, (0, duration_targets.size(1) - text_mask.size(1)), value=True)
+        if text_mask is not None and duration_targets.size(1) < text_mask.size(1):
+            text_mask = text_mask[:, :duration_targets.size(1)]
+
+        valid_mask = None
+        if text_mask is not None:
+            valid_mask = ~text_mask
+
+        offset = float(self.aux_alignment_config.get('duration_offset', 1.0))
+        use_log = self.aux_alignment_config.get('use_log_duration_loss', True)
+
+        target_tensor = duration_targets.float()
+        if use_log:
+            target_tensor = torch.log(target_tensor + offset)
+
+        pred_tensor = duration_pred
+        if pred_tensor.size(1) < target_tensor.size(1):
+            target_tensor = target_tensor[:, :pred_tensor.size(1)]
+            if valid_mask is not None:
+                valid_mask = valid_mask[:, :pred_tensor.size(1)]
+        elif pred_tensor.size(1) > target_tensor.size(1):
+            pad_size = pred_tensor.size(1) - target_tensor.size(1)
+            target_tensor = F.pad(target_tensor, (0, pad_size))
+            if valid_mask is not None:
+                valid_mask = F.pad(valid_mask, (0, pad_size), value=False)
+
+        if valid_mask is not None:
+            pred_flat = pred_tensor.masked_select(valid_mask)
+            target_flat = target_tensor.masked_select(valid_mask)
+        else:
+            pred_flat = pred_tensor.reshape(-1)
+            target_flat = target_tensor.reshape(-1)
+
+        if pred_flat.numel() == 0:
+            return None
+
+        loss = F.mse_loss(pred_flat, target_flat)
+        return loss
 
     def _get_lr(self):
         for param_group in self.optimizer.param_groups:
@@ -184,35 +247,75 @@ class Trainer(object):
         batch = [b.to(self.device) for b in batch]
         text_input, text_input_length, mel_input, mel_input_length = batch
         mel_input_length = mel_input_length // (2 ** self.model.n_down)
-        future_mask = self.model.get_future_mask(
-            mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
         mel_mask = self.model.length_to_mask(mel_input_length)
         text_mask = self.model.length_to_mask(text_input_length)
-        ppgs, s2s_pred, s2s_attn = self.model(
-            mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+        model_outputs = self.model(
+            mel_input,
+            src_key_padding_mask=mel_mask,
+            text_input=text_input,
+            text_mask=text_mask,
+        )
 
-        if self.use_diagonal_attention_prior:
+        if isinstance(model_outputs, dict):
+            ppgs = model_outputs.get('logits_ctc')
+            s2s_pred = model_outputs.get('logits_s2s')
+            s2s_attn = model_outputs.get('alignments')
+            duration_pred = model_outputs.get('duration_pred')
+        else:
+            ppgs, s2s_pred, s2s_attn = model_outputs
+            duration_pred = None
+
+        if ppgs is None or s2s_pred is None:
+            raise ValueError("Model must return both CTC and seq2seq logits during training")
+
+        if self.use_diagonal_attention_prior and s2s_attn is not None:
             loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, mel_input_length)
+        else:
+            loss_diagonal = 0
 
-        loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
-                                      text_input, mel_input_length, text_input_length)
+        loss_ctc = self.criterion['ctc'](
+            ppgs.log_softmax(dim=2).transpose(0, 1),
+            text_input,
+            mel_input_length,
+            text_input_length,
+        )
 
         loss_s2s = 0
         for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
             loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
         loss_s2s /= text_input.size(0)
 
+        duration_loss = self._compute_duration_loss(
+            duration_pred,
+            s2s_attn,
+            text_lengths=text_input_length,
+            mel_lengths=mel_input_length,
+            text_mask=text_mask,
+        )
+
         total_loss = self.ctc_weight * loss_ctc + self.s2s_weight * loss_s2s
-        if self.use_diagonal_attention_prior:
+        if self.use_diagonal_attention_prior and s2s_attn is not None:
             total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
+
+        if duration_loss is not None:
+            weight = float(self.aux_alignment_config.get('loss_weight', 1.0))
+            total_loss = total_loss + weight * duration_loss
+
         loss = total_loss
         loss.backward()
         torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
         self.optimizer.step()
         self.scheduler.step()
-        return {'loss': loss.item(),
-                'ctc': loss_ctc.item(),
-                's2s': loss_s2s.item()}
+        result = {
+            'loss': loss.item(),
+            'ctc': loss_ctc.item(),
+            's2s': loss_s2s.item(),
+        }
+        if duration_loss is not None:
+            result['duration'] = duration_loss.item()
+        if self.use_diagonal_attention_prior and s2s_attn is not None:
+            result['diagonal'] = loss_diagonal.item() if not isinstance(loss_diagonal, (int, float)) else float(loss_diagonal)
+        return result
 
     def _train_epoch(self):
         # switch dataloader if we're above configured epoch
@@ -252,23 +355,48 @@ class Trainer(object):
             batch = [b.to(self.device) for b in batch]
             text_input, text_input_length, mel_input, mel_input_length = batch
             mel_input_length = mel_input_length // (2 ** self.model.n_down)
-            future_mask = self.model.get_future_mask(
-                mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
             mel_mask = self.model.length_to_mask(mel_input_length)
             text_mask = self.model.length_to_mask(text_input_length)
-            ppgs, s2s_pred, s2s_attn = self.model(
-                mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+            model_outputs = self.model(
+                mel_input,
+                src_key_padding_mask=mel_mask,
+                text_input=text_input,
+                text_mask=text_mask,
+            )
+
+            if isinstance(model_outputs, dict):
+                ppgs = model_outputs.get('logits_ctc')
+                s2s_pred = model_outputs.get('logits_s2s')
+                s2s_attn = model_outputs.get('alignments')
+                duration_pred = model_outputs.get('duration_pred')
+            else:
+                ppgs, s2s_pred, s2s_attn = model_outputs
+                duration_pred = None
+
             loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
                                           text_input, mel_input_length, text_input_length)
             loss_s2s = 0
             for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
                 loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
             loss_s2s /= text_input.size(0)
-            loss = loss_ctc + loss_s2s
+
+            duration_loss = self._compute_duration_loss(
+                duration_pred,
+                s2s_attn,
+                text_lengths=text_input_length,
+                mel_lengths=mel_input_length,
+                text_mask=text_mask,
+            )
+
+            loss = self.ctc_weight * loss_ctc + self.s2s_weight * loss_s2s
+            if duration_loss is not None:
+                loss = loss + float(self.aux_alignment_config.get('loss_weight', 1.0)) * duration_loss
 
             eval_losses["eval/ctc"].append(loss_ctc.item())
             eval_losses["eval/s2s"].append(loss_s2s.item())
             eval_losses["eval/loss"].append(loss.item())
+            if duration_loss is not None:
+                eval_losses["eval/duration"].append(duration_loss.item())
 
             _, amax_ppgs = torch.max(ppgs, dim=2)
             wers = [calc_wer(target[:text_length],

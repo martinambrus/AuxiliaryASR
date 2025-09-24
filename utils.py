@@ -72,3 +72,45 @@ def diagonal_attention_prior(attn, text_lengths, mel_lengths, sigma=0.5):
     expected = expected.unsqueeze(0).expand(B, -1, -1)  # [B, T_text, T_mel]
     loss = torch.mean(attn * (1.0 - expected))  # Encourage attention mass to lie on the diagonal
     return loss
+
+
+def attention_to_duration_targets(alignments,
+                                  text_lengths,
+                                  mel_lengths,
+                                  detach_attention: bool = True):
+    """Convert attention matrices to integer duration targets per token."""
+
+    if alignments is None:
+        return None
+
+    if detach_attention:
+        alignments = alignments.detach()
+
+    alignments = alignments.float()
+    batch_size = alignments.size(0)
+    max_text_len = int(text_lengths.max().item()) if text_lengths.numel() > 0 else 0
+    if max_text_len == 0:
+        return None
+
+    durations = alignments.new_zeros((batch_size, max_text_len))
+
+    for idx in range(batch_size):
+        text_len = int(text_lengths[idx].item())
+        mel_len = int(mel_lengths[idx].item())
+        if text_len <= 0 or mel_len <= 0:
+            continue
+
+        attn = alignments[idx]
+        if attn.size(0) > text_len:
+            attn = attn[1:text_len + 1, :mel_len]
+        else:
+            attn = attn[:text_len, :mel_len]
+
+        if attn.numel() == 0:
+            continue
+
+        token_ids = torch.argmax(attn, dim=0)
+        counts = torch.bincount(token_ids, minlength=text_len).float()
+        durations[idx, :text_len] = counts
+
+    return durations

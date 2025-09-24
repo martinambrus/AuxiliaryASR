@@ -295,6 +295,13 @@ def main(config_path):
     if not 'n_token' in model_params:
         model_params['n_token'] = len( word_indexes )
 
+    alignment_aux_config = cfg_get_nested(config, 'alignment_auxiliary', {}) or {}
+    if alignment_aux_config.get('enabled', False):
+        model_params['enable_variance_adaptor'] = True
+        adaptor_params = alignment_aux_config.get('variance_adaptor_params', {})
+        if adaptor_params:
+            model_params['variance_adaptor_params'] = adaptor_params
+
     print("Using model parameters:", model_params)
 
     model = build_model(model_params=model_params)
@@ -341,6 +348,7 @@ def main(config_path):
                     diagonal_attention_prior_weight=cfg_get_nested( config, 'diagonal_attention_prior_weight', 0.1),
                     ctc_weight=ctc_weight,
                     s2s_weight=s2s_weight,
+                    aux_alignment_config=alignment_aux_config,
                     )
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )

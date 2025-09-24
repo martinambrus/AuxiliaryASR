@@ -67,3 +67,16 @@ dataloader_params:
 loss_weights:
   ctc: 0.8
   s2s: 1.0
+
+alignment_auxiliary:
+  enabled: false
+  loss_weight: 0.3
+  detach_attention: true
+  use_log_duration_loss: true
+  duration_offset: 1.0
+  variance_adaptor_params:
+    duration:
+      filter_size: 256
+      kernel_size: 3
+      dropout: 0.5
+      n_layers: 2

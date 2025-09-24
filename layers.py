@@ -207,6 +207,75 @@ class Attention(nn.Module):
 
         return attention_context, attention_weights
 
+class DurationPredictor(nn.Module):
+    """Predict log-duration per token using stacked 1-D convolutions."""
+
+    def __init__(self,
+                 in_dim: int,
+                 filter_size: int = 256,
+                 kernel_size: int = 3,
+                 dropout: float = 0.5,
+                 n_layers: int = 2):
+        super().__init__()
+        if n_layers < 1:
+            raise ValueError("DurationPredictor requires at least one layer")
+
+        padding = (kernel_size - 1) // 2
+        layers = []
+        current_dim = in_dim
+        for _ in range(n_layers):
+            conv = nn.Conv1d(current_dim, filter_size, kernel_size,
+                             padding=padding)
+            layer_norm = nn.LayerNorm(filter_size)
+            layers.append(nn.ModuleDict({
+                "conv": conv,
+                "layer_norm": layer_norm,
+            }))
+            current_dim = filter_size
+        self.layers = nn.ModuleList(layers)
+        self.proj = nn.Linear(current_dim, 1)
+        self.dropout = nn.Dropout(dropout)
+        self.activation = nn.ReLU()
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        """Return log-duration predictions for each token."""
+
+        out = x.transpose(1, 2)  # (B, C, T)
+        for layer in self.layers:
+            out = layer["conv"](out)
+            out = self.activation(out)
+            out = out.transpose(1, 2)
+            out = layer["layer_norm"](out)
+            out = self.dropout(out)
+            out = out.transpose(1, 2)
+        out = out.transpose(1, 2)  # (B, T, C)
+        out = self.proj(out).squeeze(-1)
+        if mask is not None:
+            out = out.masked_fill(mask, 0.0)
+        return out
+
+
+class VarianceAdaptor(nn.Module):
+    """FastSpeech-style variance adaptor that predicts phoneme durations."""
+
+    def __init__(self,
+                 in_dim: int,
+                 predictor_params: Optional[dict] = None):
+        super().__init__()
+        predictor_params = predictor_params or {}
+        self.duration_predictor = DurationPredictor(
+            in_dim=in_dim,
+            filter_size=int(predictor_params.get("filter_size", 256)),
+            kernel_size=int(predictor_params.get("kernel_size", 3)),
+            dropout=float(predictor_params.get("dropout", 0.5)),
+            n_layers=int(predictor_params.get("n_layers", 2)),
+        )
+
+    def forward(self, x: Tensor, text_mask: Optional[Tensor] = None) -> Tensor:
+        """Predict log-durations."""
+
+        return self.duration_predictor(x, mask=text_mask)
+
 class PhaseShuffle2d(nn.Module):
     def __init__(self, n=2):
         super(PhaseShuffle2d, self).__init__()
