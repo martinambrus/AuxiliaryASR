@@ -30,9 +30,11 @@ def drop_duplicated(chars):
     return ret_chars
 
 def build_criterion(critic_params={}, entropy_params={}):
+    ctc_params = {'zero_infinity': True}
+    ctc_params.update(critic_params.get('ctc', {}))
     criterion = {
         "ce": nn.CrossEntropyLoss(ignore_index=-1, **entropy_params),
-        "ctc": torch.nn.CTCLoss(**critic_params.get('ctc', {})),
+        "ctc": torch.nn.CTCLoss(**ctc_params),
     }
     return criterion
 

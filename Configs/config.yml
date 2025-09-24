@@ -111,6 +111,12 @@ ssl_frontend:
   # with randomly initialized decoders).
   layer_norm: true
 
+  # Optional stride for the convolutional bridge that follows the SSL
+  # features. Leave as ``null`` to default to ``1`` (no additional
+  # downsampling) when an SSL frontend is active, or set to ``2`` to mimic the
+  # original mel front-end behaviour.
+  init_cnn_stride: null
+
   # Desired sample rate for the encoder. When ``null`` the dataset sample rate
   # will be used. Set this explicitly if the selected checkpoint expects a
   # specific value (e.g. 16000 for most wav2vec2-family models).

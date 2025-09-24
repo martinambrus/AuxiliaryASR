@@ -126,11 +126,16 @@ class SSLFrontend(nn.Module):
         if sampling_rate is not None and sampling_rate != self.target_sample_rate:
             waveforms = AF.resample(waveforms, sampling_rate, self.target_sample_rate)
             if lengths is not None:
-                lengths = (lengths.to(torch.float32) * self.target_sample_rate / sampling_rate).floor().to(torch.long)
+                lengths = (
+                    lengths.to(torch.float32)
+                    * self.target_sample_rate
+                    / sampling_rate
+                ).floor().to(torch.long)
+                lengths = lengths.clamp(min=1)
 
         if lengths is not None:
             lengths = lengths.to(torch.long)
-            lengths = lengths.clamp(max=waveforms.size(1))
+            lengths = lengths.clamp(min=1, max=waveforms.size(1))
 
         device = waveforms.device
         dtype = next(self.model.parameters()).dtype
@@ -181,7 +186,10 @@ class SSLFrontend(nn.Module):
             encoder_lengths = None
 
         if encoder_lengths is not None:
-            encoder_lengths = encoder_lengths.clamp(max=max_feature_length)
+            if max_feature_length > 0:
+                encoder_lengths = encoder_lengths.clamp(min=1, max=max_feature_length)
+            else:
+                encoder_lengths = torch.zeros_like(encoder_lengths)
 
         return features, encoder_lengths
 

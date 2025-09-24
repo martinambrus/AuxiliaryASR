@@ -46,11 +46,20 @@ class ASRCNN(nn.Module):
             frontend_dim = self.ssl_frontend.output_dim
             self.ssl_target_sample_rate = self.ssl_frontend.target_sample_rate
             self.to_mfcc = None
+            default_stride = 1
         else:
             self.to_mfcc = MFCC(n_mfcc=input_dim // 2, n_mels=input_dim)
             frontend_dim = input_dim // 2
+            default_stride = 2
 
-        self.init_cnn = ConvNorm(frontend_dim, hidden_dim, kernel_size=7, padding=3, stride=2)
+        stride_override = self.ssl_frontend_config.get('init_cnn_stride')
+        if stride_override is None:
+            init_stride = default_stride
+        else:
+            init_stride = max(1, int(stride_override))
+        self.init_cnn_stride = init_stride
+
+        self.init_cnn = ConvNorm(frontend_dim, hidden_dim, kernel_size=7, padding=3, stride=self.init_cnn_stride)
         self.cnns = nn.Sequential(
             *[nn.Sequential(
                 ConvBlock(hidden_dim),
@@ -76,6 +85,7 @@ class ASRCNN(nn.Module):
                 feature_lengths = torch.tensor(feature_lengths, device=x.device, dtype=torch.long)
             else:
                 feature_lengths = feature_lengths.to(device=x.device, dtype=torch.long)
+            feature_lengths = torch.clamp(feature_lengths, min=1)
             encoder_lengths = self._downsample_lengths(feature_lengths)
         x = self.cnns(x)
 
@@ -83,8 +93,11 @@ class ASRCNN(nn.Module):
         if encoder_lengths is not None:
             max_time = x.size(-1)
             max_time_tensor = torch.full_like(encoder_lengths, max_time)
-            encoder_lengths = torch.minimum(encoder_lengths, max_time_tensor)
-            encoder_lengths = torch.clamp(encoder_lengths, min=0)
+            if max_time > 0:
+                encoder_lengths = torch.minimum(encoder_lengths, max_time_tensor)
+                encoder_lengths = torch.clamp(encoder_lengths, min=1)
+            else:
+                encoder_lengths = torch.zeros_like(encoder_lengths)
         x = x.transpose(1, 2)
         ctc_logit = self.ctc_linear(x)
         if text_input is not None:

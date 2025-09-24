@@ -168,7 +168,21 @@ class Trainer(object):
         height = 0
         width = 0
         for arr in arrs:
-            uint_arr = (((arr - arr.min()) / (arr.max() - arr.min())) * 255).astype(np.uint8)
+            np_arr = np.asarray(arr)
+            finite_mask = np.isfinite(np_arr)
+            if not finite_mask.any():
+                normalized = np.zeros_like(np_arr, dtype=np.float32)
+            else:
+                valid_values = np_arr[finite_mask]
+                min_val = valid_values.min()
+                max_val = valid_values.max()
+                range_val = max_val - min_val
+                if range_val <= 0:
+                    normalized = np.zeros_like(np_arr, dtype=np.float32)
+                else:
+                    normalized = (np_arr - min_val) / range_val
+            normalized = np.clip(normalized, 0.0, 1.0)
+            uint_arr = (normalized * 255).astype(np.uint8)
             pil_image = Image.fromarray(uint_arr)
             pil_images.append(pil_image)
             height += uint_arr.shape[0]
