@@ -610,17 +610,19 @@ def build_decoder(
     embedding_dim: int,
 ) -> nn.Module:
     config = config or {}
-    decoder_type = config.get("type", "transformer_relative")
+    requested_type = config.get("type")
 
-    def _ensure_enabled(section: Dict[str, Any]) -> None:
+    def _section(name: str) -> Dict[str, Any]:
+        return config.get(name, {})
+
+    def _ensure_enabled(name: str, section: Dict[str, Any]) -> None:
         if not section.get("enabled", True):
             raise ValueError(
-                f"Decoder '{decoder_type}' is disabled in the configuration."
+                f"Decoder '{name}' is disabled in the configuration."
             )
 
-    if decoder_type == "transformer_relative":
-        section = config.get("transformer_relative", {})
-        _ensure_enabled(section)
+    def _build_transformer(section: Dict[str, Any]) -> nn.Module:
+        _ensure_enabled("transformer_relative", section)
         return RelativeTransformerDecoder(
             embedding_dim=embedding_dim,
             hidden_dim=section.get("hidden_dim", encoder_dim),
@@ -632,9 +634,9 @@ def build_decoder(
             max_position=section.get("max_position", 512),
             random_mask=section.get("random_mask", 0.1),
         )
-    if decoder_type == "conformer":
-        section = config.get("conformer", {})
-        _ensure_enabled(section)
+
+    def _build_conformer(section: Dict[str, Any]) -> nn.Module:
+        _ensure_enabled("conformer", section)
         return ConformerDecoder(
             embedding_dim=embedding_dim,
             hidden_dim=section.get("hidden_dim", encoder_dim),
@@ -645,9 +647,9 @@ def build_decoder(
             dropout=section.get("dropout", 0.1),
             kernel_size=section.get("kernel_size", 15),
         )
-    if decoder_type == "rnnt":
-        section = config.get("rnnt", {})
-        _ensure_enabled(section)
+
+    def _build_rnnt(section: Dict[str, Any]) -> nn.Module:
+        _ensure_enabled("rnnt", section)
         return RNNTDecoder(
             embedding_dim=section.get("embedding_dim", embedding_dim),
             hidden_dim=section.get("hidden_dim", encoder_dim),
@@ -655,21 +657,56 @@ def build_decoder(
             joint_dim=section.get("joint_dim", encoder_dim),
             num_layers=section.get("num_layers", 1),
         )
-    if decoder_type == "mocha":
-        section = config.get("mocha", {})
-        _ensure_enabled(section)
+
+    def _build_mocha(section: Dict[str, Any]) -> nn.Module:
+        _ensure_enabled("mocha", section)
         return MonotonicDecoder(
             embedding_dim=section.get("embedding_dim", embedding_dim),
             hidden_dim=section.get("hidden_dim", encoder_dim),
             n_token=n_token,
             chunk_size=section.get("chunk_size", 4),
         )
-    if decoder_type == "cif":
-        section = config.get("cif", {})
-        _ensure_enabled(section)
+
+    def _build_cif(section: Dict[str, Any]) -> nn.Module:
+        _ensure_enabled("cif", section)
         return CIFDecoder(
             hidden_dim=section.get("hidden_dim", encoder_dim),
             n_token=n_token,
             output_dim=section.get("output_dim", encoder_dim),
         )
-    raise ValueError(f"Unsupported decoder type: {decoder_type}")
+
+    builders = {
+        "transformer_relative": _build_transformer,
+        "conformer": _build_conformer,
+        "rnnt": _build_rnnt,
+        "mocha": _build_mocha,
+        "cif": _build_cif,
+    }
+
+    order = list(builders.keys())
+
+    def _instantiate(name: str) -> nn.Module:
+        if name not in builders:
+            raise ValueError(f"Unsupported decoder type: {name}")
+        section = _section(name)
+        return builders[name](section)
+
+    if requested_type is not None:
+        return _instantiate(requested_type)
+
+    enabled = [
+        name for name in order if _section(name).get("enabled", False)
+    ]
+    if len(enabled) > 1:
+        enabled_str = ", ".join(enabled)
+        raise ValueError(
+            "Multiple decoder configurations are enabled simultaneously: "
+            f"{enabled_str}. Enable only one decoder or set"
+            " decoder_config.type explicitly."
+        )
+    if enabled:
+        return _instantiate(enabled[0])
+
+    # Default to the transformer-relative decoder when none is explicitly
+    # enabled. This maintains backward compatibility with earlier configs.
+    return _instantiate(order[0])

@@ -26,7 +26,6 @@ model_params:
    n_layers: 5
    location_kernel_size: 31
    decoder_config:
-     type: transformer_relative
      transformer_relative:
        enabled: true
        num_layers: 4

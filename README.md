@@ -24,7 +24,7 @@ Please specify the training and validation data in `config.yml` file. The data l
 
 `model_params.decoder_config` controls which sequence decoder is used on top of the CTC encoder. The configuration exposes five interchangeable designs that can be toggled on and off individually:
 
-| `type` value | Description |
+| Config section | Description |
 | --- | --- |
 | `transformer_relative` | Transformer decoder with relative-position biases and causal masking. |
 | `conformer` | Conformer-style decoder stack with convolutional modules. |
@@ -32,7 +32,7 @@ Please specify the training and validation data in `config.yml` file. The data l
 | `mocha` | Monotonic chunkwise attention decoder for strictly causal alignments. |
 | `cif` | Non-autoregressive Continuous Integrate-and-Fire decoder. |
 
-Each subsection inside `decoder_config` has an `enabled` flag so you can keep multiple parameter presets while switching the active decoder by setting the `type` field.
+Set `enabled: true` for the decoder you want to use and keep the rest disabled. Exactly one decoder should be enabled at a time; otherwise, the factory will raise an error. If none of the sections are enabled, the transformer-relative decoder is used by default. A legacy `type` override is still accepted for backward compatibility but is no longer required.
 
 Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take - but not beyond 64, as anything beyond this value did not yield desired results in my testing. Please note that `batch_size = 64` will take around 10G GPU RAM.
 
