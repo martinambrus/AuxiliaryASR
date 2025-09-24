@@ -168,6 +168,7 @@ class SSLFrontend(nn.Module):
             features = self.layer_norm(features)
 
         features = features.transpose(1, 2).contiguous()
+        max_feature_length = features.size(-1)
 
         if lengths is not None and hasattr(self.model, "_get_feat_extract_output_lengths"):
             cpu_lengths = lengths.detach().to(torch.long).cpu()
@@ -178,6 +179,9 @@ class SSLFrontend(nn.Module):
                 encoder_lengths = torch.tensor(encoder_lengths, device=device, dtype=torch.long)
         else:
             encoder_lengths = None
+
+        if encoder_lengths is not None:
+            encoder_lengths = encoder_lengths.clamp(max=max_feature_length)
 
         return features, encoder_lengths
 

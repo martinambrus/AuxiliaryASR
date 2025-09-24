@@ -80,6 +80,9 @@ class ASRCNN(nn.Module):
         x = self.cnns(x)
 
         x = self.projection(x)
+        if encoder_lengths is not None:
+            max_time = x.size(-1)
+            encoder_lengths = encoder_lengths.clamp(max=max_time)
         x = x.transpose(1, 2)
         ctc_logit = self.ctc_linear(x)
         if text_input is not None:
