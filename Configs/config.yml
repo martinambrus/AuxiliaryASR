@@ -25,6 +25,38 @@ model_params:
    token_embedding_dim: 512
    n_layers: 5
    location_kernel_size: 31
+   decoder_config:
+     type: transformer_relative
+     transformer_relative:
+       enabled: true
+       num_layers: 4
+       nhead: 4
+       dim_feedforward: 1024
+       dropout: 0.1
+       max_position: 512
+       random_mask: 0.1
+     conformer:
+       enabled: false
+       num_layers: 4
+       nhead: 4
+       dim_feedforward: 1024
+       dropout: 0.1
+       kernel_size: 15
+     rnnt:
+       enabled: false
+       embedding_dim: 512
+       hidden_dim: 256
+       joint_dim: 256
+       num_layers: 1
+     mocha:
+       enabled: false
+       embedding_dim: 512
+       hidden_dim: 256
+       chunk_size: 4
+     cif:
+       enabled: false
+       hidden_dim: 256
+       output_dim: 256
 
 optimizer_params:
   lr: 0.0005

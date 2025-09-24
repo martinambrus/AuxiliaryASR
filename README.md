@@ -18,7 +18,21 @@ pip install SoundFile torchaudio torch jiwer pyyaml click matplotlib librosa nlt
 ```bash
 python train.py --config_path ./Configs/config.yml
 ```
-Please specify the training and validation data in `config.yml` file. The data list format needs to be `filename.wav|label-in-espeak-phonemes|speaker_number`, see [train_list.txt](https://github.com/martinambrus/AuxiliaryASR/blob/main/Data/train_list.txt) as an example (a custom sample of phonemized WAV files used for English training). Note that `speaker_number` can just be `0` for ASR, but it is useful to set a meaningful number for TTS training in StyleTTS2. 
+Please specify the training and validation data in `config.yml` file. The data list format needs to be `filename.wav|label-in-espeak-phonemes|speaker_number`, see [train_list.txt](https://github.com/martinambrus/AuxiliaryASR/blob/main/Data/train_list.txt) as an example (a custom sample of phonemized WAV files used for English training). Note that `speaker_number` can just be `0` for ASR, but it is useful to set a meaningful number for TTS training in StyleTTS2.
+
+### Decoder choices
+
+`model_params.decoder_config` controls which sequence decoder is used on top of the CTC encoder. The configuration exposes five interchangeable designs that can be toggled on and off individually:
+
+| `type` value | Description |
+| --- | --- |
+| `transformer_relative` | Transformer decoder with relative-position biases and causal masking. |
+| `conformer` | Conformer-style decoder stack with convolutional modules. |
+| `rnnt` | Recurrent Neural Network Transducer joint network producing 4-D logits. |
+| `mocha` | Monotonic chunkwise attention decoder for strictly causal alignments. |
+| `cif` | Non-autoregressive Continuous Integrate-and-Fire decoder. |
+
+Each subsection inside `decoder_config` has an `enabled` flag so you can keep multiple parameter presets while switching the active decoder by setting the `type` field.
 
 Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take - but not beyond 64, as anything beyond this value did not yield desired results in my testing. Please note that `batch_size = 64` will take around 10G GPU RAM.
 
