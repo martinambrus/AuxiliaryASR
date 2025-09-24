@@ -207,6 +207,102 @@ class Attention(nn.Module):
 
         return attention_context, attention_weights
 
+
+class DurationPredictor(nn.Module):
+    """Predicts token-level durations following the FastSpeech design."""
+
+    def __init__(
+            self,
+            in_dim: int,
+            filter_size: int = 256,
+            kernel_size: int = 3,
+            dropout: float = 0.5,
+            num_layers: int = 2,
+    ) -> None:
+        super().__init__()
+
+        self.conv_layers = nn.ModuleList()
+        self.layer_norms = nn.ModuleList()
+        self.dropouts = nn.ModuleList()
+
+        conv_in_channels = in_dim
+        padding = (kernel_size - 1) // 2
+        for _ in range(num_layers):
+            conv = nn.Conv1d(
+                conv_in_channels,
+                filter_size,
+                kernel_size,
+                padding=padding,
+            )
+            nn.init.xavier_uniform_(conv.weight)
+            self.conv_layers.append(conv)
+            self.layer_norms.append(nn.LayerNorm(filter_size))
+            self.dropouts.append(nn.Dropout(dropout))
+            conv_in_channels = filter_size
+
+        self.projection = nn.Linear(filter_size, 1)
+
+    def forward(self, encoder_output: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """Compute duration predictions.
+
+        Args:
+            encoder_output: Tensor with shape ``(B, T, C)``.
+            mask: Optional boolean tensor of shape ``(B, T)`` where ``True`` marks padding positions.
+
+        Returns:
+            Tensor with shape ``(B, T)`` containing duration predictions.
+        """
+
+        x = encoder_output.transpose(1, 2)  # (B, C, T)
+        if mask is not None:
+            x = x.masked_fill(mask.unsqueeze(1), 0.0)
+
+        for conv, layer_norm, dropout in zip(self.conv_layers, self.layer_norms, self.dropouts):
+            x = conv(x)
+            x = F.relu(x)
+            x = x.transpose(1, 2)
+            x = layer_norm(x)
+            x = x.transpose(1, 2)
+            x = dropout(x)
+
+        x = x.transpose(1, 2)
+        x = self.projection(x)
+        durations = x.squeeze(-1)
+
+        if mask is not None:
+            durations = durations.masked_fill(mask, 0.0)
+
+        return durations
+
+
+class VarianceAdaptor(nn.Module):
+    """Auxiliary variance adaptor used for duration modelling."""
+
+    def __init__(
+            self,
+            input_dim: int,
+            filter_size: int = 256,
+            kernel_size: int = 3,
+            dropout: float = 0.5,
+            num_layers: int = 2,
+            predict_log_duration: bool = True,
+    ) -> None:
+        super().__init__()
+        self.predict_log_duration = predict_log_duration
+        self.duration_predictor = DurationPredictor(
+            input_dim,
+            filter_size=filter_size,
+            kernel_size=kernel_size,
+            dropout=dropout,
+            num_layers=num_layers,
+        )
+
+    def forward(self, encoder_output: torch.Tensor, mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        durations = self.duration_predictor(encoder_output, mask=mask)
+        if self.predict_log_duration:
+            return durations
+        return F.softplus(durations)
+
 class PhaseShuffle2d(nn.Module):
     def __init__(self, n=2):
         super(PhaseShuffle2d, self).__init__()

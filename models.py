@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.nn import TransformerEncoder
 import torch.nn.functional as F
-from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
+from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock, VarianceAdaptor
 
 def build_model(model_params={}, model_type='asr'):
     model = ASRCNN(**model_params)
@@ -18,6 +18,7 @@ class ASRCNN(nn.Module):
                  n_layers=6,
                  token_embedding_dim=256,
                  location_kernel_size=63,
+                 variance_adaptor=None,
     ):
         super().__init__()
         self.n_token = n_token
@@ -34,13 +35,17 @@ class ASRCNN(nn.Module):
             LinearNorm(hidden_dim//2, hidden_dim),
             nn.ReLU(),
             LinearNorm(hidden_dim, n_token))
+        variance_adaptor = variance_adaptor or {}
         self.asr_s2s = ASRS2S(
             embedding_dim=token_embedding_dim,
             hidden_dim=hidden_dim//2,
             n_token=n_token,
-            location_kernel_size=location_kernel_size)
+            location_kernel_size=location_kernel_size,
+            variance_adaptor_config=variance_adaptor)
+        self.has_variance_adaptor = getattr(self.asr_s2s, 'has_variance_adaptor', False)
+        self.predicts_log_duration = getattr(self.asr_s2s, 'predicts_log_duration', False)
 
-    def forward(self, x, src_key_padding_mask=None, text_input=None):
+    def forward(self, x, src_key_padding_mask=None, text_input=None, text_mask=None):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
         x = self.cnns(x)
@@ -49,7 +54,14 @@ class ASRCNN(nn.Module):
         x = x.transpose(1, 2)
         ctc_logit = self.ctc_linear(x)
         if text_input is not None:
-            _, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
+            _, s2s_logit, s2s_attn, duration_pred = self.asr_s2s(
+                x,
+                src_key_padding_mask,
+                text_input,
+                text_mask=text_mask,
+            )
+            if self.has_variance_adaptor:
+                return ctc_logit, s2s_logit, s2s_attn, duration_pred
             return ctc_logit, s2s_logit, s2s_attn
         else:
             return ctc_logit
@@ -90,7 +102,8 @@ class ASRS2S(nn.Module):
                  hidden_dim=512,
                  n_location_filters=32,
                  location_kernel_size=63,
-                 n_token=40):
+                 n_token=40,
+                 variance_adaptor_config=None):
         super(ASRS2S, self).__init__()
         self.embedding = nn.Embedding(n_token, embedding_dim)
         val_range = math.sqrt(6 / hidden_dim)
@@ -111,6 +124,21 @@ class ASRS2S(nn.Module):
             nn.Tanh())
         self.sos = 1
         self.eos = 2
+        variance_adaptor_config = variance_adaptor_config or {}
+        self.has_variance_adaptor = bool(variance_adaptor_config.get('enabled', False))
+        self.predicts_log_duration = False
+        if self.has_variance_adaptor:
+            self.variance_adaptor = VarianceAdaptor(
+                embedding_dim,
+                filter_size=variance_adaptor_config.get('filter_size', 256),
+                kernel_size=variance_adaptor_config.get('kernel_size', 3),
+                dropout=variance_adaptor_config.get('dropout', 0.5),
+                num_layers=variance_adaptor_config.get('num_layers', 2),
+                predict_log_duration=variance_adaptor_config.get('predict_log_duration', True),
+            )
+            self.predicts_log_duration = self.variance_adaptor.predict_log_duration
+        else:
+            self.variance_adaptor = None
 
     def initialize_decoder_states(self, memory, mask):
         """
@@ -128,13 +156,19 @@ class ASRS2S(nn.Module):
         self.unk_index = 3
         self.random_mask = 0.1
 
-    def forward(self, memory, memory_mask, text_input):
+    def forward(self, memory, memory_mask, text_input, text_mask=None):
         """
         moemory.shape = (B, L, H) = (Batchsize, Maxtimestep, Hiddendim)
         moemory_mask.shape = (B, L, )
         texts_input.shape = (B, T)
         """
         self.initialize_decoder_states(memory, memory_mask)
+        duration_predictions = None
+        if self.has_variance_adaptor:
+            duration_predictions = self.variance_adaptor(
+                self.embedding(text_input),
+                mask=text_mask,
+            )
         # text random mask
         if self.training and self.random_mask > 0:
             random_mask = (torch.rand(text_input.shape, device=text_input.device) < self.random_mask)
@@ -160,7 +194,7 @@ class ASRS2S(nn.Module):
             self.parse_decoder_outputs(
                 hidden_outputs, logit_outputs, alignments)
 
-        return hidden_outputs, logit_outputs, alignments
+        return hidden_outputs, logit_outputs, alignments, duration_predictions
 
 
     def decode(self, decoder_input):

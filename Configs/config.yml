@@ -67,3 +67,18 @@ dataloader_params:
 loss_weights:
   ctc: 0.8
   s2s: 1.0
+  duration: 0.0
+
+auxiliary_alignment:
+  variance_adaptor:
+    enabled: false
+    filter_size: 256
+    kernel_size: 3
+    dropout: 0.5
+    num_layers: 2
+    predict_log_duration: true
+  duration_loss:
+    enabled: false
+    target_strategy: uniform  # options: uniform, uniform_rounded, attention_peaks
+    log_target: true
+    mask_padding: true

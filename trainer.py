@@ -39,7 +39,11 @@ class Trainer(object):
                  use_diagonal_attention_prior = True,
                  diagonal_attention_prior_weight = 0.1,
                  ctc_weight=1.0,
-                 s2s_weight=1.0):
+                 s2s_weight=1.0,
+                 duration_loss_weight=0.0,
+                 duration_target_strategy='uniform',
+                 log_duration_target=True,
+                 mask_duration_loss=True):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -64,6 +68,15 @@ class Trainer(object):
         self.maxm_mem_usage = 0
         self.ctc_weight = ctc_weight
         self.s2s_weight = s2s_weight
+        self.duration_loss_weight = duration_loss_weight
+        self.duration_target_strategy = duration_target_strategy
+        self.log_duration_target = log_duration_target
+        self.mask_duration_loss = mask_duration_loss
+        self.duration_predicts_log = getattr(self.model, 'predicts_log_duration', False)
+        self.duration_loss_enabled = (
+            self.duration_loss_weight > 0.0 and getattr(self.model, 'has_variance_adaptor', False)
+        )
+        self.duration_loss_fn = nn.MSELoss(reduction='mean')
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -186,10 +199,21 @@ class Trainer(object):
         mel_input_length = mel_input_length // (2 ** self.model.n_down)
         future_mask = self.model.get_future_mask(
             mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
-        mel_mask = self.model.length_to_mask(mel_input_length)
-        text_mask = self.model.length_to_mask(text_input_length)
-        ppgs, s2s_pred, s2s_attn = self.model(
-            mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+        mel_mask = self.model.length_to_mask(mel_input_length).bool()
+        text_mask = self.model.length_to_mask(text_input_length).bool()
+        model_outputs = self.model(
+            mel_input,
+            src_key_padding_mask=mel_mask,
+            text_input=text_input,
+            text_mask=text_mask,
+        )
+        duration_pred = None
+        if isinstance(model_outputs, (list, tuple)) and len(model_outputs) >= 3:
+            ppgs, s2s_pred, s2s_attn = model_outputs[:3]
+            if len(model_outputs) > 3:
+                duration_pred = model_outputs[3]
+        else:
+            raise ValueError("Model forward must return at least three outputs when text_input is provided.")
 
         if self.use_diagonal_attention_prior:
             loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, mel_input_length)
@@ -202,7 +226,38 @@ class Trainer(object):
             loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
         loss_s2s /= text_input.size(0)
 
+        duration_loss = torch.tensor(0.0, device=self.device)
+        if self.duration_loss_enabled and duration_pred is not None:
+            duration_targets = self._build_duration_targets(
+                text_input_length,
+                mel_input_length,
+                text_mask,
+                alignments=s2s_attn if self.duration_target_strategy == 'attention_peaks' else None,
+            )
+            if self.log_duration_target:
+                duration_targets = torch.log(duration_targets + 1.0)
+
+            pred_for_loss = duration_pred
+            if self.duration_predicts_log and not self.log_duration_target:
+                pred_for_loss = torch.exp(duration_pred) - 1.0
+            elif (not self.duration_predicts_log) and self.log_duration_target:
+                pred_for_loss = torch.log(duration_pred + 1.0)
+
+            if self.mask_duration_loss:
+                valid_mask = ~text_mask
+                if valid_mask.any():
+                    duration_loss = self.duration_loss_fn(
+                        pred_for_loss.masked_select(valid_mask),
+                        duration_targets.masked_select(valid_mask),
+                    )
+                else:
+                    duration_loss = torch.tensor(0.0, device=self.device)
+            else:
+                duration_loss = self.duration_loss_fn(pred_for_loss, duration_targets)
+
         total_loss = self.ctc_weight * loss_ctc + self.s2s_weight * loss_s2s
+        if self.duration_loss_enabled:
+            total_loss = total_loss + self.duration_loss_weight * duration_loss
         if self.use_diagonal_attention_prior:
             total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
         loss = total_loss
@@ -210,9 +265,14 @@ class Trainer(object):
         torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
         self.optimizer.step()
         self.scheduler.step()
-        return {'loss': loss.item(),
-                'ctc': loss_ctc.item(),
-                's2s': loss_s2s.item()}
+        results = {
+            'loss': loss.item(),
+            'ctc': loss_ctc.item(),
+            's2s': loss_s2s.item(),
+        }
+        if self.duration_loss_enabled:
+            results['duration'] = duration_loss.item()
+        return results
 
     def _train_epoch(self):
         # switch dataloader if we're above configured epoch
@@ -254,10 +314,21 @@ class Trainer(object):
             mel_input_length = mel_input_length // (2 ** self.model.n_down)
             future_mask = self.model.get_future_mask(
                 mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
-            mel_mask = self.model.length_to_mask(mel_input_length)
-            text_mask = self.model.length_to_mask(text_input_length)
-            ppgs, s2s_pred, s2s_attn = self.model(
-                mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+            mel_mask = self.model.length_to_mask(mel_input_length).bool()
+            text_mask = self.model.length_to_mask(text_input_length).bool()
+            model_outputs = self.model(
+                mel_input,
+                src_key_padding_mask=mel_mask,
+                text_input=text_input,
+                text_mask=text_mask,
+            )
+            duration_pred = None
+            if isinstance(model_outputs, (list, tuple)) and len(model_outputs) >= 3:
+                ppgs, s2s_pred, s2s_attn = model_outputs[:3]
+                if len(model_outputs) > 3:
+                    duration_pred = model_outputs[3]
+            else:
+                raise ValueError("Model forward must return at least three outputs when text_input is provided.")
             loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
                                           text_input, mel_input_length, text_input_length)
             loss_s2s = 0
@@ -266,9 +337,40 @@ class Trainer(object):
             loss_s2s /= text_input.size(0)
             loss = loss_ctc + loss_s2s
 
+            if self.duration_loss_enabled and duration_pred is not None:
+                duration_targets = self._build_duration_targets(
+                    text_input_length,
+                    mel_input_length,
+                    text_mask,
+                    alignments=s2s_attn if self.duration_target_strategy == 'attention_peaks' else None,
+                )
+                if self.log_duration_target:
+                    duration_targets = torch.log(duration_targets + 1.0)
+
+                pred_for_loss = duration_pred
+                if self.duration_predicts_log and not self.log_duration_target:
+                    pred_for_loss = torch.exp(duration_pred) - 1.0
+                elif (not self.duration_predicts_log) and self.log_duration_target:
+                    pred_for_loss = torch.log(duration_pred + 1.0)
+
+                if self.mask_duration_loss:
+                    valid_mask = ~text_mask
+                    if valid_mask.any():
+                        duration_loss = self.duration_loss_fn(
+                            pred_for_loss.masked_select(valid_mask),
+                            duration_targets.masked_select(valid_mask),
+                        )
+                    else:
+                        duration_loss = torch.tensor(0.0, device=self.device)
+                else:
+                    duration_loss = self.duration_loss_fn(pred_for_loss, duration_targets)
+                loss = loss + self.duration_loss_weight * duration_loss
+
             eval_losses["eval/ctc"].append(loss_ctc.item())
             eval_losses["eval/s2s"].append(loss_s2s.item())
             eval_losses["eval/loss"].append(loss.item())
+            if self.duration_loss_enabled and duration_pred is not None:
+                eval_losses["eval/duration"].append(duration_loss.item())
 
             _, amax_ppgs = torch.max(ppgs, dim=2)
             wers = [calc_wer(target[:text_length],
@@ -290,3 +392,58 @@ class Trainer(object):
         eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
         eval_losses.update(eval_images)
         return eval_losses
+
+    def _build_duration_targets(self, text_lengths, mel_lengths, text_mask, alignments=None):
+        batch_size = text_lengths.size(0)
+        max_text_len = text_mask.size(1)
+        device = text_lengths.device
+        durations = torch.zeros(batch_size, max_text_len, device=device, dtype=torch.float32)
+
+        for idx in range(batch_size):
+            text_len = int(text_lengths[idx].item())
+            mel_len = int(mel_lengths[idx].item())
+            if text_len <= 0 or mel_len <= 0:
+                continue
+
+            if self.duration_target_strategy == 'uniform_rounded':
+                base = mel_len // text_len
+                remainder = mel_len % text_len
+                durations[idx, :text_len] = float(base)
+                if remainder > 0:
+                    durations[idx, :remainder] += 1.0
+            elif self.duration_target_strategy == 'attention_peaks' and alignments is not None:
+                durations[idx, :text_len] = self._attention_peak_durations(
+                    alignments[idx], text_len, mel_len)
+            else:
+                durations[idx, :text_len] = float(mel_len) / float(text_len)
+
+        durations = torch.clamp(durations, min=1.0)
+        if self.mask_duration_loss:
+            durations = durations.masked_fill(text_mask, 0.0)
+        return durations
+
+    def _attention_peak_durations(self, alignment, text_len, mel_len):
+        if mel_len <= 0 or text_len <= 0:
+            return torch.zeros(text_len, device=alignment.device, dtype=torch.float32)
+
+        attn = alignment[1:text_len+1, :mel_len]
+        if attn.numel() == 0:
+            return torch.full((text_len,), float(mel_len) / max(text_len, 1),
+                              device=alignment.device, dtype=torch.float32)
+
+        peak_positions = torch.argmax(attn, dim=1).float()
+        for idx in range(1, peak_positions.size(0)):
+            peak_positions[idx] = torch.max(peak_positions[idx], peak_positions[idx - 1] + 1.0)
+        peak_positions = torch.clamp(peak_positions, max=float(mel_len - 1))
+
+        boundaries = torch.zeros(text_len + 1, device=alignment.device, dtype=torch.float32)
+        boundaries[-1] = float(mel_len)
+        for idx in range(1, text_len):
+            boundaries[idx] = (peak_positions[idx - 1] + peak_positions[idx]) / 2.0
+
+        durations = boundaries[1:] - boundaries[:-1]
+        durations = torch.clamp(durations, min=1.0)
+        total = durations.sum()
+        if total > 0:
+            durations = durations * (float(mel_len) / total)
+        return durations

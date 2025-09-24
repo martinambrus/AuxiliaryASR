@@ -295,6 +295,11 @@ def main(config_path):
     if not 'n_token' in model_params:
         model_params['n_token'] = len( word_indexes )
 
+    auxiliary_alignment_config = cfg_get_nested(config, 'auxiliary_alignment', {}) or {}
+    variance_adaptor_config = auxiliary_alignment_config.get('variance_adaptor', {}) or {}
+    if variance_adaptor_config.get('enabled', False):
+        model_params['variance_adaptor'] = variance_adaptor_config
+
     print("Using model parameters:", model_params)
 
     model = build_model(model_params=model_params)
@@ -325,6 +330,10 @@ def main(config_path):
     loss_weight_config = cfg_get_nested(config, 'loss_weights', {}) or {}
     ctc_weight = float(loss_weight_config.get('ctc', 1.0))
     s2s_weight = float(loss_weight_config.get('s2s', 1.0))
+    duration_weight = float(loss_weight_config.get('duration', 0.0))
+    duration_loss_config = auxiliary_alignment_config.get('duration_loss', {}) or {}
+    if not duration_loss_config.get('enabled', False):
+        duration_weight = 0.0
 
     trainer = Trainer(model=model,
                     criterion=criterion,
@@ -341,6 +350,10 @@ def main(config_path):
                     diagonal_attention_prior_weight=cfg_get_nested( config, 'diagonal_attention_prior_weight', 0.1),
                     ctc_weight=ctc_weight,
                     s2s_weight=s2s_weight,
+                    duration_loss_weight=duration_weight,
+                    duration_target_strategy=duration_loss_config.get('target_strategy', 'uniform'),
+                    log_duration_target=duration_loss_config.get('log_target', True),
+                    mask_duration_loss=duration_loss_config.get('mask_padding', True),
                     )
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )

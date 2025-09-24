@@ -55,6 +55,33 @@ loss_weights:
 
 Increasing the warm-up ratio (`optimizer_params.pct_start`) or reducing the batch size can also help when the number of training utterances is limited.
 
+### Auxiliary variance adaptor for alignment
+
+For TTS alignment use cases you can enable an auxiliary FastSpeech-style variance adaptor that predicts token durations from the decoder embeddings. This stabilizes attention learning by providing an extra supervision signal. Configure it from `Configs/config.yml`:
+
+```yaml
+model_params:
+  variance_adaptor:
+    enabled: true           # instantiate the duration predictor
+    filter_size: 256        # convolution width inside the predictor
+    kernel_size: 3
+    dropout: 0.5
+    num_layers: 2
+    predict_log_duration: true
+
+loss_weights:
+  duration: 0.2             # weight of the auxiliary duration loss
+
+auxiliary_alignment:
+  duration_loss:
+    enabled: true           # toggle the auxiliary loss without touching weights
+    target_strategy: uniform  # or uniform_rounded / attention_peaks
+    log_target: true         # compare in the log-domain (recommended)
+    mask_padding: true       # ignore padded tokens when computing the loss
+```
+
+The uniform target strategy distributes the acoustic frames evenly across phonemes, while `attention_peaks` derives coarse durations from the decoder attention map. You can disable the adaptor entirely by setting `variance_adaptor.enabled` to `false` or keep it enabled while zeroing out the loss weight for diagnostics.
+
 ### Languages
 This repo is set up for English with the [phonemizer](https://github.com/bootphon/phonemizer) package and espeak-ng backend. You can train it with other languages. If you would like to train for datasets in different languages, you will need to change the vocabulary file ([word_index_dict.txt](https://github.com/martinambrus/AuxiliaryASR/blob/main/word_index_dict.txt)) to contain the phonemes in your dataset. There is a utility script ([words_index_extractor.py](https://github.com/martinambrus/AuxiliaryASR/blob/main/words_index_extractor.py)) which will generate (and **_rewrite_**!) the file words_index_dict.txt when ran. Here's the syntax to use to generate this file:
 ```bash
