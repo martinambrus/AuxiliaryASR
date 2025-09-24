@@ -5,6 +5,8 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from layers import Attention, LinearNorm
+
 
 def _generate_square_subsequent_mask(sz: int, device: torch.device) -> Tensor:
     mask = torch.triu(torch.ones(sz, sz, device=device), diagonal=1)
@@ -210,6 +212,162 @@ class RelativeTransformerDecoder(nn.Module):
         logits = self.output_proj(self.output_norm(tgt))
         alignments = torch.stack(attn_list, dim=1).mean(dim=1) if attn_list else None
         return tgt, logits, alignments
+
+
+class LocationAwareLSTMDecoder(nn.Module):
+    def __init__(
+        self,
+        embedding_dim: int,
+        hidden_dim: int,
+        n_token: int,
+        n_location_filters: int = 32,
+        location_kernel_size: int = 63,
+        random_mask: float = 0.1,
+        sos: int = 1,
+        eos: int = 2,
+        unk_index: int = 3,
+    ) -> None:
+        super().__init__()
+        self.embedding = nn.Embedding(n_token, embedding_dim)
+        val_range = math.sqrt(6.0 / max(hidden_dim, 1))
+        self.embedding.weight.data.uniform_(-val_range, val_range)
+
+        self.decoder_rnn_dim = hidden_dim
+        self.project_to_n_symbols = nn.Linear(self.decoder_rnn_dim, n_token)
+        self.attention_layer = Attention(
+            self.decoder_rnn_dim,
+            hidden_dim,
+            hidden_dim,
+            n_location_filters,
+            location_kernel_size,
+        )
+        self.decoder_rnn = nn.LSTMCell(
+            self.decoder_rnn_dim + embedding_dim, self.decoder_rnn_dim
+        )
+        self.project_to_hidden = nn.Sequential(
+            LinearNorm(self.decoder_rnn_dim * 2, hidden_dim),
+            nn.Tanh(),
+        )
+        self.random_mask = random_mask
+        self.sos = sos
+        self.eos = eos
+        self.unk_index = unk_index
+
+    def initialize_decoder_states(
+        self, memory: Tensor, mask: Optional[Tensor]
+    ) -> None:
+        batch, steps, channels = memory.shape
+        device = memory.device
+        dtype = memory.dtype
+        self.decoder_hidden = torch.zeros(
+            (batch, self.decoder_rnn_dim), device=device, dtype=dtype
+        )
+        self.decoder_cell = torch.zeros(
+            (batch, self.decoder_rnn_dim), device=device, dtype=dtype
+        )
+        self.attention_weights = torch.zeros(
+            (batch, steps), device=device, dtype=dtype
+        )
+        self.attention_weights_cum = torch.zeros(
+            (batch, steps), device=device, dtype=dtype
+        )
+        self.attention_context = torch.zeros(
+            (batch, channels), device=device, dtype=dtype
+        )
+        self.memory = memory
+        self.processed_memory = self.attention_layer.memory_layer(memory)
+        self.mask = mask
+
+    def forward(
+        self,
+        memory: Tensor,
+        memory_mask: Optional[Tensor],
+        text_input: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        if text_input is None:
+            raise ValueError(
+                "text_input must be provided for location-sensitive decoding"
+            )
+        self.initialize_decoder_states(memory, memory_mask)
+        if self.training and self.random_mask > 0:
+            random_mask = (
+                torch.rand(text_input.shape, device=text_input.device)
+                < self.random_mask
+            )
+            _text_input = text_input.masked_fill(random_mask, self.unk_index)
+        else:
+            _text_input = text_input
+
+        decoder_inputs = self.embedding(_text_input).transpose(0, 1)
+        start_embedding = self.embedding(
+            torch.full(
+                (decoder_inputs.size(1),),
+                self.sos,
+                dtype=text_input.dtype,
+                device=text_input.device,
+            )
+        )
+        decoder_inputs = torch.cat(
+            (start_embedding.unsqueeze(0), decoder_inputs), dim=0
+        )
+
+        hidden_outputs: List[Tensor] = []
+        logit_outputs: List[Tensor] = []
+        alignments: List[Tensor] = []
+        while len(hidden_outputs) < decoder_inputs.size(0):
+            decoder_input = decoder_inputs[len(hidden_outputs)]
+            hidden, logit, attention_weights = self.decode(decoder_input)
+            hidden_outputs.append(hidden)
+            logit_outputs.append(logit)
+            alignments.append(attention_weights)
+
+        hidden_tensor, logit_tensor, alignment_tensor = self.parse_decoder_outputs(
+            hidden_outputs, logit_outputs, alignments
+        )
+        return hidden_tensor, logit_tensor, alignment_tensor
+
+    def decode(self, decoder_input: Tensor) -> Tuple[Tensor, Tensor, Tensor]:
+        cell_input = torch.cat((decoder_input, self.attention_context), -1)
+        self.decoder_hidden, self.decoder_cell = self.decoder_rnn(
+            cell_input, (self.decoder_hidden, self.decoder_cell)
+        )
+
+        attention_weights_cat = torch.cat(
+            (
+                self.attention_weights.unsqueeze(1),
+                self.attention_weights_cum.unsqueeze(1),
+            ),
+            dim=1,
+        )
+
+        self.attention_context, self.attention_weights = self.attention_layer(
+            self.decoder_hidden,
+            self.memory,
+            self.processed_memory,
+            attention_weights_cat,
+            self.mask,
+        )
+
+        self.attention_weights_cum = self.attention_weights_cum + self.attention_weights
+        hidden_and_context = torch.cat(
+            (self.decoder_hidden, self.attention_context), -1
+        )
+        hidden = self.project_to_hidden(hidden_and_context)
+        logit = self.project_to_n_symbols(
+            F.dropout(hidden, 0.5, training=self.training)
+        )
+        return hidden, logit, self.attention_weights
+
+    def parse_decoder_outputs(
+        self,
+        hidden: List[Tensor],
+        logit: List[Tensor],
+        alignments: List[Tensor],
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        alignment_tensor = torch.stack(alignments).transpose(0, 1)
+        logit_tensor = torch.stack(logit).transpose(0, 1).contiguous()
+        hidden_tensor = torch.stack(hidden).transpose(0, 1).contiguous()
+        return hidden_tensor, logit_tensor, alignment_tensor
 
 
 class ConvolutionModule(nn.Module):
@@ -621,6 +779,20 @@ def build_decoder(
                 f"Decoder '{name}' is disabled in the configuration."
             )
 
+    def _build_location(section: Dict[str, Any]) -> nn.Module:
+        _ensure_enabled("location_lstm", section)
+        return LocationAwareLSTMDecoder(
+            embedding_dim=section.get("embedding_dim", embedding_dim),
+            hidden_dim=section.get("hidden_dim", encoder_dim),
+            n_token=n_token,
+            n_location_filters=section.get("n_location_filters", 32),
+            location_kernel_size=section.get("location_kernel_size", 63),
+            random_mask=section.get("random_mask", 0.1),
+            sos=section.get("sos", 1),
+            eos=section.get("eos", 2),
+            unk_index=section.get("unk_index", 3),
+        )
+
     def _build_transformer(section: Dict[str, Any]) -> nn.Module:
         _ensure_enabled("transformer_relative", section)
         return RelativeTransformerDecoder(
@@ -676,6 +848,7 @@ def build_decoder(
         )
 
     builders = {
+        "location_lstm": _build_location,
         "transformer_relative": _build_transformer,
         "conformer": _build_conformer,
         "rnnt": _build_rnnt,
@@ -707,6 +880,6 @@ def build_decoder(
     if enabled:
         return _instantiate(enabled[0])
 
-    # Default to the transformer-relative decoder when none is explicitly
-    # enabled. This maintains backward compatibility with earlier configs.
+    # Default to the legacy location-sensitive decoder when none is explicitly
+    # enabled to preserve backward compatibility with historic checkpoints.
     return _instantiate(order[0])
