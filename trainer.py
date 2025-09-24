@@ -9,6 +9,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
@@ -42,7 +43,7 @@ class Trainer(object):
         self.scheduler = scheduler
         self.train_dataloader = train_dataloader
         self.val_dataloader = val_dataloader
-        self.config = config
+        self.config = config or {}
         self.device = device
         self.finish_train = False
         self.logger = logger
@@ -125,6 +126,79 @@ class Trainer(object):
         mask = torch.gt(mask+1, lengths.unsqueeze(1))
         return mask
 
+    def _get_duration_config(self):
+        aux_config = self.config.get('model_params', {}).get('auxiliary_models', {})
+        variance_config = aux_config.get('variance_adaptor', {})
+        enabled = variance_config.get('enabled', False)
+        duration_config = variance_config.get('duration_predictor', {})
+        duration_enabled = enabled and duration_config.get('enabled', True)
+        return duration_enabled, duration_config
+
+    def _compute_duration_targets(self, alignments, text_lengths, mel_lengths, detach=True):
+        if alignments is None:
+            return None
+        if detach:
+            alignments = alignments.detach()
+        batch_size = alignments.size(0)
+        max_text_len = alignments.size(1) - 1
+        durations = alignments.new_zeros((batch_size, max_text_len))
+        for idx in range(batch_size):
+            text_len = int(text_lengths[idx].item())
+            mel_len = int(mel_lengths[idx].item())
+            if text_len <= 0 or mel_len <= 0:
+                continue
+            attn = alignments[idx, 1:text_len+1, :mel_len]
+            if attn.numel() == 0:
+                continue
+            frame_to_token = torch.argmax(attn, dim=0)
+            counts = torch.zeros(text_len, device=attn.device, dtype=attn.dtype)
+            counts.scatter_add_(0, frame_to_token,
+                                torch.ones_like(frame_to_token, dtype=attn.dtype))
+            durations[idx, :text_len] = counts
+        return durations
+
+    def _compute_duration_loss(self, aux_outputs, alignments, text_mask, text_lengths, mel_lengths):
+        duration_enabled, duration_config = self._get_duration_config()
+        if not duration_enabled:
+            return None
+        if aux_outputs is None or 'duration_pred' not in aux_outputs:
+            return None
+        duration_pred = aux_outputs['duration_pred']
+        if duration_pred is None:
+            return None
+        if text_mask is None:
+            return None
+
+        duration_targets = self._compute_duration_targets(
+            alignments,
+            text_lengths,
+            mel_lengths,
+            detach=duration_config.get('detach_alignment_grad', True))
+        if duration_targets is None:
+            return None
+        duration_targets = duration_targets.to(device=duration_pred.device,
+                                              dtype=duration_pred.dtype)
+
+        duration_mask = text_mask.to(device=duration_pred.device, dtype=torch.bool)
+        if duration_pred.size(1) != duration_mask.size(1):
+            min_len = min(duration_pred.size(1), duration_mask.size(1))
+            duration_pred = duration_pred[:, :min_len]
+            duration_mask = duration_mask[:, :min_len]
+            duration_targets = duration_targets[:, :min_len]
+
+        valid_positions = ~duration_mask
+        if valid_positions.sum() == 0:
+            return None
+
+        duration_target_log = torch.log(duration_targets + 1.0)
+        duration_loss = F.mse_loss(
+            duration_pred.masked_select(valid_positions),
+            duration_target_log.masked_select(valid_positions))
+        weight = duration_config.get('loss_weight', 0.0)
+        if weight == 0.0:
+            return None
+        return duration_loss * weight
+
     def _get_lr(self):
         for param_group in self.optimizer.param_groups:
             lr = param_group['lr']
@@ -160,8 +234,16 @@ class Trainer(object):
             mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
         mel_mask = self.model.length_to_mask(mel_input_length)
         text_mask = self.model.length_to_mask(text_input_length)
-        ppgs, s2s_pred, s2s_attn = self.model(
-            mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+        model_outputs = self.model(
+            mel_input,
+            src_key_padding_mask=mel_mask,
+            text_input=text_input,
+            text_mask=text_mask)
+        aux_outputs = {}
+        if isinstance(model_outputs, tuple) and len(model_outputs) == 4:
+            ppgs, s2s_pred, s2s_attn, aux_outputs = model_outputs
+        else:
+            ppgs, s2s_pred, s2s_attn = model_outputs
         
         loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
                                       text_input, mel_input_length, text_input_length)
@@ -172,13 +254,30 @@ class Trainer(object):
         loss_s2s /= text_input.size(0)
 
         loss = loss_ctc + loss_s2s
+
+        aux_losses = {}
+        duration_loss = self._compute_duration_loss(
+            aux_outputs,
+            s2s_attn,
+            text_mask,
+            text_input_length,
+            mel_input_length)
+        if duration_loss is not None:
+            aux_losses['duration'] = duration_loss
+
+        for value in aux_losses.values():
+            loss = loss + value
+
         loss.backward()
         torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
         self.optimizer.step()
         self.scheduler.step()
-        return {'loss': loss.item(),
-                'ctc': loss_ctc.item(),
-                's2s': loss_s2s.item()}
+        results = {'loss': loss.item(),
+                   'ctc': loss_ctc.item(),
+                   's2s': loss_s2s.item()}
+        for key, value in aux_losses.items():
+            results[f'aux/{key}'] = value.item()
+        return results
 
     def _train_epoch(self):
         train_losses = defaultdict(list)
@@ -205,8 +304,16 @@ class Trainer(object):
                 mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
             mel_mask = self.model.length_to_mask(mel_input_length)
             text_mask = self.model.length_to_mask(text_input_length)
-            ppgs, s2s_pred, s2s_attn = self.model(
-                mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+            model_outputs = self.model(
+                mel_input,
+                src_key_padding_mask=mel_mask,
+                text_input=text_input,
+                text_mask=text_mask)
+            aux_outputs = {}
+            if isinstance(model_outputs, tuple) and len(model_outputs) == 4:
+                ppgs, s2s_pred, s2s_attn, aux_outputs = model_outputs
+            else:
+                ppgs, s2s_pred, s2s_attn = model_outputs
             loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
                                           text_input, mel_input_length, text_input_length)
             loss_s2s = 0
@@ -214,6 +321,16 @@ class Trainer(object):
                 loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
             loss_s2s /= text_input.size(0)
             loss = loss_ctc + loss_s2s
+
+            duration_loss = self._compute_duration_loss(
+                aux_outputs,
+                s2s_attn,
+                text_mask,
+                text_input_length,
+                mel_input_length)
+            if duration_loss is not None:
+                loss = loss + duration_loss
+                eval_losses["eval/aux_duration"].append(duration_loss.item())
 
             eval_losses["eval/ctc"].append(loss_ctc.item())
             eval_losses["eval/s2s"].append(loss_s2s.item())

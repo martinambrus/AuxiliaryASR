@@ -85,6 +85,7 @@ def main(config_path):
                     criterion=criterion,
                     optimizer=optimizer,
                     scheduler=scheduler,
+                    config=config,
                     device=device,
                     train_dataloader=train_dataloader,
                     val_dataloader=val_dataloader,

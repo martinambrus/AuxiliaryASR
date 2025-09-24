@@ -20,7 +20,23 @@ python train.py --config_path ./Configs/config.yml
 ```
 Please specify the training and validation data in `config.yml` file. The data list format needs to be `filename.wav|label|speaker_number`, see [train_list.txt](https://github.com/yl4579/AuxiliaryASR/blob/main/Data/train_list.txt) as an example (a subset for LJSpeech). Note that `speaker_number` can just be `0` for ASR, but it is useful to set a meaningful number for TTS training (if you need to use this repo for StyleTTS). 
 
-Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take. However, please note that `batch_size = 64` will take around 10G GPU RAM. 
+Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take. However, please note that `batch_size = 64` will take around 10G GPU RAM.
+
+### Auxiliary variance adaptor
+To stabilise TTS alignment you can optionally enable a FastSpeech-style duration predictor that is trained from the attention alignment. Set the following options in `Configs/config.yml`:
+
+```yaml
+model_params:
+  auxiliary_models:
+    variance_adaptor:
+      enabled: true          # turn the adaptor on/off
+      duration_predictor:
+        enabled: true        # enable the duration head
+        loss_weight: 0.1     # weighting factor for the auxiliary loss
+        detach_alignment_grad: true  # prevent gradients flowing into the attention map
+```
+
+Further hyper-parameters such as `kernel_size`, `filter_size`, `n_layers`, and `dropout` control the duration predictor architecture. Set `enabled: false` for either `variance_adaptor` or `duration_predictor` to disable the auxiliary module.
 
 ### Languages
 This repo is set up for English with the [g2p_en](https://github.com/Kyubyong/g2p) package, but you can train it with other languages. If you would like to train for datasets in different languages, you will need to modify the [meldataset.py](https://github.com/yl4579/AuxiliaryASR/blob/main/meldataset.py#L86-L93) file (L86-93) with your own phonemizer. You also need to change the vocabulary file ([word_index_dict.txt](https://github.com/yl4579/AuxiliaryASR/blob/main/word_index_dict.txt)) and change `n_token` in `config.yml` to reflect the number of tokens. A recommended phonemizer for other languages is [phonemizer](https://github.com/bootphon/phonemizer).

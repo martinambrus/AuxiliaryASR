@@ -5,6 +5,49 @@ from torch.nn import TransformerEncoder
 import torch.nn.functional as F
 from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
 
+
+class DurationPredictor(nn.Module):
+    def __init__(self,
+                 hidden_size,
+                 filter_size=256,
+                 kernel_size=3,
+                 n_layers=2,
+                 dropout=0.1):
+        super().__init__()
+        self.conv_layers = nn.ModuleList()
+        self.norm_layers = nn.ModuleList()
+        self.dropout = nn.Dropout(dropout)
+
+        for i in range(n_layers):
+            in_channels = hidden_size if i == 0 else filter_size
+            padding = (kernel_size - 1) // 2
+            self.conv_layers.append(
+                nn.Conv1d(in_channels, filter_size, kernel_size, padding=padding))
+            self.norm_layers.append(nn.LayerNorm(filter_size))
+
+        self.linear_layer = nn.Linear(filter_size, 1)
+
+    def forward(self, hidden_states, mask=None):
+        if mask is not None and mask.size(1) != hidden_states.size(1):
+            mask = mask[:, :hidden_states.size(1)]
+        x = hidden_states.transpose(1, 2)
+        for conv, norm in zip(self.conv_layers, self.norm_layers):
+            x = conv(x)
+            x = torch.relu(x)
+            x = x.transpose(1, 2)
+            x = norm(x)
+            x = x.transpose(1, 2)
+            x = self.dropout(x)
+
+        x = x.transpose(1, 2)
+        x = self.linear_layer(x).squeeze(-1)
+
+        if mask is not None:
+            mask = mask.to(dtype=torch.bool, device=x.device)
+            x = x.masked_fill(mask, 0.0)
+
+        return x
+
 def build_model(model_params={}, model_type='asr'):
     model = ASRCNN(**model_params)
     return model
@@ -17,7 +60,7 @@ class ASRCNN(nn.Module):
                  n_token=35,
                  n_layers=6,
                  token_embedding_dim=256,
-
+                 auxiliary_models=None,
     ):
         super().__init__()
         self.n_token = n_token
@@ -39,7 +82,22 @@ class ASRCNN(nn.Module):
             hidden_dim=hidden_dim//2,
             n_token=n_token)
 
-    def forward(self, x, src_key_padding_mask=None, text_input=None):
+        self.auxiliary_models_config = auxiliary_models or {}
+        variance_config = self.auxiliary_models_config.get('variance_adaptor', {})
+        self.use_variance_adaptor = variance_config.get('enabled', False)
+        duration_config = variance_config.get('duration_predictor', {})
+        self.use_duration_predictor = self.use_variance_adaptor and duration_config.get('enabled', True)
+        if self.use_duration_predictor:
+            self.duration_predictor = DurationPredictor(
+                hidden_size=hidden_dim//2,
+                filter_size=duration_config.get('filter_size', hidden_dim//2),
+                kernel_size=duration_config.get('kernel_size', 3),
+                n_layers=duration_config.get('n_layers', 2),
+                dropout=duration_config.get('dropout', 0.1))
+        else:
+            self.duration_predictor = None
+
+    def forward(self, x, src_key_padding_mask=None, text_input=None, text_mask=None):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
         x = self.cnns(x)
@@ -48,7 +106,17 @@ class ASRCNN(nn.Module):
         x = x.transpose(1, 2)
         ctc_logit = self.ctc_linear(x)
         if text_input is not None:
-            _, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
+            decoder_hidden, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
+            aux_outputs = {}
+            if self.use_duration_predictor:
+                duration_mask = text_mask
+                if duration_mask is None and text_input is not None:
+                    duration_mask = torch.zeros_like(text_input, dtype=torch.bool, device=text_input.device)
+                if duration_mask is not None:
+                    aux_outputs['duration_pred'] = self.duration_predictor(
+                        decoder_hidden[:, 1:, :], mask=duration_mask)
+            if aux_outputs:
+                return ctc_logit, s2s_logit, s2s_attn, aux_outputs
             return ctc_logit, s2s_logit, s2s_attn
         else:
             return ctc_logit

@@ -21,6 +21,17 @@ model_params:
    hidden_dim: 256
    n_token: 80
    token_embedding_dim: 256
+   auxiliary_models:
+     variance_adaptor:
+       enabled: false
+       duration_predictor:
+         enabled: true
+         loss_weight: 0.1
+         kernel_size: 3
+         filter_size: 256
+         n_layers: 2
+         dropout: 0.1
+         detach_alignment_grad: true
 
 optimizer_params:
   lr: 0.0005
