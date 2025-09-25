@@ -289,7 +289,24 @@ def main(config_path):
         'n_token': len( word_indexes ),
         'token_embedding_dim': 512,
         'n_layers': 5,
-        'location_kernel_size': 31
+        'location_kernel_size': 31,
+        'decoder_type': 'transformer',
+        'decoder_params': {
+            'transformer': {
+                'num_layers': 6,
+                'num_heads': 8,
+                'ffn_dim': 1024,
+                'dropout': 0.1,
+                'activation': 'relu',
+                'use_relative_positional_bias': True,
+                'max_relative_distance': 200,
+                'random_mask': 0.1,
+            },
+            'lstm': {
+                'random_mask': 0.1,
+                'unk_index': 3,
+            }
+        }
     })
 
     if not 'n_token' in model_params:
