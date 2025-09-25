@@ -289,15 +289,22 @@ def main(config_path):
         'n_token': len( word_indexes ),
         'token_embedding_dim': 512,
         'n_layers': 5,
-        'location_kernel_size': 31
+        'location_kernel_size': 31,
+        'decoder_type': 'rnnt',
+        'rnnt_prediction_dim': 256,
+        'rnnt_joint_dim': 320,
+        'rnnt_num_layers': 1,
+        'rnnt_dropout': 0.1,
     })
 
-    if not 'n_token' in model_params:
+    if 'n_token' not in model_params:
         model_params['n_token'] = len( word_indexes )
+    model_params.setdefault('decoder_type', 'rnnt')
 
     print("Using model parameters:", model_params)
 
     model = build_model(model_params=model_params)
+    decoder_type = getattr(model, "decoder_type", model_params.get('decoder_type', 'rnnt')).lower()
 
     scheduler_params = {
             'max_lr': float(cfg_get_nested( config, 'optimizer_params.lr', 5e-4)),
@@ -313,18 +320,29 @@ def main(config_path):
         {"params": model.parameters(), "optimizer_params":{}, "scheduler_params": scheduler_params})
 
     blank_index = sorted_train_dataloader.dataset.text_cleaner.word_index_dictionary[" "] # get blank index
-    criterion = build_criterion(critic_params={
-                'ctc': {'blank': blank_index},
-        }, entropy_params=entropy_params)
+    loss_weight_config = cfg_get_nested(config, 'loss_weights', {}) or {}
+    ctc_weight = float(loss_weight_config.get('ctc', 1.0))
+    s2s_weight = float(loss_weight_config.get('s2s', 0.0))
+    rnnt_weight = float(loss_weight_config.get('rnnt', 1.0))
+
+    rnnt_loss_params = cfg_get_nested(config, 'rnnt_loss_params', {}) or {}
+    criterion_params = {}
+    if ctc_weight > 0:
+        criterion_params['ctc'] = {'blank': blank_index}
+    if decoder_type == 's2s' and s2s_weight > 0:
+        criterion_params['ce'] = {}
+    if decoder_type == 'rnnt' and rnnt_weight > 0:
+        rnnt_params = {'blank': blank_index}
+        rnnt_params.update(rnnt_loss_params)
+        criterion_params['rnnt'] = rnnt_params
+    criterion = build_criterion(critic_params=criterion_params, entropy_params=entropy_params)
 
     if enable_early_stopping:
         early_stopping = EarlyStoppingWithNoLearningRate(patience=max([ 3, int( math.floor( int( cfg_get_nested( config, 'save_freq', 10 ) ) / 2 ) ) ]) )
     else:
         early_stopping = None
 
-    loss_weight_config = cfg_get_nested(config, 'loss_weights', {}) or {}
-    ctc_weight = float(loss_weight_config.get('ctc', 1.0))
-    s2s_weight = float(loss_weight_config.get('s2s', 1.0))
+    diagonal_attention_enabled = cfg_get_nested( config, 'use_diagonal_attention_prior', True) and decoder_type == 's2s'
 
     trainer = Trainer(model=model,
                     criterion=criterion,
@@ -337,10 +355,13 @@ def main(config_path):
                     shuffled_val_dataloader=shuffled_val_dataloader,
                     logger=logger,
                     switch_sortagrad_dataset_epoch=cfg_get_nested( config, 'sortagrad_switch_to_shuffled_dataset_epoch', 10),
-                    use_diagonal_attention_prior=cfg_get_nested( config, 'use_diagonal_attention_prior', True),
+                    use_diagonal_attention_prior=diagonal_attention_enabled,
                     diagonal_attention_prior_weight=cfg_get_nested( config, 'diagonal_attention_prior_weight', 0.1),
                     ctc_weight=ctc_weight,
                     s2s_weight=s2s_weight,
+                    rnnt_weight=rnnt_weight,
+                    decoder_type=decoder_type,
+                    blank_id=blank_index,
                     )
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )

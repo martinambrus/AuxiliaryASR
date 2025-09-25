@@ -14,6 +14,11 @@ import jiwer
 import matplotlib.pylab as plt
 from pathlib import Path
 
+try:
+    from torchaudio.functional import rnnt_loss as torchaudio_rnnt_loss
+except ImportError:  # pragma: no cover - torchaudio might be unavailable during testing
+    torchaudio_rnnt_loss = None
+
 def calc_wer(target, pred, ignore_indexes=[0]):
     target_chars = drop_duplicated(list(filter(lambda x: x not in ignore_indexes, map(str, list(target)))))
     pred_chars = drop_duplicated(list(filter(lambda x: x not in ignore_indexes, map(str, list(pred)))))
@@ -29,11 +34,47 @@ def drop_duplicated(chars):
             ret_chars.append(curr)
     return ret_chars
 
-def build_criterion(critic_params={}, entropy_params={}):
-    criterion = {
-        "ce": nn.CrossEntropyLoss(ignore_index=-1, **entropy_params),
-        "ctc": torch.nn.CTCLoss(**critic_params.get('ctc', {})),
-    }
+class RNNTLossWrapper(nn.Module):
+    def __init__(self, blank=0, reduction="mean", clamp=-1):
+        super().__init__()
+        if torchaudio_rnnt_loss is None:
+            raise ImportError("torchaudio is required to compute RNNT loss but is not available.")
+        self.blank = blank
+        self.reduction = reduction
+        self.clamp = clamp
+
+    def forward(self, log_probs, targets, logit_lengths, target_lengths):
+        return torchaudio_rnnt_loss(
+            log_probs,
+            targets,
+            logit_lengths,
+            target_lengths,
+            blank=self.blank,
+            reduction=self.reduction,
+            clamp=self.clamp,
+        )
+
+
+def build_criterion(critic_params=None, entropy_params=None):
+    critic_params = critic_params or {}
+    entropy_params = entropy_params or {}
+    criterion = {}
+
+    if "ce" in critic_params:
+        ce_config = critic_params.get("ce") or {}
+        ce_kwargs = dict(ce_config)
+        ce_kwargs.setdefault("ignore_index", -1)
+        ce_kwargs.update(entropy_params)
+        criterion["ce"] = nn.CrossEntropyLoss(**ce_kwargs)
+
+    if "ctc" in critic_params:
+        ctc_kwargs = critic_params.get("ctc") or {}
+        criterion["ctc"] = torch.nn.CTCLoss(**ctc_kwargs)
+
+    if "rnnt" in critic_params:
+        rnnt_kwargs = critic_params.get("rnnt") or {}
+        criterion["rnnt"] = RNNTLossWrapper(**rnnt_kwargs)
+
     return criterion
 
 def get_data_path_list(train_path=None, val_path=None):

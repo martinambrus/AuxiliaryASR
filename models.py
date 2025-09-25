@@ -1,27 +1,39 @@
 import math
+from typing import Optional
+
 import torch
 from torch import nn
-from torch.nn import TransformerEncoder
 import torch.nn.functional as F
+
 from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
 
-def build_model(model_params={}, model_type='asr'):
+def build_model(model_params=None, model_type="asr"):
+    model_params = model_params or {}
     model = ASRCNN(**model_params)
     return model
 
 
 class ASRCNN(nn.Module):
-    def __init__(self,
-                 input_dim=80,
-                 hidden_dim=256,
-                 n_token=35,
-                 n_layers=6,
-                 token_embedding_dim=256,
-                 location_kernel_size=63,
+    def __init__(
+        self,
+        input_dim=80,
+        hidden_dim=256,
+        n_token=35,
+        n_layers=6,
+        token_embedding_dim=256,
+        location_kernel_size=63,
+        decoder_type="rnnt",
+        rnnt_prediction_dim=256,
+        rnnt_joint_dim=320,
+        rnnt_num_layers=1,
+        rnnt_dropout=0.1,
+        blank_id=0,
     ):
         super().__init__()
         self.n_token = n_token
         self.n_down = 1
+        self.decoder_type = (decoder_type or "rnnt").lower()
+        self.blank_id = blank_id
         self.to_mfcc = MFCC()
         self.init_cnn = ConvNorm(input_dim//2, hidden_dim, kernel_size=7, padding=3, stride=2)
         self.cnns = nn.Sequential(
@@ -34,13 +46,38 @@ class ASRCNN(nn.Module):
             LinearNorm(hidden_dim//2, hidden_dim),
             nn.ReLU(),
             LinearNorm(hidden_dim, n_token))
-        self.asr_s2s = ASRS2S(
-            embedding_dim=token_embedding_dim,
-            hidden_dim=hidden_dim//2,
-            n_token=n_token,
-            location_kernel_size=location_kernel_size)
+        if self.decoder_type == "s2s":
+            self.asr_s2s = ASRS2S(
+                embedding_dim=token_embedding_dim,
+                hidden_dim=hidden_dim//2,
+                n_token=n_token,
+                location_kernel_size=location_kernel_size)
+        elif self.decoder_type == "rnnt":
+            self.rnnt_prediction = RNNTDecoder(
+                vocab_size=n_token,
+                embedding_dim=token_embedding_dim,
+                hidden_dim=rnnt_prediction_dim,
+                num_layers=rnnt_num_layers,
+                dropout=rnnt_dropout,
+                blank_id=blank_id,
+            )
+            self.rnnt_joint = RNNTJoint(
+                encoder_dim=hidden_dim // 2,
+                prediction_dim=rnnt_prediction_dim,
+                joint_dim=rnnt_joint_dim,
+                vocab_size=n_token,
+            )
+        else:
+            raise ValueError(f"Unsupported decoder_type: {self.decoder_type}")
 
-    def forward(self, x, src_key_padding_mask=None, text_input=None):
+    def forward(
+        self,
+        x,
+        src_key_padding_mask: Optional[torch.Tensor] = None,
+        text_input: Optional[torch.Tensor] = None,
+        decoder_inputs: Optional[torch.Tensor] = None,
+        decoder_lengths: Optional[torch.Tensor] = None,
+    ):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
         x = self.cnns(x)
@@ -48,11 +85,18 @@ class ASRCNN(nn.Module):
         x = self.projection(x)
         x = x.transpose(1, 2)
         ctc_logit = self.ctc_linear(x)
-        if text_input is not None:
+        if self.decoder_type == "s2s":
+            if text_input is None:
+                raise ValueError("text_input must be provided when using the seq2seq decoder")
             _, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
             return ctc_logit, s2s_logit, s2s_attn
-        else:
-            return ctc_logit
+        if self.decoder_type == "rnnt":
+            if decoder_inputs is None or decoder_lengths is None:
+                raise ValueError("decoder_inputs and decoder_lengths must be provided for RNNT decoding")
+            prediction = self.rnnt_prediction(decoder_inputs, decoder_lengths)
+            joint = self.rnnt_joint(x, prediction)
+            return ctc_logit, joint
+        return ctc_logit
 
     def get_feature(self, x):
         x = self.to_mfcc(x)
@@ -200,3 +244,69 @@ class ASRS2S(nn.Module):
         hidden = torch.stack(hidden).transpose(0, 1).contiguous()
 
         return hidden, logit, alignments
+
+
+class RNNTDecoder(nn.Module):
+    def __init__(
+        self,
+        vocab_size,
+        embedding_dim,
+        hidden_dim,
+        num_layers=1,
+        dropout=0.1,
+        blank_id=0,
+    ):
+        super().__init__()
+        self.embedding = nn.Embedding(vocab_size, embedding_dim)
+        val_range = math.sqrt(6 / hidden_dim)
+        self.embedding.weight.data.uniform_(-val_range, val_range)
+        self.rnn = nn.LSTM(
+            input_size=embedding_dim,
+            hidden_size=hidden_dim,
+            num_layers=num_layers,
+            batch_first=True,
+        )
+        self.dropout = nn.Dropout(dropout)
+        self.blank_id = blank_id
+
+    def forward(self, targets: torch.Tensor, target_lengths: torch.Tensor) -> torch.Tensor:
+        if targets.dim() != 2:
+            raise ValueError("targets must be a 2D tensor of shape (batch, max_target_length)")
+        if target_lengths.dim() != 1:
+            raise ValueError("target_lengths must be a 1D tensor")
+        if targets.size(0) != target_lengths.size(0):
+            raise ValueError("targets and target_lengths batch dimensions must match")
+
+        batch_size, max_u = targets.size()
+        start_symbols = targets.new_full((batch_size, 1), fill_value=self.blank_id)
+        decoder_input = torch.cat([start_symbols, targets], dim=1)
+        effective_lengths = target_lengths + 1
+
+        embedded = self.embedding(decoder_input)
+        packed = nn.utils.rnn.pack_padded_sequence(
+            embedded, effective_lengths.cpu(), batch_first=True, enforce_sorted=False
+        )
+        outputs, _ = self.rnn(packed)
+        outputs, _ = nn.utils.rnn.pad_packed_sequence(
+            outputs, batch_first=True, total_length=embedded.size(1)
+        )
+        outputs = self.dropout(outputs)
+        return outputs
+
+
+class RNNTJoint(nn.Module):
+    def __init__(self, encoder_dim, prediction_dim, joint_dim, vocab_size):
+        super().__init__()
+        self.encoder_proj = nn.Linear(encoder_dim, joint_dim)
+        self.prediction_proj = nn.Linear(prediction_dim, joint_dim)
+        self.activation = nn.Tanh()
+        self.output = nn.Linear(joint_dim, vocab_size)
+
+    def forward(self, encoder_outputs: torch.Tensor, prediction_outputs: torch.Tensor) -> torch.Tensor:
+        if encoder_outputs.dim() != 3 or prediction_outputs.dim() != 3:
+            raise ValueError("encoder_outputs and prediction_outputs must be 3D tensors")
+        enc = self.encoder_proj(encoder_outputs).unsqueeze(2)
+        pred = self.prediction_proj(prediction_outputs).unsqueeze(1)
+        joint = self.activation(enc + pred)
+        logits = self.output(joint)
+        return logits

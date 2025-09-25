@@ -25,6 +25,11 @@ model_params:
    token_embedding_dim: 512
    n_layers: 5
    location_kernel_size: 31
+   decoder_type: "rnnt"
+   rnnt_prediction_dim: 256
+   rnnt_joint_dim: 320
+   rnnt_num_layers: 1
+   rnnt_dropout: 0.1
 
 optimizer_params:
   lr: 0.0005
@@ -38,8 +43,8 @@ enable_early_stopping: True
 # default: 10
 sortagrad_switch_to_shuffled_dataset_epoch: 10
 
-# make ASR learn to read phonemes from left to right, not randomly
-use_diagonal_attention_prior: True
+# make ASR learn to read phonemes from left to right, not randomly (only used with seq2seq decoder)
+use_diagonal_attention_prior: False
 diagonal_attention_prior_weight: 0.1
 
 # stabilizes ASR training for smaller datasets
@@ -66,4 +71,9 @@ dataloader_params:
 
 loss_weights:
   ctc: 0.8
-  s2s: 1.0
+  s2s: 0.0
+  rnnt: 1.0
+
+# optional RNNT loss parameters (passed to torchaudio rnnt_loss)
+rnnt_loss_params:
+  reduction: "mean"
