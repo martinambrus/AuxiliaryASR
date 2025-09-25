@@ -18,6 +18,7 @@ class ASRCNN(nn.Module):
                  n_layers=6,
                  token_embedding_dim=256,
                  location_kernel_size=63,
+                 multi_task_config=None,
     ):
         super().__init__()
         self.n_token = n_token
@@ -30,15 +31,67 @@ class ASRCNN(nn.Module):
                 nn.GroupNorm(num_groups=1, num_channels=hidden_dim)
             ) for n in range(n_layers)])
         self.projection = ConvNorm(hidden_dim, hidden_dim // 2)
-        self.ctc_linear = nn.Sequential(
-            LinearNorm(hidden_dim//2, hidden_dim),
-            nn.ReLU(),
-            LinearNorm(hidden_dim, n_token))
+        self.multi_task_config = multi_task_config or {}
+        self.use_ctc = bool(self.multi_task_config.get('use_ctc', True))
+        self.use_seq2seq = bool(self.multi_task_config.get('use_seq2seq', True))
+
+        if self.use_ctc:
+            self.ctc_linear = nn.Sequential(
+                LinearNorm(hidden_dim//2, hidden_dim),
+                nn.ReLU(),
+                LinearNorm(hidden_dim, n_token))
+        else:
+            self.ctc_linear = None
+
         self.asr_s2s = ASRS2S(
             embedding_dim=token_embedding_dim,
             hidden_dim=hidden_dim//2,
             n_token=n_token,
             location_kernel_size=location_kernel_size)
+
+        frame_cfg = self.multi_task_config.get('frame_phoneme', {}) or {}
+        self.enable_frame_classifier = bool(frame_cfg.get('enabled', False))
+        if self.enable_frame_classifier:
+            n_classes = int(frame_cfg.get('num_classes') or 0)
+            if n_classes <= 0:
+                n_classes = n_token
+            self.frame_classifier = nn.Sequential(
+                LinearNorm(hidden_dim//2, hidden_dim//2),
+                nn.ReLU(),
+                LinearNorm(hidden_dim//2, n_classes)
+            )
+            self.frame_num_classes = n_classes
+        else:
+            self.frame_classifier = None
+            self.frame_num_classes = 0
+
+        speaker_cfg = self.multi_task_config.get('speaker', {}) or {}
+        self.enable_speaker = bool(speaker_cfg.get('enabled', False))
+        if self.enable_speaker:
+            embedding_dim = int(speaker_cfg.get('embedding_dim', hidden_dim//2))
+            self.num_speakers = max(1, int(speaker_cfg.get('num_speakers', 1)))
+            self.speaker_projection = nn.Linear(hidden_dim//2, embedding_dim)
+            self.speaker_norm = nn.LayerNorm(embedding_dim)
+            self.speaker_classifier = nn.Linear(embedding_dim, self.num_speakers)
+        else:
+            self.speaker_projection = None
+            self.speaker_classifier = None
+            self.speaker_norm = None
+            self.num_speakers = 0
+
+        pron_cfg = self.multi_task_config.get('pronunciation_error', {}) or {}
+        self.enable_pronunciation_error = bool(pron_cfg.get('enabled', False))
+        if self.enable_pronunciation_error:
+            num_classes = max(2, int(pron_cfg.get('num_classes', 2)))
+            self.pron_error_head = nn.Sequential(
+                LinearNorm(self.asr_s2s.decoder_rnn_dim, hidden_dim//2),
+                nn.ReLU(),
+                LinearNorm(hidden_dim//2, num_classes)
+            )
+            self.pron_error_num_classes = num_classes
+        else:
+            self.pron_error_head = None
+            self.pron_error_num_classes = 0
 
     def forward(self, x, src_key_padding_mask=None, text_input=None):
         x = self.to_mfcc(x)
@@ -47,12 +100,42 @@ class ASRCNN(nn.Module):
 
         x = self.projection(x)
         x = x.transpose(1, 2)
-        ctc_logit = self.ctc_linear(x)
-        if text_input is not None:
-            _, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
-            return ctc_logit, s2s_logit, s2s_attn
-        else:
-            return ctc_logit
+        outputs = {"encoder_features": x}
+
+        if self.use_ctc and self.ctc_linear is not None:
+            ctc_logit = self.ctc_linear(x)
+            outputs["ctc_logits"] = ctc_logit
+
+        if self.enable_frame_classifier and self.frame_classifier is not None:
+            frame_logits = self.frame_classifier(x)
+            outputs["frame_phoneme_logits"] = frame_logits
+
+        if self.enable_speaker and self.speaker_projection is not None:
+            pooled = x.mean(dim=1)
+            speaker_embedding = torch.tanh(self.speaker_projection(pooled))
+            speaker_embedding = self.speaker_norm(speaker_embedding)
+            speaker_logits = self.speaker_classifier(speaker_embedding)
+            outputs["speaker_embeddings"] = speaker_embedding
+            outputs["speaker_logits"] = speaker_logits
+
+        if text_input is not None and self.use_seq2seq:
+            hidden_outputs, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
+            outputs["s2s_hidden"] = hidden_outputs
+            outputs["s2s_logits"] = s2s_logit
+            outputs["s2s_attn"] = s2s_attn
+
+            if self.enable_pronunciation_error and self.pron_error_head is not None:
+                # remove the initial SOS step when computing pronunciation error logits
+                if hidden_outputs.size(1) > 1:
+                    pron_input = hidden_outputs[:, 1:, :]
+                else:
+                    pron_input = hidden_outputs
+                pron_error_logits = self.pron_error_head(pron_input)
+                outputs["pron_error_logits"] = pron_error_logits
+        elif text_input is None:
+            outputs.setdefault("s2s_logits", None)
+
+        return outputs
 
     def get_feature(self, x):
         x = self.to_mfcc(x)

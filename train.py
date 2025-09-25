@@ -252,31 +252,37 @@ def main(config_path):
     val_num_workers = int(dataloader_params.get('val_num_workers', 2))
     train_bucket_sampler_config = dataloader_params.get('train_bucket_sampler', {})
 
+    collate_config = {'return_speaker_ids': True}
+
     sorted_train_dataloader = build_dataloader(train_list_sorted,
                                         batch_size=batch_size,
                                         num_workers=train_num_workers,
                                         dataset_config=dataset_params,
-                                        device=device)
+                                        device=device,
+                                        collate_config=collate_config)
     shuffled_train_dataloader = build_dataloader(train_entries,
                                             batch_size=batch_size,
                                             num_workers=train_num_workers,
                                             dataset_config=dataset_params,
                                             device=device,
                                             lengths=train_durations,
-                                            bucket_sampler_config=train_bucket_sampler_config)
+                                            bucket_sampler_config=train_bucket_sampler_config,
+                                            collate_config=collate_config)
 
     sorted_val_dataloader = build_dataloader(val_list_sorted,
                                       batch_size=batch_size,
                                       validation=True,
                                       num_workers=val_num_workers,
                                       device=device,
-                                      dataset_config=dataset_params)
+                                      dataset_config=dataset_params,
+                                      collate_config=collate_config)
     shuffled_val_dataloader = build_dataloader(val_entries,
                                           batch_size=batch_size,
                                           validation=True,
                                           num_workers=val_num_workers,
                                           device=device,
-                                          dataset_config=dataset_params)
+                                          dataset_config=dataset_params,
+                                          collate_config=collate_config)
 
     word_indexes = set(
         line.strip() for line in open(cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'))
@@ -294,6 +300,25 @@ def main(config_path):
 
     if not 'n_token' in model_params:
         model_params['n_token'] = len( word_indexes )
+
+    multi_task_config = cfg_get_nested(config, 'multi_task', {}) or {}
+
+    speaker_cfg = multi_task_config.get('speaker', {}) or {}
+    if speaker_cfg.get('enabled', False) and int(speaker_cfg.get('num_speakers', 0)) <= 0:
+        speaker_ids = set()
+        for entry in train_entries + val_entries:
+            if len(entry) >= 3 and entry[2] != "":
+                try:
+                    speaker_ids.add(int(entry[2]))
+                except ValueError:
+                    continue
+        inferred = max(speaker_ids) + 1 if speaker_ids else 1
+        speaker_cfg = dict(speaker_cfg)
+        speaker_cfg['num_speakers'] = inferred
+        multi_task_config['speaker'] = speaker_cfg
+
+    model_params = dict(model_params)
+    model_params['multi_task_config'] = multi_task_config
 
     print("Using model parameters:", model_params)
 
@@ -315,7 +340,7 @@ def main(config_path):
     blank_index = sorted_train_dataloader.dataset.text_cleaner.word_index_dictionary[" "] # get blank index
     criterion = build_criterion(critic_params={
                 'ctc': {'blank': blank_index},
-        }, entropy_params=entropy_params)
+        }, entropy_params=entropy_params, multi_task_config=multi_task_config)
 
     if enable_early_stopping:
         early_stopping = EarlyStoppingWithNoLearningRate(patience=max([ 3, int( math.floor( int( cfg_get_nested( config, 'save_freq', 10 ) ) / 2 ) ) ]) )
@@ -323,8 +348,17 @@ def main(config_path):
         early_stopping = None
 
     loss_weight_config = cfg_get_nested(config, 'loss_weights', {}) or {}
-    ctc_weight = float(loss_weight_config.get('ctc', 1.0))
-    s2s_weight = float(loss_weight_config.get('s2s', 1.0))
+    use_ctc = bool(multi_task_config.get('use_ctc', True))
+    use_s2s = bool(multi_task_config.get('use_seq2seq', True))
+    frame_cfg = multi_task_config.get('frame_phoneme', {}) or {}
+    speaker_cfg = multi_task_config.get('speaker', {}) or {}
+    pron_cfg = multi_task_config.get('pronunciation_error', {}) or {}
+
+    ctc_weight = float(loss_weight_config.get('ctc', 1.0 if use_ctc else 0.0)) if use_ctc else 0.0
+    s2s_weight = float(loss_weight_config.get('s2s', 1.0 if use_s2s else 0.0)) if use_s2s else 0.0
+    frame_weight = float(loss_weight_config.get('frame_phoneme', 0.0)) if frame_cfg.get('enabled', False) else 0.0
+    speaker_weight = float(loss_weight_config.get('speaker', 0.0)) if speaker_cfg.get('enabled', False) else 0.0
+    pron_weight = float(loss_weight_config.get('pronunciation_error', 0.0)) if pron_cfg.get('enabled', False) else 0.0
 
     trainer = Trainer(model=model,
                     criterion=criterion,
@@ -337,10 +371,16 @@ def main(config_path):
                     shuffled_val_dataloader=shuffled_val_dataloader,
                     logger=logger,
                     switch_sortagrad_dataset_epoch=cfg_get_nested( config, 'sortagrad_switch_to_shuffled_dataset_epoch', 10),
-                    use_diagonal_attention_prior=cfg_get_nested( config, 'use_diagonal_attention_prior', True),
+                    use_diagonal_attention_prior=(cfg_get_nested( config, 'use_diagonal_attention_prior', True) and use_s2s),
                     diagonal_attention_prior_weight=cfg_get_nested( config, 'diagonal_attention_prior_weight', 0.1),
                     ctc_weight=ctc_weight,
                     s2s_weight=s2s_weight,
+                    frame_weight=frame_weight,
+                    speaker_weight=speaker_weight,
+                    pron_error_weight=pron_weight,
+                    enable_frame_classifier=frame_cfg.get('enabled', False),
+                    enable_speaker=speaker_cfg.get('enabled', False),
+                    enable_pronunciation_error=pron_cfg.get('enabled', False)
                     )
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )

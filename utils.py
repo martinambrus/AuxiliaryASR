@@ -29,11 +29,26 @@ def drop_duplicated(chars):
             ret_chars.append(curr)
     return ret_chars
 
-def build_criterion(critic_params={}, entropy_params={}):
+def build_criterion(critic_params={}, entropy_params={}, multi_task_config=None):
+    multi_task_config = multi_task_config or {}
+
     criterion = {
         "ce": nn.CrossEntropyLoss(ignore_index=-1, **entropy_params),
         "ctc": torch.nn.CTCLoss(**critic_params.get('ctc', {})),
     }
+
+    frame_cfg = multi_task_config.get('frame_phoneme', {}) or {}
+    if frame_cfg.get('enabled', False):
+        criterion["frame_ce"] = nn.CrossEntropyLoss(ignore_index=-1, **entropy_params)
+
+    speaker_cfg = multi_task_config.get('speaker', {}) or {}
+    if speaker_cfg.get('enabled', False):
+        criterion["speaker_ce"] = nn.CrossEntropyLoss()
+
+    pron_cfg = multi_task_config.get('pronunciation_error', {}) or {}
+    if pron_cfg.get('enabled', False):
+        criterion["pron_error_ce"] = nn.CrossEntropyLoss(ignore_index=-1, **entropy_params)
+
     return criterion
 
 def get_data_path_list(train_path=None, val_path=None):

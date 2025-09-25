@@ -39,7 +39,13 @@ class Trainer(object):
                  use_diagonal_attention_prior = True,
                  diagonal_attention_prior_weight = 0.1,
                  ctc_weight=1.0,
-                 s2s_weight=1.0):
+                 s2s_weight=1.0,
+                 frame_weight=0.0,
+                 speaker_weight=0.0,
+                 pron_error_weight=0.0,
+                 enable_frame_classifier=False,
+                 enable_speaker=False,
+                 enable_pronunciation_error=False):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -64,6 +70,12 @@ class Trainer(object):
         self.maxm_mem_usage = 0
         self.ctc_weight = ctc_weight
         self.s2s_weight = s2s_weight
+        self.frame_weight = frame_weight
+        self.speaker_weight = speaker_weight
+        self.pron_error_weight = pron_error_weight
+        self.enable_frame_classifier = enable_frame_classifier
+        self.enable_speaker = enable_speaker
+        self.enable_pronunciation_error = enable_pronunciation_error
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -157,6 +169,51 @@ class Trainer(object):
             break
         return lr
 
+    def _build_frame_targets(self, text_input, text_lengths, frame_lengths, max_frames):
+        device = text_input.device
+        batch_size = text_input.size(0)
+        targets = torch.full((batch_size, max_frames), -1, device=device, dtype=torch.long)
+        for idx in range(batch_size):
+            text_len = int(text_lengths[idx].item())
+            frame_len = int(frame_lengths[idx].item())
+            if text_len <= 0 or frame_len <= 0:
+                continue
+            frame_len = min(frame_len, max_frames)
+            effective_text = text_input[idx, :text_len]
+            frame_indices = torch.linspace(0, text_len - 1, steps=frame_len, device=device)
+            frame_indices = frame_indices.round().clamp(min=0, max=text_len - 1).long()
+            targets[idx, :frame_len] = effective_text[frame_indices]
+        return targets
+
+    def _build_pronunciation_targets(self, text_input, text_lengths, max_length):
+        device = text_input.device
+        batch_size = text_input.size(0)
+        targets = torch.full((batch_size, max_length), -1, device=device, dtype=torch.long)
+        for idx in range(batch_size):
+            length = int(text_lengths[idx].item())
+            if length <= 0:
+                continue
+            max_assign = min(length, max_length)
+            if max_assign <= 0:
+                continue
+            tokens = text_input[idx, :max_assign]
+            pron_targets = torch.zeros(max_assign, device=device, dtype=torch.long)
+            if max_assign > 1:
+                repeated = tokens[1:] == tokens[:-1]
+                pron_targets[1:][repeated] = 1
+            targets[idx, :max_assign] = pron_targets
+        return targets
+
+    @staticmethod
+    def _sequence_accuracy(predictions, targets):
+        if predictions is None or targets is None:
+            return 0.0
+        mask = targets != -1
+        if mask.sum().item() == 0:
+            return 0.0
+        correct = (predictions == targets) & mask
+        return correct.float().sum().item() / mask.float().sum().item()
+
     @staticmethod
     def get_image(arrs):
         pil_images = []
@@ -181,38 +238,111 @@ class Trainer(object):
         # FIX: trying to fix OOM errors
         #torch.cuda.empty_cache()
         self.optimizer.zero_grad()
-        batch = [b.to(self.device) for b in batch]
-        text_input, text_input_length, mel_input, mel_input_length = batch
+        processed_batch = []
+        for element in batch:
+            if hasattr(element, 'to'):
+                processed_batch.append(element.to(self.device))
+            else:
+                processed_batch.append(element)
+        batch = processed_batch
+
+        text_input, text_input_length, mel_input, mel_input_length = batch[:4]
+        if len(batch) > 4:
+            speaker_ids = batch[4]
+        else:
+            speaker_ids = torch.zeros(text_input.size(0), device=self.device, dtype=torch.long)
+        speaker_ids = speaker_ids.long()
         mel_input_length = mel_input_length // (2 ** self.model.n_down)
         future_mask = self.model.get_future_mask(
             mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
         mel_mask = self.model.length_to_mask(mel_input_length)
         text_mask = self.model.length_to_mask(text_input_length)
-        ppgs, s2s_pred, s2s_attn = self.model(
+        model_outputs = self.model(
             mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 
-        if self.use_diagonal_attention_prior:
+        losses = {}
+        total_loss = torch.zeros(1, device=self.device)
+
+        ppgs = model_outputs.get('ctc_logits')
+        if self.ctc_weight > 0 and ppgs is not None:
+            loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
+                                          text_input, mel_input_length, text_input_length)
+            total_loss = total_loss + self.ctc_weight * loss_ctc
+            losses['ctc'] = loss_ctc.item()
+        else:
+            loss_ctc = torch.zeros(1, device=self.device)
+
+        s2s_pred = model_outputs.get('s2s_logits')
+        s2s_attn = model_outputs.get('s2s_attn')
+        if self.s2s_weight > 0 and s2s_pred is not None:
+            loss_s2s = 0
+            for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
+                loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
+            loss_s2s /= max(1, text_input.size(0))
+            total_loss = total_loss + self.s2s_weight * loss_s2s
+            losses['s2s'] = loss_s2s.item()
+        else:
+            loss_s2s = torch.zeros(1, device=self.device)
+
+        if self.enable_frame_classifier and self.frame_weight > 0:
+            frame_logits = model_outputs.get('frame_phoneme_logits')
+            if frame_logits is not None:
+                frame_targets = self._build_frame_targets(text_input, text_input_length, mel_input_length, frame_logits.size(1))
+                frame_loss = self.criterion['frame_ce'](frame_logits.reshape(-1, frame_logits.size(2)),
+                                                        frame_targets.view(-1))
+                total_loss = total_loss + self.frame_weight * frame_loss
+                losses['frame_phoneme'] = frame_loss.item()
+            else:
+                frame_loss = torch.zeros(1, device=self.device)
+        else:
+            frame_loss = torch.zeros(1, device=self.device)
+
+        if self.enable_speaker and self.speaker_weight > 0:
+            speaker_logits = model_outputs.get('speaker_logits')
+            if speaker_logits is not None:
+                loss_speaker = self.criterion['speaker_ce'](speaker_logits, speaker_ids)
+                total_loss = total_loss + self.speaker_weight * loss_speaker
+                speaker_pred = torch.argmax(speaker_logits, dim=1)
+                speaker_acc = torch.eq(speaker_pred, speaker_ids).float().mean().item()
+                losses['speaker'] = loss_speaker.item()
+                losses['speaker_acc'] = speaker_acc
+            else:
+                loss_speaker = torch.zeros(1, device=self.device)
+        else:
+            loss_speaker = torch.zeros(1, device=self.device)
+
+        if self.enable_pronunciation_error and self.pron_error_weight > 0:
+            pron_logits = model_outputs.get('pron_error_logits')
+            if pron_logits is not None:
+                pron_targets = self._build_pronunciation_targets(text_input, text_input_length, pron_logits.size(1))
+                pron_loss = self.criterion['pron_error_ce'](pron_logits.reshape(-1, pron_logits.size(2)),
+                                                            pron_targets.view(-1))
+                total_loss = total_loss + self.pron_error_weight * pron_loss
+                pron_pred = torch.argmax(pron_logits, dim=2)
+                pron_acc = self._sequence_accuracy(pron_pred, pron_targets)
+                losses['pronunciation_error'] = pron_loss.item()
+                losses['pronunciation_error_acc'] = pron_acc
+            else:
+                pron_loss = torch.zeros(1, device=self.device)
+        else:
+            pron_loss = torch.zeros(1, device=self.device)
+
+        if self.use_diagonal_attention_prior and s2s_attn is not None:
             loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, mel_input_length)
-
-        loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
-                                      text_input, mel_input_length, text_input_length)
-
-        loss_s2s = 0
-        for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
-            loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
-        loss_s2s /= text_input.size(0)
-
-        total_loss = self.ctc_weight * loss_ctc + self.s2s_weight * loss_s2s
-        if self.use_diagonal_attention_prior:
             total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
+            losses['diag_attn'] = loss_diagonal.item()
+        
         loss = total_loss
         loss.backward()
         torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
         self.optimizer.step()
         self.scheduler.step()
-        return {'loss': loss.item(),
-                'ctc': loss_ctc.item(),
-                's2s': loss_s2s.item()}
+        losses['loss'] = loss.item()
+        if 'ctc' not in losses:
+            losses['ctc'] = loss_ctc.item()
+        if 's2s' not in losses:
+            losses['s2s'] = loss_s2s.item()
+        return losses
 
     def _train_epoch(self):
         # switch dataloader if we're above configured epoch
@@ -249,41 +379,102 @@ class Trainer(object):
         eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
         for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
-            batch = [b.to(self.device) for b in batch]
-            text_input, text_input_length, mel_input, mel_input_length = batch
+            processed_batch = []
+            for element in batch:
+                if hasattr(element, 'to'):
+                    processed_batch.append(element.to(self.device))
+                else:
+                    processed_batch.append(element)
+            batch = processed_batch
+
+            text_input, text_input_length, mel_input, mel_input_length = batch[:4]
+            if len(batch) > 4:
+                speaker_ids = batch[4].long()
+            else:
+                speaker_ids = torch.zeros(text_input.size(0), device=self.device, dtype=torch.long)
             mel_input_length = mel_input_length // (2 ** self.model.n_down)
             future_mask = self.model.get_future_mask(
                 mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
             mel_mask = self.model.length_to_mask(mel_input_length)
             text_mask = self.model.length_to_mask(text_input_length)
-            ppgs, s2s_pred, s2s_attn = self.model(
+            model_outputs = self.model(
                 mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
-            loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
-                                          text_input, mel_input_length, text_input_length)
-            loss_s2s = 0
-            for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
-                loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
-            loss_s2s /= text_input.size(0)
-            loss = loss_ctc + loss_s2s
 
-            eval_losses["eval/ctc"].append(loss_ctc.item())
-            eval_losses["eval/s2s"].append(loss_s2s.item())
-            eval_losses["eval/loss"].append(loss.item())
+            ppgs = model_outputs.get('ctc_logits')
+            s2s_pred = model_outputs.get('s2s_logits')
+            s2s_attn = model_outputs.get('s2s_attn')
 
-            _, amax_ppgs = torch.max(ppgs, dim=2)
-            wers = [calc_wer(target[:text_length],
-                             pred[:mel_length],
-                             ignore_indexes=list(range(5))) \
-                    for target, pred, text_length, mel_length in zip(
-                            text_input.cpu(), amax_ppgs.cpu(), text_input_length.cpu(), mel_input_length.cpu())]
-            eval_losses["eval/wer"].extend(wers)
+            if self.ctc_weight > 0 and ppgs is not None:
+                loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
+                                              text_input, mel_input_length, text_input_length)
+                eval_losses["eval/ctc"].append(loss_ctc.item())
+            else:
+                loss_ctc = torch.zeros(1, device=self.device)
 
-            _, amax_s2s = torch.max(s2s_pred, dim=2)
-            acc = [torch.eq(target[:length], pred[:length]).float().mean().item() \
-                   for target, pred, length in zip(text_input.cpu(), amax_s2s.cpu(), text_input_length.cpu())]
-            eval_losses["eval/acc"].extend(acc)
+            if self.s2s_weight > 0 and s2s_pred is not None:
+                loss_s2s = 0
+                for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
+                    loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
+                loss_s2s /= max(1, text_input.size(0))
+                eval_losses["eval/s2s"].append(loss_s2s.item())
+            else:
+                loss_s2s = torch.zeros(1, device=self.device)
 
-            if eval_steps_per_epoch <= 2:
+            total_eval_loss = torch.zeros(1, device=self.device)
+            if self.ctc_weight > 0:
+                total_eval_loss = total_eval_loss + self.ctc_weight * loss_ctc
+            if self.s2s_weight > 0:
+                total_eval_loss = total_eval_loss + self.s2s_weight * loss_s2s
+
+            if self.enable_frame_classifier and self.frame_weight > 0:
+                frame_logits = model_outputs.get('frame_phoneme_logits')
+                if frame_logits is not None:
+                    frame_targets = self._build_frame_targets(text_input, text_input_length, mel_input_length, frame_logits.size(1))
+                    frame_loss = self.criterion['frame_ce'](frame_logits.reshape(-1, frame_logits.size(2)),
+                                                            frame_targets.view(-1))
+                    total_eval_loss = total_eval_loss + self.frame_weight * frame_loss
+                    eval_losses['eval/frame_phoneme'].append(frame_loss.item())
+
+            if self.enable_speaker and self.speaker_weight > 0:
+                speaker_logits = model_outputs.get('speaker_logits')
+                if speaker_logits is not None:
+                    loss_speaker = self.criterion['speaker_ce'](speaker_logits, speaker_ids)
+                    total_eval_loss = total_eval_loss + self.speaker_weight * loss_speaker
+                    eval_losses['eval/speaker'].append(loss_speaker.item())
+                    speaker_pred = torch.argmax(speaker_logits, dim=1)
+                    speaker_acc = torch.eq(speaker_pred, speaker_ids).float().mean().item()
+                    eval_losses['eval/speaker_acc'].append(speaker_acc)
+
+            if self.enable_pronunciation_error and self.pron_error_weight > 0:
+                pron_logits = model_outputs.get('pron_error_logits')
+                if pron_logits is not None:
+                    pron_targets = self._build_pronunciation_targets(text_input, text_input_length, pron_logits.size(1))
+                    pron_loss = self.criterion['pron_error_ce'](pron_logits.reshape(-1, pron_logits.size(2)),
+                                                                pron_targets.view(-1))
+                    total_eval_loss = total_eval_loss + self.pron_error_weight * pron_loss
+                    eval_losses['eval/pronunciation_error'].append(pron_loss.item())
+                    pron_pred = torch.argmax(pron_logits, dim=2)
+                    pron_acc = self._sequence_accuracy(pron_pred, pron_targets)
+                    eval_losses['eval/pronunciation_error_acc'].append(pron_acc)
+
+            eval_losses["eval/loss"].append(total_eval_loss.item())
+
+            if ppgs is not None:
+                _, amax_ppgs = torch.max(ppgs, dim=2)
+                wers = [calc_wer(target[:text_length],
+                                 pred[:mel_length],
+                                 ignore_indexes=list(range(5))) \
+                        for target, pred, text_length, mel_length in zip(
+                                text_input.cpu(), amax_ppgs.cpu(), text_input_length.cpu(), mel_input_length.cpu())]
+                eval_losses["eval/wer"].extend(wers)
+
+            if s2s_pred is not None:
+                _, amax_s2s = torch.max(s2s_pred, dim=2)
+                acc = [torch.eq(target[:length], pred[:length]).float().mean().item() \
+                       for target, pred, length in zip(text_input.cpu(), amax_s2s.cpu(), text_input_length.cpu())]
+                eval_losses["eval/acc"].extend(acc)
+
+            if s2s_attn is not None and eval_steps_per_epoch <= 2:
                 eval_images["eval/image"].append(
                     self.get_image([s2s_attn[0].cpu().numpy()]))
 

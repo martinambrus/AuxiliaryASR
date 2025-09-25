@@ -26,6 +26,20 @@ model_params:
    n_layers: 5
    location_kernel_size: 31
 
+multi_task:
+  use_ctc: true
+  use_seq2seq: true
+  frame_phoneme:
+    enabled: false
+    num_classes: 0   # defaults to n_token when set to 0 or omitted
+  speaker:
+    enabled: false
+    num_speakers: 0  # when 0 the trainer will infer it from the dataset metadata
+    embedding_dim: 128
+  pronunciation_error:
+    enabled: false
+    num_classes: 2
+
 optimizer_params:
   lr: 0.0005
   pct_start: 0.1
@@ -67,3 +81,6 @@ dataloader_params:
 loss_weights:
   ctc: 0.8
   s2s: 1.0
+  frame_phoneme: 0.0
+  speaker: 0.0
+  pronunciation_error: 0.0
