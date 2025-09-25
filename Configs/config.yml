@@ -24,7 +24,22 @@ model_params:
    hidden_dim: 256
    token_embedding_dim: 512
    n_layers: 5
-   location_kernel_size: 31
+   decoder_type: conformer
+   decoder_config:
+     type: conformer
+     conformer:
+       num_layers: 4
+       nhead: 4
+       ff_multiplier: 4
+       conv_kernel_size: 31
+       dropout: 0.1
+       use_macaron: true
+       use_conv_module: true
+       random_mask_prob: 0.1
+       pad_token_id: 0
+     lstm:
+       location_kernel_size: 31
+       random_mask_prob: 0.1
 
 optimizer_params:
   lr: 0.0005

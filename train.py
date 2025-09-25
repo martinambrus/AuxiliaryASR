@@ -175,6 +175,57 @@ def cfg_get_nested(cfg: dict, path, default=None, sep="."):
             return default
     return cur
 
+
+def prepare_model_params(config, vocab_size):
+    defaults = {
+        'input_dim': 80,
+        'hidden_dim': 256,
+        'n_token': vocab_size,
+        'token_embedding_dim': 512,
+        'n_layers': 5,
+        'decoder_type': 'conformer',
+        'decoder_config': {},
+    }
+
+    raw_params = cfg_get_nested(config, 'model_params', {}) or {}
+    if not isinstance(raw_params, dict):
+        raw_params = {}
+
+    params = {**defaults, **{k: v for k, v in raw_params.items()
+                             if k not in {'decoder', 'decoder_type', 'decoder_config', 'location_kernel_size'}}}
+
+    params['n_token'] = int(raw_params.get('n_token', params.get('n_token', vocab_size)))
+    if params['n_token'] <= 0:
+        params['n_token'] = vocab_size
+
+    decoder_type = raw_params.get('decoder_type')
+    decoder_config = raw_params.get('decoder_config') or {}
+    decoder_entry = raw_params.get('decoder')
+
+    if isinstance(decoder_entry, dict):
+        decoder_config = decoder_entry
+        decoder_type = decoder_entry.get('type', decoder_type)
+
+    if decoder_type is None and 'location_kernel_size' in raw_params:
+        decoder_type = 'lstm'
+
+    if decoder_type is None:
+        decoder_type = defaults.get('decoder_type', 'conformer')
+
+    if decoder_type == 'lstm':
+        lstm_cfg = decoder_config.get('lstm', {})
+        kernel = raw_params.get('location_kernel_size', lstm_cfg.get('location_kernel_size'))
+        if kernel is not None:
+            lstm_cfg = {**lstm_cfg, 'location_kernel_size': kernel}
+        if 'random_mask_prob' in raw_params:
+            lstm_cfg = {**lstm_cfg, 'random_mask_prob': raw_params['random_mask_prob']}
+        decoder_config = {**decoder_config, 'lstm': lstm_cfg}
+
+    params['decoder_type'] = decoder_type if decoder_type in {'lstm', 'conformer'} else 'conformer'
+    params['decoder_config'] = decoder_config
+
+    return params
+
 class EarlyStoppingWithNoLearningRate:
     def __init__(self, patience=5):
         self.patience = patience  # Number of epochs to wait for improvement
@@ -283,17 +334,7 @@ def main(config_path):
         if line.strip()
     )
 
-    model_params = cfg_get_nested( config, 'model_params', {
-        'input_dim': 80,
-        'hidden_dim': 256,
-        'n_token': len( word_indexes ),
-        'token_embedding_dim': 512,
-        'n_layers': 5,
-        'location_kernel_size': 31
-    })
-
-    if not 'n_token' in model_params:
-        model_params['n_token'] = len( word_indexes )
+    model_params = prepare_model_params(config, len(word_indexes))
 
     print("Using model parameters:", model_params)
 
