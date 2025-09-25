@@ -137,6 +137,42 @@ class ASRCNN(nn.Module):
 
         return outputs
 
+    def _optional_state_prefixes(self):
+        prefixes = []
+        if not self.use_ctc or self.ctc_linear is None:
+            prefixes.append("ctc_linear")
+        if not self.enable_frame_classifier or self.frame_classifier is None:
+            prefixes.append("frame_classifier")
+        if not self.enable_speaker or self.speaker_projection is None:
+            prefixes.extend([
+                "speaker_projection",
+                "speaker_norm",
+                "speaker_classifier",
+            ])
+        if not self.enable_pronunciation_error or self.pron_error_head is None:
+            prefixes.append("pron_error_head")
+        return prefixes
+
+    def load_state_dict(self, state_dict, strict=True):
+        if any(key.startswith("module.") for key in state_dict.keys()):
+            state_dict = state_dict.__class__(
+                (key.replace("module.", "", 1), value)
+                for key, value in state_dict.items()
+            )
+
+        optional_prefixes = self._optional_state_prefixes()
+        if optional_prefixes:
+            def _is_optional(key):
+                return any(key.startswith(prefix) for prefix in optional_prefixes)
+
+            filtered_state = state_dict.__class__(
+                (key, value) for key, value in state_dict.items() if not _is_optional(key)
+            )
+        else:
+            filtered_state = state_dict
+
+        return super().load_state_dict(filtered_state, strict=strict)
+
     def get_feature(self, x):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
