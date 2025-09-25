@@ -330,6 +330,10 @@ class Trainer(object):
         if primary_loss.dim() == 0:
             primary_loss = primary_loss.unsqueeze(0)
 
+        target_lengths = target_lengths.to(primary_loss.device)
+        normalizer = target_lengths.to(primary_loss.dtype).clamp_min(1)
+        primary_loss = primary_loss / normalizer
+
         total_loss = primary_loss
         if mix_metadata and mix_metadata.get('lam_secondary') is not None:
             lam_primary = mix_metadata['lam_primary'].to(primary_loss.dtype)
@@ -343,6 +347,9 @@ class Trainer(object):
                 secondary_loss = ctc(log_probs, secondary_targets, input_lengths, secondary_lengths)
                 if secondary_loss.dim() == 0:
                     secondary_loss = secondary_loss.unsqueeze(0)
+                secondary_lengths = secondary_lengths.to(primary_loss.device)
+                secondary_norm = secondary_lengths.to(primary_loss.dtype).clamp_min(1)
+                secondary_loss = secondary_loss / secondary_norm
             else:
                 secondary_loss = torch.zeros_like(primary_loss)
 
