@@ -3,7 +3,7 @@ save_freq: 10
 device: "cuda"
 epochs: 200
 batch_size: 64
-pretrained_model: ""
+pretrained_model: true
 load_only_params: false
 train_data: "Data/train_list.txt"
 val_data: "Data/val_list.txt"
@@ -30,7 +30,7 @@ multi_task:
   use_ctc: true
   use_seq2seq: true
   frame_phoneme:
-    enabled: false
+    enabled: true
     num_classes: 0   # defaults to n_token when set to 0 or omitted
   speaker:
     enabled: false
@@ -52,7 +52,7 @@ stabilization:
     prob: 0.5
     dominant_mix: true
   intermediate_ctc:
-    enabled: false
+    enabled: true
     loss_weight: 0.3
     dropout: 0.1
     layers:
