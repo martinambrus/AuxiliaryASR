@@ -573,8 +573,13 @@ class Trainer(object):
             s2s_attn = model_outputs.get('s2s_attn')
 
             if self.ctc_weight > 0 and ppgs is not None:
-                loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
-                                              text_input, mel_input_length, text_input_length)
+                loss_ctc = self._compute_ctc_loss(
+                    ppgs,
+                    text_input,
+                    mel_input_length,
+                    text_input_length,
+                    mix_metadata=None,
+                )
                 eval_losses["eval/ctc"].append(loss_ctc.item())
             else:
                 loss_ctc = torch.zeros(1, device=self.device)
