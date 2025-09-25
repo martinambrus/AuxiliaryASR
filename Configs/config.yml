@@ -78,3 +78,4 @@ loss_weights:
 rnnt_loss_params:
   reduction: "mean"
   fused_log_softmax: true
+  normalize_by_target_length: true

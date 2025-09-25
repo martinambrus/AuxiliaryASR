@@ -42,6 +42,9 @@ class RNNTLossWrapper(nn.Module):
         clamp=-1,
         fused_log_softmax=True,
         input_is_log_probs=False,
+        normalize_by_target_length=True,
+        normalize_by_logit_length=False,
+        length_norm_epsilon=1e-6,
     ):
         super().__init__()
         if torchaudio_rnnt_loss is None:
@@ -51,6 +54,9 @@ class RNNTLossWrapper(nn.Module):
         self.clamp = clamp
         self.fused_log_softmax = fused_log_softmax
         self.input_is_log_probs = input_is_log_probs
+        self.normalize_by_target_length = normalize_by_target_length
+        self.normalize_by_logit_length = normalize_by_logit_length
+        self.length_norm_epsilon = length_norm_epsilon
 
         if self.input_is_log_probs and self.fused_log_softmax:
             raise ValueError(
@@ -59,6 +65,11 @@ class RNNTLossWrapper(nn.Module):
             )
 
     def forward(self, logits, targets, logit_lengths, target_lengths):
+        if self.normalize_by_target_length or self.normalize_by_logit_length:
+            raw_reduction = "none"
+        else:
+            raw_reduction = self.reduction
+
         if self.input_is_log_probs:
             loss_input = logits
             fused_log_softmax = False
@@ -70,16 +81,39 @@ class RNNTLossWrapper(nn.Module):
                 loss_input = logits.log_softmax(dim=-1)
                 fused_log_softmax = False
 
-        return torchaudio_rnnt_loss(
+        losses = torchaudio_rnnt_loss(
             loss_input,
             targets,
             logit_lengths,
             target_lengths,
             blank=self.blank,
-            reduction=self.reduction,
+            reduction=raw_reduction,
             clamp=self.clamp,
             fused_log_softmax=fused_log_softmax,
         )
+
+        if not (self.normalize_by_target_length or self.normalize_by_logit_length):
+            return losses
+
+        # convert to float tensors on the same device for safe normalization
+        if self.normalize_by_target_length:
+            norm = target_lengths.to(device=losses.device, dtype=losses.dtype)
+            norm = norm.clamp_min(self.length_norm_epsilon)
+            losses = losses / norm
+
+        if self.normalize_by_logit_length:
+            norm = logit_lengths.to(device=losses.device, dtype=losses.dtype)
+            norm = norm.clamp_min(self.length_norm_epsilon)
+            losses = losses / norm
+
+        if self.reduction == "sum":
+            return losses.sum()
+        if self.reduction == "mean":
+            return losses.mean()
+        if self.reduction == "none":
+            return losses
+
+        raise ValueError(f"Unsupported reduction: {self.reduction}")
 
 
 def build_criterion(critic_params=None, entropy_params=None):
