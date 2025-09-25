@@ -14,6 +14,54 @@ import jiwer
 import matplotlib.pylab as plt
 from pathlib import Path
 
+
+def select_logits_from_output(model_output, preferred_order=(
+    "primary_logits",
+    "ctc_logits",
+    "s2s_logits",
+    "logits",
+)):
+    """Return the primary logit tensor from a model forward pass.
+
+    Recent multi-task changes make :class:`~models.ASRCNN` return a dictionary
+    containing logits for every enabled objective. The utility notebooks were
+    written against the previous behaviour where ``model(mels)`` yielded a
+    tensor, so helpers that consume model outputs now need a consistent way to
+    retrieve the main ASR logits.  This function inspects the output structure
+    and returns the first tensor that matches the preferred key order.  If a
+    tensor is passed directly it is returned unchanged.
+
+    Args:
+        model_output: The object returned by ``model.forward``.
+        preferred_order: Sequence of dictionary keys to probe.  The first
+            existing tensor value is returned.
+
+    Returns:
+        torch.Tensor: The logits tensor suitable for decoding.
+
+    Raises:
+        TypeError: If ``model_output`` is neither a tensor nor a mapping.
+        KeyError: If no tensor is found for any of the preferred keys.
+    """
+
+    if isinstance(model_output, torch.Tensor):
+        return model_output
+
+    if isinstance(model_output, dict):
+        for key in preferred_order:
+            tensor = model_output.get(key)
+            if isinstance(tensor, torch.Tensor):
+                return tensor
+        raise KeyError(
+            "Could not find logits in model output. Available keys: "
+            + ", ".join(model_output.keys())
+        )
+
+    raise TypeError(
+        "Expected model output to be a tensor or dict, got "
+        f"{type(model_output)!r} instead"
+    )
+
 def calc_wer(target, pred, ignore_indexes=[0]):
     target_chars = drop_duplicated(list(filter(lambda x: x not in ignore_indexes, map(str, list(target)))))
     pred_chars = drop_duplicated(list(filter(lambda x: x not in ignore_indexes, map(str, list(pred)))))
@@ -29,11 +77,26 @@ def drop_duplicated(chars):
             ret_chars.append(curr)
     return ret_chars
 
-def build_criterion(critic_params={}, entropy_params={}):
+def build_criterion(critic_params={}, entropy_params={}, multi_task_config=None):
+    multi_task_config = multi_task_config or {}
+
     criterion = {
         "ce": nn.CrossEntropyLoss(ignore_index=-1, **entropy_params),
         "ctc": torch.nn.CTCLoss(**critic_params.get('ctc', {})),
     }
+
+    frame_cfg = multi_task_config.get('frame_phoneme', {}) or {}
+    if frame_cfg.get('enabled', False):
+        criterion["frame_ce"] = nn.CrossEntropyLoss(ignore_index=-1, **entropy_params)
+
+    speaker_cfg = multi_task_config.get('speaker', {}) or {}
+    if speaker_cfg.get('enabled', False):
+        criterion["speaker_ce"] = nn.CrossEntropyLoss()
+
+    pron_cfg = multi_task_config.get('pronunciation_error', {}) or {}
+    if pron_cfg.get('enabled', False):
+        criterion["pron_error_ce"] = nn.CrossEntropyLoss(ignore_index=-1, **entropy_params)
+
     return criterion
 
 def get_data_path_list(train_path=None, val_path=None):

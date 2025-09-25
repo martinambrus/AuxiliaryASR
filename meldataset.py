@@ -206,7 +206,7 @@ class MelDataset(torch.utils.data.Dataset):
             length_feature = acoustic_feature.size(1)
             acoustic_feature = acoustic_feature[:, :(length_feature - length_feature % 2)]
 
-            return wave_tensor, acoustic_feature, text_tensor, data[0]
+            return wave_tensor, acoustic_feature, text_tensor, speaker_id
         except Exception as e:
             try:
                 wave_path, text, speaker_id = data
@@ -282,9 +282,10 @@ class Collater(object):
       return_wave (bool): if true, will return the wave data along with spectrogram. 
     """
 
-    def __init__(self, return_wave=False):
+    def __init__(self, return_wave=False, return_speaker_ids=False):
         self.text_pad_index = 0
         self.return_wave = return_wave
+        self.return_speaker_ids = return_speaker_ids
 
     def __call__(self, batch):
         batch_size = len(batch)
@@ -302,22 +303,27 @@ class Collater(object):
         texts = torch.zeros((batch_size, max_text_length)).long()
         input_lengths = torch.zeros(batch_size).long()
         output_lengths = torch.zeros(batch_size).long()
-        paths = ['' for _ in range(batch_size)]
-        for bid, (_, mel, text, path) in enumerate(batch):
+        speaker_ids = torch.zeros(batch_size).long()
+        for bid, (_, mel, text, speaker_id) in enumerate(batch):
             mel_size = mel.size(1)
             text_size = text.size(0)
             mels[bid, :, :mel_size] = mel
             texts[bid, :text_size] = text
             input_lengths[bid] = text_size
             output_lengths[bid] = mel_size
-            paths[bid] = path
+            speaker_ids[bid] = int(speaker_id)
             assert(text_size < (mel_size//2))
+
+        outputs = [texts, input_lengths, mels, output_lengths]
+
+        if self.return_speaker_ids:
+            outputs.append(speaker_ids)
 
         if self.return_wave:
             waves = [b[0] for b in batch]
-            return texts, input_lengths, mels, output_lengths, paths, waves
+            outputs.append(waves)
 
-        return texts, input_lengths, mels, output_lengths
+        return tuple(outputs)
 
 
 
