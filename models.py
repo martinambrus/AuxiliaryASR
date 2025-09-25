@@ -92,7 +92,7 @@ class ASRCNN(nn.Module):
             return ctc_logit, s2s_logit, s2s_attn
         if self.decoder_type == "rnnt":
             if decoder_inputs is None or decoder_lengths is None:
-                raise ValueError("decoder_inputs and decoder_lengths must be provided for RNNT decoding")
+                return ctc_logit
             prediction = self.rnnt_prediction(decoder_inputs, decoder_lengths)
             joint = self.rnnt_joint(x, prediction)
             return ctc_logit, joint
