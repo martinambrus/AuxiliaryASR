@@ -135,6 +135,12 @@ class ASRCNN(nn.Module):
         elif text_input is None:
             outputs.setdefault("s2s_logits", None)
 
+        if "primary_logits" not in outputs:
+            if isinstance(outputs.get("ctc_logits"), torch.Tensor):
+                outputs["primary_logits"] = outputs["ctc_logits"]
+            elif isinstance(outputs.get("s2s_logits"), torch.Tensor):
+                outputs["primary_logits"] = outputs["s2s_logits"]
+
         return outputs
 
     def _optional_state_prefixes(self):
