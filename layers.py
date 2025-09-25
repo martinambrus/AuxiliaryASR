@@ -149,10 +149,19 @@ class LocationLayer(nn.Module):
         return processed_attention
 
 
-class Attention(nn.Module):
+class LocationSensitiveAttention(nn.Module):
+    """Location-sensitive attention mechanism.
+
+    This is the original attention used by the model and kept for backward
+    compatibility. It computes attention energies using the previous alignment
+    history that is processed with a small convolutional network.
+    """
+
+    attention_type = "location"
+
     def __init__(self, attention_rnn_dim, embedding_dim, attention_dim,
                  attention_location_n_filters, attention_location_kernel_size):
-        super(Attention, self).__init__()
+        super().__init__()
         self.query_layer = LinearNorm(attention_rnn_dim, attention_dim,
                                       bias=False, w_init_gain='tanh')
         self.memory_layer = LinearNorm(embedding_dim, attention_dim, bias=False,
@@ -165,17 +174,6 @@ class Attention(nn.Module):
 
     def get_alignment_energies(self, query, processed_memory,
                                attention_weights_cat):
-        """
-        PARAMS
-        ------
-        query: decoder output (batch, n_mel_channels * n_frames_per_step)
-        processed_memory: processed encoder outputs (B, T_in, attention_dim)
-        attention_weights_cat: cumulative and prev. att weights (B, 2, max_time)
-        RETURNS
-        -------
-        alignment (batch, max_time)
-        """
-
         processed_query = self.query_layer(query.unsqueeze(1))
         processed_attention_weights = self.location_layer(attention_weights_cat)
         energies = self.v(torch.tanh(
@@ -185,16 +183,7 @@ class Attention(nn.Module):
         return energies
 
     def forward(self, attention_hidden_state, memory, processed_memory,
-                attention_weights_cat, mask):
-        """
-        PARAMS
-        ------
-        attention_hidden_state: attention rnn last output
-        memory: encoder outputs
-        processed_memory: processed encoder outputs
-        attention_weights_cat: previous and cummulative attention weights
-        mask: binary mask for padded data
-        """
+                attention_weights_cat=None, mask=None, **_):
         alignment = self.get_alignment_energies(
             attention_hidden_state, processed_memory, attention_weights_cat)
 
@@ -205,7 +194,171 @@ class Attention(nn.Module):
         attention_context = torch.bmm(attention_weights.unsqueeze(1), memory)
         attention_context = attention_context.squeeze(1)
 
-        return attention_context, attention_weights
+        return attention_context, attention_weights, {
+            'alpha': attention_weights
+        }
+
+
+class MonotonicAttention(nn.Module):
+    """Parallel monotonic attention as described by Raffel et al. (2017).
+
+    The implementation follows the expectation-based formulation that can be
+    evaluated efficiently with a linear pass over the encoder time steps. It is
+    compatible with teacher-forced training as well as autoregressive decoding.
+    """
+
+    attention_type = "monotonic"
+
+    def __init__(self, attention_rnn_dim, embedding_dim, attention_dim,
+                 sigmoid_noise=0.0):
+        super().__init__()
+        self.query_layer = LinearNorm(attention_rnn_dim, attention_dim,
+                                      bias=False, w_init_gain='tanh')
+        self.memory_layer = LinearNorm(embedding_dim, attention_dim, bias=False,
+                                       w_init_gain='tanh')
+        self.v = LinearNorm(attention_dim, 1, bias=False)
+        self.sigmoid_noise = sigmoid_noise
+        self.score_mask_value = -float("inf")
+        self.eps = 1e-8
+
+    def _apply_noise(self, energies, training):
+        if self.sigmoid_noise > 0.0 and training:
+            noise = torch.randn_like(energies) * self.sigmoid_noise
+            energies = energies + noise
+        return energies
+
+    def _sigmoid(self, energies):
+        return torch.sigmoid(energies)
+
+    def _monotonic_attention(self, p_choose, prev_alpha):
+        """Compute the expected monotonic attention distribution.
+
+        Args:
+            p_choose: Probability of choosing each encoder state. Shape (B, T).
+            prev_alpha: Previous attention distribution. Shape (B, T).
+        Returns:
+            alpha: Updated attention distribution. Shape (B, T).
+        """
+        batch, time = p_choose.size()
+        alpha = torch.zeros_like(p_choose)
+
+        # First position is a special case without the recursive term.
+        alpha[:, 0] = p_choose[:, 0] * prev_alpha[:, 0]
+
+        for t in range(1, time):
+            stay_prob = (1.0 - p_choose[:, t - 1]) * alpha[:, t - 1]
+            stay_prob = stay_prob / torch.clamp(p_choose[:, t - 1], min=self.eps)
+            alpha[:, t] = p_choose[:, t] * (prev_alpha[:, t] + stay_prob)
+
+        # Normalise to make sure the alignment sums to one even with masking.
+        alpha_sum = alpha.sum(dim=-1, keepdim=True)
+        alpha = alpha / torch.clamp(alpha_sum, min=self.eps)
+        return alpha
+
+    def forward(self, attention_hidden_state, memory, processed_memory,
+                attention_weights_cat=None, mask=None, prev_attention=None,
+                training=True):
+        if prev_attention is None:
+            raise ValueError("Monotonic attention requires previous attention.")
+
+        processed_query = self.query_layer(attention_hidden_state).unsqueeze(1)
+        energies = self.v(torch.tanh(processed_query + processed_memory)).squeeze(-1)
+
+        if mask is not None:
+            energies = energies.masked_fill(mask, self.score_mask_value)
+
+        energies = self._apply_noise(energies, training)
+        p_choose = self._sigmoid(energies)
+
+        if mask is not None:
+            p_choose = p_choose.masked_fill(mask, 0.0)
+
+        alpha = self._monotonic_attention(p_choose, prev_attention)
+        attention_context = torch.bmm(alpha.unsqueeze(1), memory).squeeze(1)
+
+        return attention_context, alpha, {
+            'alpha': alpha
+        }
+
+
+class MoChAAttention(MonotonicAttention):
+    """Monotonic Chunkwise Attention (MoChA).
+
+    Extends monotonic attention by performing a soft attention inside a
+    fixed-length chunk after the monotonic boundary is determined. The
+    expectation-based formulation is used to keep the operation differentiable
+    during training.
+    """
+
+    attention_type = "mocha"
+
+    def __init__(self, attention_rnn_dim, embedding_dim, attention_dim,
+                 chunk_size=4, sigmoid_noise=0.0):
+        super().__init__(attention_rnn_dim, embedding_dim, attention_dim,
+                         sigmoid_noise=sigmoid_noise)
+        self.chunk_size = int(max(1, chunk_size))
+        self.chunk_energy = LinearNorm(attention_dim, 1, bias=False)
+
+    def _chunkwise_attention(self, alpha, chunk_energy, mask):
+        exp_energy = torch.exp(chunk_energy)
+        if mask is not None:
+            exp_energy = exp_energy.masked_fill(mask, 0.0)
+
+        batch, time = alpha.size()
+        beta = torch.zeros_like(alpha)
+
+        # Pre-compute normalisation terms for each potential chunk.
+        denom = torch.zeros_like(exp_energy)
+        for idx in range(time):
+            start = max(0, idx - self.chunk_size + 1)
+            denom[:, idx] = exp_energy[:, start:idx + 1].sum(dim=-1)
+
+        eps = self.eps
+        inv_denom = torch.where(denom > 0, 1.0 / torch.clamp(denom, min=eps), torch.zeros_like(denom))
+
+        for j in range(time):
+            upper = min(time, j + self.chunk_size)
+            contrib = torch.zeros(batch, device=alpha.device, dtype=alpha.dtype)
+            for k in range(j, upper):
+                contrib = contrib + alpha[:, k] * inv_denom[:, k]
+            beta[:, j] = exp_energy[:, j] * contrib
+
+        beta_sum = beta.sum(dim=-1, keepdim=True)
+        beta = beta / torch.clamp(beta_sum, min=eps)
+        return beta
+
+    def forward(self, attention_hidden_state, memory, processed_memory,
+                attention_weights_cat=None, mask=None, prev_attention=None,
+                training=True):
+        if prev_attention is None:
+            raise ValueError("MoChA attention requires previous attention.")
+
+        processed_query = self.query_layer(attention_hidden_state).unsqueeze(1)
+        energies = self.v(torch.tanh(processed_query + processed_memory)).squeeze(-1)
+        chunk_energy = self.chunk_energy(torch.tanh(processed_query + processed_memory)).squeeze(-1)
+
+        if mask is not None:
+            energies = energies.masked_fill(mask, self.score_mask_value)
+            chunk_energy = chunk_energy.masked_fill(mask, self.score_mask_value)
+
+        energies = self._apply_noise(energies, training)
+        p_choose = self._sigmoid(energies)
+        if mask is not None:
+            p_choose = p_choose.masked_fill(mask, 0.0)
+
+        alpha = self._monotonic_attention(p_choose, prev_attention)
+
+        beta = self._chunkwise_attention(alpha, chunk_energy, mask)
+        attention_context = torch.bmm(beta.unsqueeze(1), memory).squeeze(1)
+
+        return attention_context, beta, {
+            'alpha': alpha,
+            'beta': beta
+        }
+
+
+# Backwards compatibility alias.
+Attention = LocationSensitiveAttention
 
 class PhaseShuffle2d(nn.Module):
     def __init__(self, n=2):

@@ -25,6 +25,15 @@ model_params:
    token_embedding_dim: 512
    n_layers: 5
    location_kernel_size: 31
+   decoder_attention:
+      # Set to true to keep using the legacy location-sensitive attention.
+      location_sensitive: false
+      # Enable the new monotonic attention path. When combined with
+      # ``chunkwise: true`` this becomes Monotonic Chunkwise Attention (MoChA).
+      monotonic: true
+      chunkwise: true
+      chunk_size: 4
+      sigmoid_noise: 0.0
 
 optimizer_params:
   lr: 0.0005
