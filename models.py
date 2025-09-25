@@ -224,9 +224,9 @@ class ASRCNN(nn.Module):
         intermediate_outputs: Dict[str, torch.Tensor] = {}
         for layer_idx, layer in enumerate(self.encoder_layers, start=1):
             x = layer(x)
-            head = self.intermediate_ctc_heads.get(str(layer_idx))
-            if head is not None:
-                intermediate_outputs[str(layer_idx)] = head(x)
+            key = str(layer_idx)
+            if key in self.intermediate_ctc_heads:
+                intermediate_outputs[key] = self.intermediate_ctc_heads[key](x)
 
         x = self.projection(x)
         x = x.transpose(1, 2)
