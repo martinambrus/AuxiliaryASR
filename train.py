@@ -307,12 +307,12 @@ def main(config_path):
     if speaker_cfg.get('enabled', False) and int(speaker_cfg.get('num_speakers', 0)) <= 0:
         speaker_ids = set()
         for entry in train_entries + val_entries:
-            if len(entry) >= 3 and entry[2] != "":
-                try:
-                    speaker_ids.add(int(entry[2]))
-                except ValueError:
-                    continue
-        inferred = max(speaker_ids) + 1 if speaker_ids else 1
+            if len(entry) >= 3:
+                speaker_id = str(entry[2]).strip()
+                if speaker_id:
+                    speaker_ids.add(speaker_id)
+        inferred = max(1, len(speaker_ids))
+        print(f"Inferred {inferred} unique speaker id(s) from metadata")
         speaker_cfg = dict(speaker_cfg)
         speaker_cfg['num_speakers'] = inferred
         multi_task_config['speaker'] = speaker_cfg
