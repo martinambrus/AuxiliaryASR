@@ -317,8 +317,11 @@ def main(config_path):
         speaker_cfg['num_speakers'] = inferred
         multi_task_config['speaker'] = speaker_cfg
 
+    stabilization_config = cfg_get_nested(config, 'stabilization', {}) or {}
+
     model_params = dict(model_params)
     model_params['multi_task_config'] = multi_task_config
+    model_params['stabilization_config'] = stabilization_config
 
     print("Using model parameters:", model_params)
 
@@ -339,7 +342,7 @@ def main(config_path):
 
     blank_index = sorted_train_dataloader.dataset.text_cleaner.word_index_dictionary[" "] # get blank index
     criterion = build_criterion(critic_params={
-                'ctc': {'blank': blank_index},
+                'ctc': {'blank': blank_index, 'reduction': 'none', 'zero_infinity': True},
         }, entropy_params=entropy_params, multi_task_config=multi_task_config)
 
     if enable_early_stopping:
@@ -359,6 +362,11 @@ def main(config_path):
     frame_weight = float(loss_weight_config.get('frame_phoneme', 0.0)) if frame_cfg.get('enabled', False) else 0.0
     speaker_weight = float(loss_weight_config.get('speaker', 0.0)) if speaker_cfg.get('enabled', False) else 0.0
     pron_weight = float(loss_weight_config.get('pronunciation_error', 0.0)) if pron_cfg.get('enabled', False) else 0.0
+    mixspeech_config = stabilization_config.get('mix_speech', {}) or {}
+    intermediate_ctc_config = stabilization_config.get('intermediate_ctc', {}) or {}
+    if isinstance(intermediate_ctc_config, dict) and 'loss_weight' not in intermediate_ctc_config:
+        intermediate_ctc_config = dict(intermediate_ctc_config)
+        intermediate_ctc_config['loss_weight'] = float(loss_weight_config.get('intermediate_ctc', 0.0))
 
     trainer = Trainer(model=model,
                     criterion=criterion,
@@ -380,7 +388,9 @@ def main(config_path):
                     pron_error_weight=pron_weight,
                     enable_frame_classifier=frame_cfg.get('enabled', False),
                     enable_speaker=speaker_cfg.get('enabled', False),
-                    enable_pronunciation_error=pron_cfg.get('enabled', False)
+                    enable_pronunciation_error=pron_cfg.get('enabled', False),
+                    mixspeech_config=mixspeech_config,
+                    intermediate_ctc_config=intermediate_ctc_config
                     )
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )

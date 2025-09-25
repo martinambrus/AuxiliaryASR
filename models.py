@@ -1,9 +1,66 @@
 import math
+from typing import Dict, List
+
 import torch
 from torch import nn
-from torch.nn import TransformerEncoder
 import torch.nn.functional as F
+
 from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
+
+
+def _stochastic_depth(residual: torch.Tensor, drop_prob: float, training: bool) -> torch.Tensor:
+    """Apply sample-wise stochastic depth to a residual branch."""
+
+    if drop_prob <= 0.0 or not training:
+        return residual
+
+    keep_prob = 1.0 - drop_prob
+    if keep_prob <= 0.0:
+        return torch.zeros_like(residual)
+
+    shape = (residual.size(0),) + (1,) * (residual.dim() - 1)
+    random_tensor = keep_prob + torch.rand(shape, dtype=residual.dtype, device=residual.device)
+    random_tensor.floor_()
+    return residual / keep_prob * random_tensor
+
+
+class EncoderStage(nn.Module):
+    """A convolutional encoder stage with optional stochastic depth."""
+
+    def __init__(self, hidden_dim: int, drop_prob: float = 0.0):
+        super().__init__()
+        self.drop_prob = float(max(0.0, drop_prob))
+        self.block = ConvBlock(hidden_dim)
+        self.post_norm = nn.GroupNorm(num_groups=1, num_channels=hidden_dim)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        residual = self.block(x)
+        residual = self.post_norm(residual)
+
+        if self.drop_prob > 0.0:
+            delta = residual - x
+            delta = _stochastic_depth(delta, self.drop_prob, self.training)
+            residual = x + delta
+
+        return residual
+
+
+class IntermediateCTCHead(nn.Module):
+    """Light-weight projection head for intermediate CTC supervision."""
+
+    def __init__(self, hidden_dim: int, n_token: int, dropout: float = 0.1):
+        super().__init__()
+        projection_dim = max(1, hidden_dim // 2)
+        self.layers = nn.Sequential(
+            ConvNorm(hidden_dim, projection_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            ConvNorm(projection_dim, n_token),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        logits = self.layers(x)
+        return logits.transpose(1, 2)
 
 def build_model(model_params={}, model_type='asr'):
     model = ASRCNN(**model_params)
@@ -19,17 +76,37 @@ class ASRCNN(nn.Module):
                  token_embedding_dim=256,
                  location_kernel_size=63,
                  multi_task_config=None,
+                 stabilization_config=None,
     ):
         super().__init__()
         self.n_token = n_token
         self.n_down = 1
         self.to_mfcc = MFCC()
         self.init_cnn = ConvNorm(input_dim//2, hidden_dim, kernel_size=7, padding=3, stride=2)
-        self.cnns = nn.Sequential(
-            *[nn.Sequential(
-                ConvBlock(hidden_dim),
-                nn.GroupNorm(num_groups=1, num_channels=hidden_dim)
-            ) for n in range(n_layers)])
+        self.stabilization_config = stabilization_config or {}
+        self._stochastic_depth_cfg = self.stabilization_config.get('stochastic_depth', {}) or {}
+        self.enable_stochastic_depth = bool(self._stochastic_depth_cfg.get('enabled', False))
+
+        self.encoder_layers = nn.ModuleList()
+        for layer_idx in range(1, n_layers + 1):
+            if self.enable_stochastic_depth:
+                drop_prob = self._get_stochastic_depth_prob(layer_idx, n_layers)
+            else:
+                drop_prob = 0.0
+            self.encoder_layers.append(EncoderStage(hidden_dim, drop_prob=drop_prob))
+
+        ictc_cfg = self.stabilization_config.get('intermediate_ctc', {}) or {}
+        self.enable_intermediate_ctc = bool(ictc_cfg.get('enabled', False))
+        ictc_dropout = float(ictc_cfg.get('dropout', 0.1))
+        self.intermediate_ctc_layers = self._parse_intermediate_layers(ictc_cfg.get('layers'), n_layers)
+        if self.enable_intermediate_ctc and self.intermediate_ctc_layers:
+            self.intermediate_ctc_heads = nn.ModuleDict({
+                str(layer_idx): IntermediateCTCHead(hidden_dim, n_token, dropout=ictc_dropout)
+                for layer_idx in self.intermediate_ctc_layers
+            })
+        else:
+            self.intermediate_ctc_heads = nn.ModuleDict()
+
         self.projection = ConvNorm(hidden_dim, hidden_dim // 2)
         self.multi_task_config = multi_task_config or {}
         self.use_ctc = bool(self.multi_task_config.get('use_ctc', True))
@@ -93,14 +170,70 @@ class ASRCNN(nn.Module):
             self.pron_error_head = None
             self.pron_error_num_classes = 0
 
+    def _get_stochastic_depth_prob(self, layer_idx: int, total_layers: int) -> float:
+        strategy = str(self._stochastic_depth_cfg.get('mode', 'linear')).lower()
+        min_drop = float(self._stochastic_depth_cfg.get('min_drop_rate', 0.0))
+        max_drop = float(self._stochastic_depth_cfg.get('max_drop_rate', self._stochastic_depth_cfg.get('drop_rate', 0.0)))
+        max_drop = max(0.0, min(1.0, max_drop))
+        min_drop = max(0.0, min(1.0, min_drop))
+        if total_layers <= 1:
+            return max_drop
+
+        if strategy == 'uniform':
+            return max_drop
+
+        progress = (layer_idx - 1) / (total_layers - 1)
+        drop = min_drop + (max_drop - min_drop) * progress
+        return max(0.0, min(1.0, drop))
+
+    @staticmethod
+    def _parse_intermediate_layers(layers_config, max_layers: int) -> List[int]:
+        if layers_config is None:
+            return []
+
+        parsed: List[int] = []
+        if isinstance(layers_config, dict):
+            source = layers_config.keys()
+        else:
+            source = layers_config
+
+        for entry in source:
+            if isinstance(entry, dict):
+                idx = entry.get('index', entry.get('layer'))
+            else:
+                idx = entry
+            try:
+                value = int(idx)
+            except (TypeError, ValueError):
+                continue
+            if 1 <= value <= max_layers:
+                parsed.append(value)
+
+        # Preserve ordering but drop duplicates
+        seen = set()
+        ordered: List[int] = []
+        for value in parsed:
+            if value not in seen:
+                seen.add(value)
+                ordered.append(value)
+        return ordered
+
     def forward(self, x, src_key_padding_mask=None, text_input=None):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
-        x = self.cnns(x)
+        intermediate_outputs: Dict[str, torch.Tensor] = {}
+        for layer_idx, layer in enumerate(self.encoder_layers, start=1):
+            x = layer(x)
+            key = str(layer_idx)
+            if key in self.intermediate_ctc_heads:
+                intermediate_outputs[key] = self.intermediate_ctc_heads[key](x)
 
         x = self.projection(x)
         x = x.transpose(1, 2)
         outputs = {"encoder_features": x}
+
+        if intermediate_outputs:
+            outputs["intermediate_ctc_logits"] = intermediate_outputs
 
         if self.use_ctc and self.ctc_linear is not None:
             ctc_logit = self.ctc_linear(x)
@@ -177,13 +310,33 @@ class ASRCNN(nn.Module):
         else:
             filtered_state = state_dict
 
-        return super().load_state_dict(filtered_state, strict=strict)
+        remapped = filtered_state.__class__()
+        for key, value in filtered_state.items():
+            if key.startswith('cnns.'):
+                segments = key.split('.')
+                if len(segments) >= 3:
+                    layer_idx = segments[1]
+                    stage_idx = segments[2]
+                    remainder = segments[3:]
+                    new_segments = ['encoder_layers', layer_idx]
+                    if stage_idx == '0':
+                        new_segments.append('block')
+                        new_segments.extend(remainder)
+                    elif stage_idx == '1':
+                        new_segments.append('post_norm')
+                        new_segments.extend(remainder)
+                    else:
+                        new_segments.extend(segments[2:])
+                    key = '.'.join(new_segments)
+            remapped[key] = value
+
+        return super().load_state_dict(remapped, strict=strict)
 
     def get_feature(self, x):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
-        x = self.cnns(x)
-        x = self.instance_norm(x)
+        for layer in self.encoder_layers:
+            x = layer(x)
         x = self.projection(x)
         return x
 

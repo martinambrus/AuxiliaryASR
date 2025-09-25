@@ -15,6 +15,7 @@ from tqdm import tqdm
 from utils import calc_wer
 
 import logging
+from torch.distributions import Beta
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -45,7 +46,9 @@ class Trainer(object):
                  pron_error_weight=0.0,
                  enable_frame_classifier=False,
                  enable_speaker=False,
-                 enable_pronunciation_error=False):
+                 enable_pronunciation_error=False,
+                 mixspeech_config=None,
+                 intermediate_ctc_config=None):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -76,6 +79,45 @@ class Trainer(object):
         self.enable_frame_classifier = enable_frame_classifier
         self.enable_speaker = enable_speaker
         self.enable_pronunciation_error = enable_pronunciation_error
+
+        self.mixspeech_config = mixspeech_config or {}
+        self.mixspeech_enabled = bool(self.mixspeech_config.get('enabled', False))
+        self.mixspeech_prob = float(self.mixspeech_config.get('prob', 0.5))
+        self.mixspeech_alpha = float(self.mixspeech_config.get('alpha', 0.3))
+        self.mixspeech_dominant = bool(self.mixspeech_config.get('dominant_mix', True))
+
+        ictc_cfg = intermediate_ctc_config or {}
+        self.intermediate_ctc_enabled = bool(ictc_cfg.get('enabled', False))
+        self.intermediate_ctc_weight = float(ictc_cfg.get('loss_weight', 0.0))
+        self.intermediate_ctc_layer_weights = self._parse_intermediate_layer_weights(ictc_cfg.get('layers'))
+
+    @staticmethod
+    def _parse_intermediate_layer_weights(layers_config):
+        weights = {}
+        if layers_config is None:
+            return weights
+
+        if isinstance(layers_config, dict):
+            iterator = layers_config.items()
+        else:
+            iterator = []
+            for entry in layers_config:
+                if isinstance(entry, dict):
+                    idx = entry.get('index', entry.get('layer'))
+                    weight = entry.get('weight', entry.get('loss_weight', 1.0))
+                else:
+                    idx = entry
+                    weight = 1.0
+                iterator.append((idx, weight))
+
+        for idx, weight in iterator:
+            try:
+                layer_idx = int(idx)
+                weights[str(layer_idx)] = float(weight)
+            except (TypeError, ValueError):
+                continue
+
+        return weights
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -234,6 +276,87 @@ class Trainer(object):
 
         return palette
 
+    def _apply_mixspeech(self, mel_input):
+        if not self.mixspeech_enabled or mel_input.size(0) < 2 or self.mixspeech_prob <= 0.0:
+            return mel_input, None
+
+        device = mel_input.device
+        batch_size = mel_input.size(0)
+        mix_mask = torch.rand(batch_size, device=device) < self.mixspeech_prob
+        if not mix_mask.any():
+            return mel_input, None
+
+        perm = torch.randperm(batch_size, device=device)
+        if self.mixspeech_alpha > 0.0:
+            beta = Beta(self.mixspeech_alpha, self.mixspeech_alpha)
+            lam = beta.sample((batch_size,)).to(device=device, dtype=mel_input.dtype)
+        else:
+            lam = torch.full((batch_size,), 0.5, device=device, dtype=mel_input.dtype)
+
+        mixed = mel_input.clone()
+        lam_primary = torch.ones(batch_size, device=device, dtype=mel_input.dtype)
+        lam_secondary = torch.zeros(batch_size, device=device, dtype=mel_input.dtype)
+        secondary_indices = torch.full((batch_size,), -1, device=device, dtype=torch.long)
+        applied = False
+
+        for idx in range(batch_size):
+            if not mix_mask[idx] or perm[idx].item() == idx:
+                continue
+            partner = int(perm[idx].item())
+            lam_val = lam[idx]
+            if self.mixspeech_dominant:
+                lam_val = torch.max(lam_val, 1.0 - lam_val)
+            mixed[idx] = lam_val * mel_input[idx] + (1.0 - lam_val) * mel_input[partner]
+            lam_primary[idx] = lam_val
+            lam_secondary[idx] = 1.0 - lam_val
+            secondary_indices[idx] = partner
+            applied = True
+
+        if not applied:
+            return mel_input, None
+
+        metadata = {
+            'lam_primary': lam_primary,
+            'lam_secondary': lam_secondary,
+            'secondary_indices': secondary_indices,
+            'avg_lambda': float(lam_primary.mean().item()),
+        }
+        return mixed, metadata
+
+    def _compute_ctc_loss(self, logits, targets, input_lengths, target_lengths, mix_metadata=None):
+        ctc = self.criterion['ctc']
+        log_probs = logits.log_softmax(dim=2).transpose(0, 1)
+        primary_loss = ctc(log_probs, targets, input_lengths, target_lengths)
+        if primary_loss.dim() == 0:
+            primary_loss = primary_loss.unsqueeze(0)
+
+        target_lengths = target_lengths.to(primary_loss.device)
+        normalizer = target_lengths.to(primary_loss.dtype).clamp_min(1)
+        primary_loss = primary_loss / normalizer
+
+        total_loss = primary_loss
+        if mix_metadata and mix_metadata.get('lam_secondary') is not None:
+            lam_primary = mix_metadata['lam_primary'].to(primary_loss.dtype)
+            lam_secondary = mix_metadata['lam_secondary'].to(primary_loss.dtype)
+            secondary_indices = mix_metadata['secondary_indices']
+            if torch.any(lam_secondary > 0):
+                fallback = torch.arange(targets.size(0), device=targets.device, dtype=torch.long)
+                secondary_indices = torch.where(secondary_indices >= 0, secondary_indices, fallback)
+                secondary_targets = targets.index_select(0, secondary_indices)
+                secondary_lengths = target_lengths.index_select(0, secondary_indices)
+                secondary_loss = ctc(log_probs, secondary_targets, input_lengths, secondary_lengths)
+                if secondary_loss.dim() == 0:
+                    secondary_loss = secondary_loss.unsqueeze(0)
+                secondary_lengths = secondary_lengths.to(primary_loss.device)
+                secondary_norm = secondary_lengths.to(primary_loss.dtype).clamp_min(1)
+                secondary_loss = secondary_loss / secondary_norm
+            else:
+                secondary_loss = torch.zeros_like(primary_loss)
+
+            total_loss = primary_loss * lam_primary + secondary_loss * lam_secondary
+
+        return total_loss.mean()
+
     def run(self, batch):
         # FIX: trying to fix OOM errors
         #torch.cuda.empty_cache()
@@ -252,6 +375,11 @@ class Trainer(object):
         else:
             speaker_ids = torch.zeros(text_input.size(0), device=self.device, dtype=torch.long)
         speaker_ids = speaker_ids.long()
+
+        mix_metadata = None
+        if self.mixspeech_enabled and self.model.training:
+            mel_input, mix_metadata = self._apply_mixspeech(mel_input)
+
         mel_input_length = mel_input_length // (2 ** self.model.n_down)
         future_mask = self.model.get_future_mask(
             mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
@@ -261,12 +389,15 @@ class Trainer(object):
             mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 
         losses = {}
+        if mix_metadata:
+            losses['mixspeech/avg_lambda'] = mix_metadata['avg_lambda']
+            active_ratio = (mix_metadata['secondary_indices'] >= 0).float().mean().item()
+            losses['mixspeech/applicable_ratio'] = active_ratio
         total_loss = torch.zeros(1, device=self.device)
 
         ppgs = model_outputs.get('ctc_logits')
         if self.ctc_weight > 0 and ppgs is not None:
-            loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
-                                          text_input, mel_input_length, text_input_length)
+            loss_ctc = self._compute_ctc_loss(ppgs, text_input, mel_input_length, text_input_length, mix_metadata)
             total_loss = total_loss + self.ctc_weight * loss_ctc
             losses['ctc'] = loss_ctc.item()
         else:
@@ -275,14 +406,58 @@ class Trainer(object):
         s2s_pred = model_outputs.get('s2s_logits')
         s2s_attn = model_outputs.get('s2s_attn')
         if self.s2s_weight > 0 and s2s_pred is not None:
-            loss_s2s = 0
-            for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
-                loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
-            loss_s2s /= max(1, text_input.size(0))
+            loss_s2s = torch.zeros(1, device=self.device)
+            total_samples = text_input.size(0)
+            lam_primary = mix_metadata['lam_primary'] if mix_metadata else None
+            lam_secondary = mix_metadata['lam_secondary'] if mix_metadata else None
+            secondary_indices = mix_metadata['secondary_indices'] if mix_metadata else None
+            fallback_indices = torch.arange(total_samples, device=self.device, dtype=torch.long)
+
+            for idx, (_s2s_pred, _text_input, _text_length) in enumerate(zip(s2s_pred, text_input, text_input_length)):
+                main_len = int(_text_length.item())
+                main_len = min(main_len, _s2s_pred.size(0))
+                if main_len <= 0:
+                    continue
+                ce_loss = self.criterion['ce'](_s2s_pred[:main_len], _text_input[:main_len])
+                weight_primary = lam_primary[idx] if lam_primary is not None else 1.0
+                sample_loss = ce_loss * weight_primary
+
+                if lam_secondary is not None and lam_secondary[idx] > 0:
+                    partner_idx = secondary_indices[idx] if secondary_indices[idx] >= 0 else fallback_indices[idx]
+                    partner_idx = int(partner_idx.item())
+                    partner_len = int(text_input_length[partner_idx].item())
+                    partner_len = min(partner_len, _s2s_pred.size(0))
+                    if partner_len > 0:
+                        partner_target = text_input[partner_idx, :partner_len]
+                        ce_partner = self.criterion['ce'](_s2s_pred[:partner_len], partner_target)
+                        sample_loss = sample_loss + ce_partner * lam_secondary[idx]
+
+                loss_s2s = loss_s2s + sample_loss
+
+            loss_s2s = loss_s2s / max(1, text_input.size(0))
             total_loss = total_loss + self.s2s_weight * loss_s2s
             losses['s2s'] = loss_s2s.item()
         else:
             loss_s2s = torch.zeros(1, device=self.device)
+
+        intermediate_outputs = model_outputs.get('intermediate_ctc_logits') or {}
+        if (
+            self.intermediate_ctc_enabled
+            and self.intermediate_ctc_weight > 0.0
+            and isinstance(intermediate_outputs, dict)
+            and intermediate_outputs
+        ):
+            layer_losses = torch.zeros(1, device=self.device)
+            for layer_key, logits in intermediate_outputs.items():
+                if not isinstance(logits, torch.Tensor):
+                    continue
+                layer_loss = self._compute_ctc_loss(logits, text_input, mel_input_length, text_input_length, mix_metadata)
+                weight = float(self.intermediate_ctc_layer_weights.get(str(layer_key), 1.0))
+                layer_losses = layer_losses + weight * layer_loss
+                losses[f'intermediate_ctc/layer_{layer_key}'] = layer_loss.item()
+
+            total_loss = total_loss + self.intermediate_ctc_weight * layer_losses
+            losses['intermediate_ctc'] = layer_losses.item()
 
         if self.enable_frame_classifier and self.frame_weight > 0:
             frame_logits = model_outputs.get('frame_phoneme_logits')
@@ -405,8 +580,13 @@ class Trainer(object):
             s2s_attn = model_outputs.get('s2s_attn')
 
             if self.ctc_weight > 0 and ppgs is not None:
-                loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
-                                              text_input, mel_input_length, text_input_length)
+                loss_ctc = self._compute_ctc_loss(
+                    ppgs,
+                    text_input,
+                    mel_input_length,
+                    text_input_length,
+                    mix_metadata=None,
+                )
                 eval_losses["eval/ctc"].append(loss_ctc.item())
             else:
                 loss_ctc = torch.zeros(1, device=self.device)

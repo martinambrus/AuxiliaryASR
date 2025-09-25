@@ -80,9 +80,12 @@ def drop_duplicated(chars):
 def build_criterion(critic_params={}, entropy_params={}, multi_task_config=None):
     multi_task_config = multi_task_config or {}
 
+    ctc_params = dict(critic_params.get('ctc', {}))
+    ctc_params.setdefault('reduction', 'none')
+
     criterion = {
         "ce": nn.CrossEntropyLoss(ignore_index=-1, **entropy_params),
-        "ctc": torch.nn.CTCLoss(**critic_params.get('ctc', {})),
+        "ctc": torch.nn.CTCLoss(**ctc_params),
     }
 
     frame_cfg = multi_task_config.get('frame_phoneme', {}) or {}
