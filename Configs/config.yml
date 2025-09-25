@@ -25,6 +25,17 @@ model_params:
    token_embedding_dim: 512
    n_layers: 5
    location_kernel_size: 31
+   auxiliary_models:
+     variance_adaptor:
+       enabled: true
+       detach_attention_for_targets: true
+       loss_weight: 0.5
+       loss_type: "mse"  # options: mse, l1, smooth_l1
+       duration_predictor:
+         n_layers: 2
+         filter_size: 256
+         kernel_size: 3
+         dropout: 0.5
 
 optimizer_params:
   lr: 0.0005
@@ -67,3 +78,4 @@ dataloader_params:
 loss_weights:
   ctc: 0.8
   s2s: 1.0
+  variance_duration: 0.5

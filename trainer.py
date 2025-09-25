@@ -9,6 +9,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
@@ -39,7 +40,11 @@ class Trainer(object):
                  use_diagonal_attention_prior = True,
                  diagonal_attention_prior_weight = 0.1,
                  ctc_weight=1.0,
-                 s2s_weight=1.0):
+                 s2s_weight=1.0,
+                 use_variance_adaptor=False,
+                 variance_loss_weight=1.0,
+                 variance_loss_type='mse',
+                 detach_duration_targets=True):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -64,6 +69,10 @@ class Trainer(object):
         self.maxm_mem_usage = 0
         self.ctc_weight = ctc_weight
         self.s2s_weight = s2s_weight
+        self.use_variance_adaptor = use_variance_adaptor
+        self.variance_loss_weight = variance_loss_weight
+        self.variance_loss_type = variance_loss_type
+        self.detach_duration_targets = detach_duration_targets
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -188,8 +197,13 @@ class Trainer(object):
             mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
         mel_mask = self.model.length_to_mask(mel_input_length)
         text_mask = self.model.length_to_mask(text_input_length)
-        ppgs, s2s_pred, s2s_attn = self.model(
+        model_outputs = self.model(
             mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+        if isinstance(model_outputs, (list, tuple)) and len(model_outputs) == 4:
+            ppgs, s2s_pred, s2s_attn, auxiliary_outputs = model_outputs
+        else:
+            ppgs, s2s_pred, s2s_attn = model_outputs
+            auxiliary_outputs = {}
 
         if self.use_diagonal_attention_prior:
             loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, mel_input_length)
@@ -202,17 +216,37 @@ class Trainer(object):
             loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
         loss_s2s /= text_input.size(0)
 
+        duration_loss = torch.tensor(0.0, device=self.device)
+        if self.use_variance_adaptor and auxiliary_outputs:
+            log_duration_pred = auxiliary_outputs.get('log_duration')
+            if log_duration_pred is not None:
+                attn_for_duration = s2s_attn.detach() if self.detach_duration_targets else s2s_attn
+                duration_targets = self._compute_duration_targets(
+                    attn_for_duration,
+                    text_input_length,
+                    mel_input_length)
+                log_duration_target = torch.log1p(duration_targets)
+                duration_loss = self._duration_loss(
+                    log_duration_pred,
+                    log_duration_target,
+                    text_input_length)
+
         total_loss = self.ctc_weight * loss_ctc + self.s2s_weight * loss_s2s
         if self.use_diagonal_attention_prior:
             total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
+        if self.use_variance_adaptor and auxiliary_outputs:
+            total_loss = total_loss + self.variance_loss_weight * duration_loss
         loss = total_loss
         loss.backward()
         torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
         self.optimizer.step()
         self.scheduler.step()
-        return {'loss': loss.item(),
-                'ctc': loss_ctc.item(),
-                's2s': loss_s2s.item()}
+        results = {'loss': loss.item(),
+                   'ctc': loss_ctc.item(),
+                   's2s': loss_s2s.item()}
+        if self.use_variance_adaptor and auxiliary_outputs:
+            results['duration'] = duration_loss.item()
+        return results
 
     def _train_epoch(self):
         # switch dataloader if we're above configured epoch
@@ -256,19 +290,41 @@ class Trainer(object):
                 mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
             mel_mask = self.model.length_to_mask(mel_input_length)
             text_mask = self.model.length_to_mask(text_input_length)
-            ppgs, s2s_pred, s2s_attn = self.model(
+            model_outputs = self.model(
                 mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+            if isinstance(model_outputs, (list, tuple)) and len(model_outputs) == 4:
+                ppgs, s2s_pred, s2s_attn, auxiliary_outputs = model_outputs
+            else:
+                ppgs, s2s_pred, s2s_attn = model_outputs
+                auxiliary_outputs = {}
             loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
                                           text_input, mel_input_length, text_input_length)
             loss_s2s = 0
             for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
                 loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
             loss_s2s /= text_input.size(0)
+            duration_loss = torch.tensor(0.0, device=self.device)
+            if self.use_variance_adaptor and auxiliary_outputs:
+                log_duration_pred = auxiliary_outputs.get('log_duration')
+                if log_duration_pred is not None:
+                    duration_targets = self._compute_duration_targets(
+                        s2s_attn.detach(),
+                        text_input_length,
+                        mel_input_length)
+                    log_duration_target = torch.log1p(duration_targets)
+                    duration_loss = self._duration_loss(
+                        log_duration_pred,
+                        log_duration_target,
+                        text_input_length)
             loss = loss_ctc + loss_s2s
+            if self.use_variance_adaptor and auxiliary_outputs:
+                loss = loss + self.variance_loss_weight * duration_loss
 
             eval_losses["eval/ctc"].append(loss_ctc.item())
             eval_losses["eval/s2s"].append(loss_s2s.item())
             eval_losses["eval/loss"].append(loss.item())
+            if self.use_variance_adaptor and auxiliary_outputs:
+                eval_losses["eval/duration"].append(duration_loss.item())
 
             _, amax_ppgs = torch.max(ppgs, dim=2)
             wers = [calc_wer(target[:text_length],
@@ -290,3 +346,43 @@ class Trainer(object):
         eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
         eval_losses.update(eval_images)
         return eval_losses
+
+    def _compute_duration_targets(self, attn, text_lengths, mel_lengths):
+        """Convert attention maps into discrete duration targets."""
+        batch_size = attn.size(0)
+        max_text_len = int(text_lengths.max().item()) if text_lengths.numel() else 0
+        device = attn.device
+        durations = attn.new_zeros((batch_size, max_text_len))
+
+        for idx in range(batch_size):
+            text_len = int(text_lengths[idx].item())
+            mel_len = int(mel_lengths[idx].item())
+            if text_len == 0 or mel_len == 0:
+                continue
+            attn_slice = attn[idx, 1:1 + text_len, :mel_len]
+            if attn_slice.numel() == 0:
+                continue
+            frame_assignments = attn_slice.argmax(dim=0)
+            counts = torch.bincount(frame_assignments, minlength=text_len).float().to(device)
+            durations[idx, :text_len] = counts
+
+        return durations
+
+    def _duration_loss(self, log_duration_pred, log_duration_target, text_lengths):
+        """Compute masked error between predicted and target log durations."""
+        if log_duration_pred.dim() == 3 and log_duration_pred.size(-1) == 1:
+            log_duration_pred = log_duration_pred.squeeze(-1)
+
+        mask = self.length_to_mask(text_lengths).to(log_duration_pred.device)
+        mask = mask[:, :log_duration_pred.size(1)]
+
+        if self.variance_loss_type == 'l1':
+            loss = torch.abs(log_duration_pred - log_duration_target)
+        elif self.variance_loss_type in ('smooth_l1', 'huber'):
+            loss = F.smooth_l1_loss(log_duration_pred, log_duration_target, reduction='none')
+        else:
+            loss = (log_duration_pred - log_duration_target) ** 2
+
+        loss = loss.masked_fill(mask, 0.0)
+        denom = torch.clamp((~mask).sum(), min=1).float()
+        return loss.sum() / denom

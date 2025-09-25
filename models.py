@@ -3,7 +3,7 @@ import torch
 from torch import nn
 from torch.nn import TransformerEncoder
 import torch.nn.functional as F
-from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
+from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock, VarianceAdaptor
 
 def build_model(model_params={}, model_type='asr'):
     model = ASRCNN(**model_params)
@@ -18,6 +18,7 @@ class ASRCNN(nn.Module):
                  n_layers=6,
                  token_embedding_dim=256,
                  location_kernel_size=63,
+                 auxiliary_models=None,
     ):
         super().__init__()
         self.n_token = n_token
@@ -40,6 +41,17 @@ class ASRCNN(nn.Module):
             n_token=n_token,
             location_kernel_size=location_kernel_size)
 
+        auxiliary_models = auxiliary_models or {}
+        variance_cfg = auxiliary_models.get('variance_adaptor', {})
+        self.use_variance_adaptor = bool(variance_cfg.get('enabled', False))
+        if self.use_variance_adaptor:
+            duration_predictor_cfg = variance_cfg.get('duration_predictor', {})
+            self.variance_adaptor = VarianceAdaptor(
+                input_size=self.asr_s2s.decoder_rnn_dim,
+                duration_predictor_config=duration_predictor_cfg)
+        else:
+            self.variance_adaptor = None
+
     def forward(self, x, src_key_padding_mask=None, text_input=None):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
@@ -49,8 +61,12 @@ class ASRCNN(nn.Module):
         x = x.transpose(1, 2)
         ctc_logit = self.ctc_linear(x)
         if text_input is not None:
-            _, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
-            return ctc_logit, s2s_logit, s2s_attn
+            hidden_states, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
+            auxiliary_outputs = {}
+            if self.use_variance_adaptor and self.variance_adaptor is not None:
+                decoder_hidden = hidden_states[:, 1:, :]
+                auxiliary_outputs = self.variance_adaptor(decoder_hidden)
+            return ctc_logit, s2s_logit, s2s_attn, auxiliary_outputs
         else:
             return ctc_logit
 

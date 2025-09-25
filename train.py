@@ -294,6 +294,8 @@ def main(config_path):
 
     if not 'n_token' in model_params:
         model_params['n_token'] = len( word_indexes )
+    if 'auxiliary_models' not in model_params:
+        model_params['auxiliary_models'] = {}
 
     print("Using model parameters:", model_params)
 
@@ -325,6 +327,13 @@ def main(config_path):
     loss_weight_config = cfg_get_nested(config, 'loss_weights', {}) or {}
     ctc_weight = float(loss_weight_config.get('ctc', 1.0))
     s2s_weight = float(loss_weight_config.get('s2s', 1.0))
+    variance_cfg = cfg_get_nested(config, 'model_params.auxiliary_models.variance_adaptor', {}) or {}
+    use_variance_adaptor = bool(variance_cfg.get('enabled', False))
+    variance_loss_weight = float(variance_cfg.get('loss_weight', 1.0))
+    if 'variance_duration' in loss_weight_config:
+        variance_loss_weight = float(loss_weight_config['variance_duration'])
+    variance_loss_type = variance_cfg.get('loss_type', 'mse')
+    detach_duration_targets = bool(variance_cfg.get('detach_attention_for_targets', True))
 
     trainer = Trainer(model=model,
                     criterion=criterion,
@@ -341,6 +350,10 @@ def main(config_path):
                     diagonal_attention_prior_weight=cfg_get_nested( config, 'diagonal_attention_prior_weight', 0.1),
                     ctc_weight=ctc_weight,
                     s2s_weight=s2s_weight,
+                    use_variance_adaptor=use_variance_adaptor,
+                    variance_loss_weight=variance_loss_weight,
+                    variance_loss_type=variance_loss_type,
+                    detach_duration_targets=detach_duration_targets,
                     )
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )

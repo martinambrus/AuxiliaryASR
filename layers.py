@@ -130,6 +130,101 @@ class ConvBlock(nn.Module):
         ]
         return nn.Sequential(*layers)
 
+
+class DurationPredictor(nn.Module):
+    """Predict log-duration targets for variance adaptation."""
+
+    def __init__(self,
+                 input_size: int,
+                 filter_size: int = 256,
+                 kernel_size: int = 3,
+                 dropout: float = 0.5,
+                 n_layers: int = 2):
+        super().__init__()
+        if n_layers < 1:
+            raise ValueError("DurationPredictor requires at least one layer")
+
+        self.layers = nn.ModuleList()
+        for layer_index in range(n_layers):
+            in_channels = input_size if layer_index == 0 else filter_size
+            self.layers.append(nn.ModuleDict({
+                "conv": ConvNorm(in_channels,
+                                   filter_size,
+                                   kernel_size=kernel_size,
+                                   padding=(kernel_size - 1) // 2),
+                "activation": nn.ReLU(),
+                "layer_norm": nn.LayerNorm(filter_size),
+                "dropout": nn.Dropout(dropout)
+            }))
+
+        self.proj = LinearNorm(filter_size, 1)
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> Tensor:
+        """Forward pass.
+
+        Args:
+            x: Tensor of shape ``[B, T, C]`` containing hidden states.
+            mask: Optional bool tensor of shape ``[B, T]`` where ``True``
+                indicates padded positions.
+
+        Returns:
+            Tensor of shape ``[B, T]`` with log-duration predictions.
+        """
+
+        out = x
+        for layer in self.layers:
+            conv = layer["conv"]
+            activation = layer["activation"]
+            layer_norm = layer["layer_norm"]
+            dropout = layer["dropout"]
+
+            out = conv(out.transpose(1, 2)).transpose(1, 2)
+            out = activation(out)
+            out = layer_norm(out)
+            out = dropout(out)
+
+        out = self.proj(out).squeeze(-1)
+        if mask is not None:
+            out = out.masked_fill(mask, 0.0)
+        return out
+
+
+class VarianceAdaptor(nn.Module):
+    """FastSpeech-style variance adaptor supporting duration prediction."""
+
+    def __init__(self,
+                 input_size: int,
+                 duration_predictor_config: Optional[dict] = None):
+        super().__init__()
+        duration_predictor_config = duration_predictor_config or {}
+
+        self.duration_predictor = DurationPredictor(
+            input_size=input_size,
+            filter_size=int(duration_predictor_config.get("filter_size",
+                                                          input_size)),
+            kernel_size=int(duration_predictor_config.get("kernel_size", 3)),
+            dropout=float(duration_predictor_config.get("dropout", 0.5)),
+            n_layers=int(duration_predictor_config.get("n_layers", 2)),
+        )
+
+    def forward(self, x: Tensor, mask: Optional[Tensor] = None) -> dict:
+        """Predict auxiliary variance targets.
+
+        Args:
+            x: Decoder hidden states ``[B, T, C]``.
+            mask: Optional bool tensor ``[B, T]`` marking padding positions.
+
+        Returns:
+            Dictionary with ``log_duration`` and ``duration`` predictions.
+        """
+
+        log_duration = self.duration_predictor(x, mask=mask)
+        duration = torch.clamp(torch.exp(log_duration) - 1.0, min=0.0)
+        return {
+            "log_duration": log_duration,
+            "duration": duration,
+        }
+
 class LocationLayer(nn.Module):
     def __init__(self, attention_n_filters, attention_kernel_size,
                  attention_dim):
