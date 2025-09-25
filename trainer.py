@@ -296,13 +296,12 @@ class Trainer(object):
         self.optimizer.step()
         self.scheduler.step()
 
-        metrics = {'loss': total_loss.item()}
-        if "ctc" in self.criterion and self.ctc_weight > 0:
-            metrics['ctc'] = loss_ctc.item()
-        if self.decoder_type == "s2s" and "ce" in self.criterion and self.s2s_weight > 0:
-            metrics['s2s'] = loss_s2s.item()
-        if self.decoder_type == "rnnt" and "rnnt" in self.criterion and self.rnnt_weight > 0:
-            metrics['rnnt'] = loss_rnnt.item()
+        metrics = {
+            'loss': total_loss.item(),
+            'ctc': loss_ctc.item(),
+            's2s': loss_s2s.item(),
+            'rnnt': loss_rnnt.item(),
+        }
         return metrics
 
     def _train_epoch(self):
@@ -399,12 +398,9 @@ class Trainer(object):
                 )
                 total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
 
-            if "ctc" in self.criterion and self.ctc_weight > 0:
-                eval_losses["eval/ctc"].append(loss_ctc.item())
-            if self.decoder_type == "s2s" and "ce" in self.criterion and self.s2s_weight > 0:
-                eval_losses["eval/s2s"].append(loss_s2s.item())
-            if self.decoder_type == "rnnt" and "rnnt" in self.criterion and self.rnnt_weight > 0:
-                eval_losses["eval/rnnt"].append(loss_rnnt.item())
+            eval_losses["eval/ctc"].append(loss_ctc.item())
+            eval_losses["eval/s2s"].append(loss_s2s.item())
+            eval_losses["eval/rnnt"].append(loss_rnnt.item())
             eval_losses["eval/loss"].append(total_loss.item())
 
             _, amax_ppgs = torch.max(ppgs, dim=2)
@@ -423,7 +419,12 @@ class Trainer(object):
             ]
             eval_losses["eval/wer"].extend(wers)
 
-            if self.decoder_type == "s2s" and "ce" in self.criterion and self.s2s_weight > 0:
+            if (
+                self.decoder_type == "s2s"
+                and "ce" in self.criterion
+                and self.s2s_weight > 0
+                and s2s_pred is not None
+            ):
                 _, amax_s2s = torch.max(s2s_pred, dim=2)
                 acc = [
                     torch.eq(target[:length], pred[:length]).float().mean().item()
@@ -434,11 +435,12 @@ class Trainer(object):
                     )
                 ]
                 eval_losses["eval/acc"].extend(acc)
-
                 if eval_steps_per_epoch <= 2:
                     eval_images["eval/image"].append(
                         self.get_image([s2s_attn[0].cpu().numpy()])
                     )
+            else:
+                eval_losses["eval/acc"].extend([0.0] * text_input.size(0))
 
         eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
         eval_losses.update(eval_images)
