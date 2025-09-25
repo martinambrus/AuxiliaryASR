@@ -210,7 +210,7 @@ class Trainer(object):
             if seq_len > 0:
                 padded[idx, :seq_len] = seq
             lengths[idx] = seq_len
-        return padded, lengths
+        return padded.to(dtype=torch.int32), lengths.to(dtype=torch.int32)
 
     def _forward_model(self, mel_input, mel_lengths, text_input, text_lengths):
         mel_mask = self.model.length_to_mask(mel_lengths)
@@ -276,9 +276,9 @@ class Trainer(object):
                 decoder_inputs, decoder_lengths = self._prepare_rnnt_inputs(text_input, text_input_length)
             loss_rnnt = self.criterion['rnnt'](
                 rnnt_logits.log_softmax(dim=-1),
-                decoder_inputs.to(self.device),
-                mel_input_length,
-                decoder_lengths.to(self.device),
+                decoder_inputs.to(self.device, dtype=torch.int32),
+                mel_input_length.to(dtype=torch.int32),
+                decoder_lengths.to(self.device, dtype=torch.int32),
             )
 
         total_loss = self.ctc_weight * loss_ctc
@@ -382,9 +382,9 @@ class Trainer(object):
                     decoder_inputs, decoder_lengths = self._prepare_rnnt_inputs(text_input, text_input_length)
                 loss_rnnt = self.criterion['rnnt'](
                     rnnt_logits.log_softmax(dim=-1),
-                    decoder_inputs.to(self.device),
-                    mel_input_length,
-                    decoder_lengths.to(self.device),
+                    decoder_inputs.to(self.device, dtype=torch.int32),
+                    mel_input_length.to(dtype=torch.int32),
+                    decoder_lengths.to(self.device, dtype=torch.int32),
                 )
 
             total_loss = self.ctc_weight * loss_ctc
