@@ -1,7 +1,7 @@
 import math
 import torch
 from torch import nn
-from typing import Optional, Any
+from typing import Optional
 from torch import Tensor
 import torch.nn.functional as F
 import torchaudio
@@ -206,6 +206,226 @@ class Attention(nn.Module):
         attention_context = attention_context.squeeze(1)
 
         return attention_context, attention_weights
+
+
+def _monotonic_attention(p_select: Tensor, prev_attention: Tensor, mask: Optional[Tensor] = None,
+                         eps: float = 1e-8) -> Tensor:
+    """Compute expected monotonic attention distribution.
+
+    Args:
+        p_select: Selection probabilities for the current decoding step (B, T).
+        prev_attention: Attention distribution from the previous decoding step (B, T).
+        mask: Optional boolean mask where ``True`` indicates padded positions (B, T).
+        eps: Small constant for numerical stability.
+
+    Returns:
+        Tensor: Normalized attention weights with shape (B, T).
+    """
+
+    if mask is not None:
+        p_select = p_select.masked_fill(mask, 0.0)
+        prev_attention = prev_attention.masked_fill(mask, 0.0)
+
+    batch, seq_len = p_select.size()
+    cumulative = torch.zeros(batch, device=p_select.device, dtype=p_select.dtype)
+    attention = []
+
+    for step in range(seq_len):
+        prev = prev_attention[:, step]
+        cumulative = cumulative * (1.0 - p_select[:, step]) + prev
+        attn_step = p_select[:, step] * cumulative
+        attention.append(attn_step)
+
+    attention = torch.stack(attention, dim=-1)
+
+    if mask is not None:
+        attention = attention.masked_fill(mask, 0.0)
+
+    denom = attention.sum(-1, keepdim=True)
+    normalized = attention / (denom + eps)
+
+    zero_mask = denom.squeeze(-1) <= eps
+    if zero_mask.any():
+        prev_norm = prev_attention / (prev_attention.sum(-1, keepdim=True) + eps)
+        prev_norm = prev_norm.masked_fill(mask, 0.0) if mask is not None else prev_norm
+        normalized = torch.where(zero_mask.unsqueeze(-1), prev_norm, normalized)
+
+    return normalized
+
+
+def _compute_chunkwise_attention(alpha: Tensor, chunk_energy: Tensor, chunk_size: int,
+                                 mask: Optional[Tensor] = None,
+                                 score_mask_value: float = -1e4,
+                                 eps: float = 1e-8) -> Tensor:
+    """Distribute monotonic attention mass over chunk windows.
+
+    Args:
+        alpha: Monotonic attention distribution (B, T).
+        chunk_energy: Chunk energy scores (B, T).
+        chunk_size: Size of the chunk window.
+        mask: Optional boolean mask for padded positions (B, T).
+        score_mask_value: Mask value for invalid locations.
+        eps: Numerical stability constant.
+
+    Returns:
+        Tensor: Chunk-wise attention distribution (B, T).
+    """
+
+    if chunk_size <= 1:
+        beta = alpha.clone()
+        if mask is not None:
+            beta = beta.masked_fill(mask, 0.0)
+        denom = beta.sum(-1, keepdim=True)
+        return beta / (denom + eps)
+
+    batch, seq_len = alpha.size()
+    chunk_size = min(chunk_size, seq_len)
+
+    device = alpha.device
+    idx = torch.arange(seq_len, device=device)
+    end_idx = idx.unsqueeze(1)
+    start_idx = idx.unsqueeze(0)
+    base_mask = (start_idx <= end_idx) & ((end_idx - start_idx) < chunk_size)
+    base_mask = base_mask.unsqueeze(0).expand(batch, -1, -1)
+
+    energy_matrix = chunk_energy.unsqueeze(1).expand(-1, seq_len, -1)
+    energy_matrix = energy_matrix.masked_fill(~base_mask, score_mask_value)
+
+    if mask is not None:
+        expanded_mask = mask.unsqueeze(1).expand(-1, seq_len, -1)
+        energy_matrix = energy_matrix.masked_fill(expanded_mask, score_mask_value)
+        alpha = alpha.masked_fill(mask, 0.0)
+
+    chunk_weights = torch.softmax(energy_matrix, dim=-1)
+    chunk_weights = chunk_weights * base_mask.to(chunk_weights.dtype)
+
+    denom = chunk_weights.sum(-1, keepdim=True).clamp_min(eps)
+    chunk_weights = chunk_weights / denom
+
+    beta = torch.bmm(alpha.unsqueeze(1), chunk_weights).squeeze(1)
+
+    if mask is not None:
+        beta = beta.masked_fill(mask, 0.0)
+
+    beta_sum = beta.sum(-1, keepdim=True)
+    normalized_beta = beta / (beta_sum.clamp_min(eps))
+
+    zero_mask = beta_sum.squeeze(-1) <= eps
+    if zero_mask.any():
+        fallback = alpha / (alpha.sum(-1, keepdim=True).clamp_min(eps))
+        fallback = fallback.masked_fill(mask, 0.0) if mask is not None else fallback
+        normalized_beta = torch.where(zero_mask.unsqueeze(-1), fallback, normalized_beta)
+
+    return normalized_beta
+
+
+class MonotonicAttention(nn.Module):
+    def __init__(self,
+                 attention_rnn_dim,
+                 embedding_dim,
+                 attention_dim,
+                 attention_location_n_filters=32,
+                 attention_location_kernel_size=31,
+                 use_location_features=True,
+                 noise_std=0.0):
+        super().__init__()
+        self.query_layer = LinearNorm(attention_rnn_dim, attention_dim,
+                                      bias=False, w_init_gain='tanh')
+        self.memory_layer = LinearNorm(embedding_dim, attention_dim, bias=False,
+                                       w_init_gain='tanh')
+        self.energy_layer = LinearNorm(attention_dim, 1, bias=False)
+        self.use_location_features = use_location_features
+        if self.use_location_features:
+            self.location_layer = LocationLayer(
+                attention_location_n_filters,
+                attention_location_kernel_size,
+                attention_dim,
+            )
+        else:
+            self.location_layer = None
+        self.score_mask_value = -1e4
+        self.noise_std = noise_std
+
+    def _compute_energy(self, query: Tensor, processed_memory: Tensor,
+                         attention_weights_cat: Optional[Tensor]) -> Tensor:
+        processed_query = self.query_layer(query).unsqueeze(1)
+        energies = processed_query + processed_memory
+        if self.use_location_features and attention_weights_cat is not None:
+            processed_attention = self.location_layer(attention_weights_cat)
+            energies = energies + processed_attention
+        return torch.tanh(energies)
+
+    def forward(self, attention_hidden_state: Tensor, memory: Tensor,
+                processed_memory: Tensor, attention_weights_cat: Optional[Tensor],
+                mask: Optional[Tensor]):
+        energies = self._compute_energy(attention_hidden_state,
+                                        processed_memory,
+                                        attention_weights_cat)
+        energy_scores = self.energy_layer(energies).squeeze(-1)
+        if mask is not None:
+            energy_scores = energy_scores.masked_fill(mask, self.score_mask_value)
+        if self.training and self.noise_std > 0:
+            noise = torch.randn_like(energy_scores) * self.noise_std
+            energy_scores = energy_scores + noise
+        p_select = torch.sigmoid(energy_scores)
+        prev_attention = attention_weights_cat[:, 0, :] if attention_weights_cat is not None else None
+        if prev_attention is None:
+            prev_attention = torch.zeros_like(p_select)
+            prev_attention[:, 0] = 1.0
+        attention_weights = _monotonic_attention(p_select, prev_attention, mask)
+        attention_context = torch.bmm(attention_weights.unsqueeze(1), memory).squeeze(1)
+        return attention_context, attention_weights
+
+
+class MoChAAttention(MonotonicAttention):
+    def __init__(self,
+                 attention_rnn_dim,
+                 embedding_dim,
+                 attention_dim,
+                 attention_location_n_filters=32,
+                 attention_location_kernel_size=31,
+                 use_location_features=True,
+                 noise_std=0.0,
+                 chunk_size=4):
+        super().__init__(attention_rnn_dim,
+                         embedding_dim,
+                         attention_dim,
+                         attention_location_n_filters,
+                         attention_location_kernel_size,
+                         use_location_features,
+                         noise_std)
+        self.chunk_size = chunk_size
+        self.chunk_energy_layer = LinearNorm(attention_dim, 1, bias=False)
+
+    def forward(self, attention_hidden_state: Tensor, memory: Tensor,
+                processed_memory: Tensor, attention_weights_cat: Optional[Tensor],
+                mask: Optional[Tensor]):
+        energies = self._compute_energy(attention_hidden_state,
+                                        processed_memory,
+                                        attention_weights_cat)
+
+        monotonic_scores = self.energy_layer(energies).squeeze(-1)
+        chunk_scores = self.chunk_energy_layer(energies).squeeze(-1)
+
+        if mask is not None:
+            monotonic_scores = monotonic_scores.masked_fill(mask, self.score_mask_value)
+            chunk_scores = chunk_scores.masked_fill(mask, self.score_mask_value)
+
+        if self.training and self.noise_std > 0:
+            noise = torch.randn_like(monotonic_scores) * self.noise_std
+            monotonic_scores = monotonic_scores + noise
+
+        p_select = torch.sigmoid(monotonic_scores)
+        prev_attention = attention_weights_cat[:, 0, :] if attention_weights_cat is not None else None
+        if prev_attention is None:
+            prev_attention = torch.zeros_like(p_select)
+            prev_attention[:, 0] = 1.0
+
+        alpha = _monotonic_attention(p_select, prev_attention, mask)
+        beta = _compute_chunkwise_attention(alpha, chunk_scores, self.chunk_size, mask,
+                                            score_mask_value=self.score_mask_value)
+        attention_context = torch.bmm(beta.unsqueeze(1), memory).squeeze(1)
+        return attention_context, beta
 
 class PhaseShuffle2d(nn.Module):
     def __init__(self, n=2):

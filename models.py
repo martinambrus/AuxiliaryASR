@@ -3,10 +3,24 @@ import torch
 from torch import nn
 from torch.nn import TransformerEncoder
 import torch.nn.functional as F
-from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
+from layers import (
+    MFCC,
+    Attention,
+    LinearNorm,
+    ConvNorm,
+    ConvBlock,
+    MonotonicAttention,
+    MoChAAttention,
+)
 
 def build_model(model_params={}, model_type='asr'):
-    model = ASRCNN(**model_params)
+    params = dict(model_params)
+    decoder_cfg = params.pop('decoder', {}) if isinstance(model_params, dict) else {}
+    attention_type = params.get('attention_type', decoder_cfg.get('attention_type', 'location'))
+    attention_config = params.get('attention_config', decoder_cfg.get('attention_config', {}))
+    params['attention_type'] = attention_type
+    params['attention_config'] = attention_config
+    model = ASRCNN(**params)
     return model
 
 
@@ -18,9 +32,12 @@ class ASRCNN(nn.Module):
                  n_layers=6,
                  token_embedding_dim=256,
                  location_kernel_size=63,
+                 attention_type='location',
+                 attention_config=None,
     ):
         super().__init__()
         self.n_token = n_token
+        self.attention_type = attention_type
         self.n_down = 1
         self.to_mfcc = MFCC()
         self.init_cnn = ConvNorm(input_dim//2, hidden_dim, kernel_size=7, padding=3, stride=2)
@@ -34,11 +51,15 @@ class ASRCNN(nn.Module):
             LinearNorm(hidden_dim//2, hidden_dim),
             nn.ReLU(),
             LinearNorm(hidden_dim, n_token))
+        if attention_config is None:
+            attention_config = {}
         self.asr_s2s = ASRS2S(
             embedding_dim=token_embedding_dim,
             hidden_dim=hidden_dim//2,
             n_token=n_token,
-            location_kernel_size=location_kernel_size)
+            location_kernel_size=location_kernel_size,
+            attention_type=attention_type,
+            attention_config=attention_config)
 
     def forward(self, x, src_key_padding_mask=None, text_input=None):
         x = self.to_mfcc(x)
@@ -90,7 +111,9 @@ class ASRS2S(nn.Module):
                  hidden_dim=512,
                  n_location_filters=32,
                  location_kernel_size=63,
-                 n_token=40):
+                 n_token=40,
+                 attention_type='location',
+                 attention_config=None):
         super(ASRS2S, self).__init__()
         self.embedding = nn.Embedding(n_token, embedding_dim)
         val_range = math.sqrt(6 / hidden_dim)
@@ -98,13 +121,59 @@ class ASRS2S(nn.Module):
 
         self.decoder_rnn_dim = hidden_dim
         self.project_to_n_symbols = nn.Linear(self.decoder_rnn_dim, n_token)
-        self.attention_layer = Attention(
-            self.decoder_rnn_dim,
-            hidden_dim,
-            hidden_dim,
-            n_location_filters,
-            location_kernel_size
-        )
+        if attention_config is None:
+            attention_config = {}
+
+        attention_type = (attention_type or 'location').lower()
+        config = attention_config.copy()
+
+        monotonic_cfg = config.get('monotonic', {})
+        mocha_cfg = config.get('mocha', {})
+
+        use_location = monotonic_cfg.get('use_location_features', True)
+        noise_std = float(monotonic_cfg.get('noise_std', 0.0))
+        monotonic_enabled = monotonic_cfg.get('enabled', True)
+        mocha_enabled = mocha_cfg.get('enabled', True)
+        chunk_size = int(mocha_cfg.get('chunk_size', 4))
+
+        if attention_type == 'mocha':
+            if not monotonic_enabled:
+                raise ValueError('MoChA attention requires monotonic attention to be enabled.')
+            if not mocha_enabled:
+                attention_type = 'monotonic'
+        if attention_type == 'monotonic' and not monotonic_enabled:
+            attention_type = 'location'
+
+        if attention_type == 'mocha':
+            self.attention_layer = MoChAAttention(
+                self.decoder_rnn_dim,
+                hidden_dim,
+                hidden_dim,
+                n_location_filters,
+                location_kernel_size,
+                use_location_features=use_location,
+                noise_std=noise_std,
+                chunk_size=max(1, chunk_size)
+            )
+        elif attention_type == 'monotonic':
+            self.attention_layer = MonotonicAttention(
+                self.decoder_rnn_dim,
+                hidden_dim,
+                hidden_dim,
+                n_location_filters,
+                location_kernel_size,
+                use_location_features=use_location,
+                noise_std=noise_std
+            )
+        else:
+            self.attention_layer = Attention(
+                self.decoder_rnn_dim,
+                hidden_dim,
+                hidden_dim,
+                n_location_filters,
+                location_kernel_size
+            )
+        self.attention_type = attention_type
         self.decoder_rnn = nn.LSTMCell(self.decoder_rnn_dim + embedding_dim, self.decoder_rnn_dim)
         self.project_to_hidden = nn.Sequential(
             LinearNorm(self.decoder_rnn_dim * 2, hidden_dim),
@@ -120,6 +189,8 @@ class ASRS2S(nn.Module):
         self.decoder_hidden = torch.zeros((B, self.decoder_rnn_dim)).type_as(memory)
         self.decoder_cell = torch.zeros((B, self.decoder_rnn_dim)).type_as(memory)
         self.attention_weights = torch.zeros((B, L)).type_as(memory)
+        if isinstance(self.attention_layer, (MonotonicAttention, MoChAAttention)):
+            self.attention_weights[:, 0] = 1.0
         self.attention_weights_cum = torch.zeros((B, L)).type_as(memory)
         self.attention_context = torch.zeros((B, H)).type_as(memory)
         self.memory = memory

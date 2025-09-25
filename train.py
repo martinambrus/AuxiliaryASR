@@ -283,17 +283,32 @@ def main(config_path):
         if line.strip()
     )
 
-    model_params = cfg_get_nested( config, 'model_params', {
+    default_model_params = {
         'input_dim': 80,
         'hidden_dim': 256,
-        'n_token': len( word_indexes ),
+        'n_token': len(word_indexes),
         'token_embedding_dim': 512,
         'n_layers': 5,
-        'location_kernel_size': 31
-    })
+        'location_kernel_size': 31,
+        'decoder': {
+            'attention_type': 'mocha',
+            'attention_config': {
+                'monotonic': {
+                    'enabled': True,
+                    'use_location_features': True,
+                    'noise_std': 0.0
+                },
+                'mocha': {
+                    'enabled': True,
+                    'chunk_size': 4
+                }
+            }
+        }
+    }
+    model_params = cfg_get_nested(config, 'model_params', default_model_params)
 
-    if not 'n_token' in model_params:
-        model_params['n_token'] = len( word_indexes )
+    if 'n_token' not in model_params:
+        model_params['n_token'] = len(word_indexes)
 
     print("Using model parameters:", model_params)
 

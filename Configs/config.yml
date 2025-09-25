@@ -25,6 +25,16 @@ model_params:
    token_embedding_dim: 512
    n_layers: 5
    location_kernel_size: 31
+   decoder:
+     attention_type: mocha
+     attention_config:
+       monotonic:
+         enabled: true
+         use_location_features: true
+         noise_std: 0.0
+       mocha:
+         enabled: true
+         chunk_size: 4
 
 optimizer_params:
   lr: 0.0005
