@@ -77,3 +77,4 @@ loss_weights:
 # optional RNNT loss parameters (passed to torchaudio rnnt_loss)
 rnnt_loss_params:
   reduction: "mean"
+  fused_log_softmax: true

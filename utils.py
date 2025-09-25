@@ -35,23 +35,50 @@ def drop_duplicated(chars):
     return ret_chars
 
 class RNNTLossWrapper(nn.Module):
-    def __init__(self, blank=0, reduction="mean", clamp=-1):
+    def __init__(
+        self,
+        blank=0,
+        reduction="mean",
+        clamp=-1,
+        fused_log_softmax=True,
+        input_is_log_probs=False,
+    ):
         super().__init__()
         if torchaudio_rnnt_loss is None:
             raise ImportError("torchaudio is required to compute RNNT loss but is not available.")
         self.blank = blank
         self.reduction = reduction
         self.clamp = clamp
+        self.fused_log_softmax = fused_log_softmax
+        self.input_is_log_probs = input_is_log_probs
 
-    def forward(self, log_probs, targets, logit_lengths, target_lengths):
+        if self.input_is_log_probs and self.fused_log_softmax:
+            raise ValueError(
+                "RNNTLossWrapper cannot receive pre-normalized log probabilities "
+                "when fused_log_softmax is enabled."
+            )
+
+    def forward(self, logits, targets, logit_lengths, target_lengths):
+        if self.input_is_log_probs:
+            loss_input = logits
+            fused_log_softmax = False
+        else:
+            if self.fused_log_softmax:
+                loss_input = logits
+                fused_log_softmax = True
+            else:
+                loss_input = logits.log_softmax(dim=-1)
+                fused_log_softmax = False
+
         return torchaudio_rnnt_loss(
-            log_probs,
+            loss_input,
             targets,
             logit_lengths,
             target_lengths,
             blank=self.blank,
             reduction=self.reduction,
             clamp=self.clamp,
+            fused_log_softmax=fused_log_softmax,
         )
 
 

@@ -275,7 +275,7 @@ class Trainer(object):
             if decoder_inputs is None or decoder_lengths is None:
                 decoder_inputs, decoder_lengths = self._prepare_rnnt_inputs(text_input, text_input_length)
             loss_rnnt = self.criterion['rnnt'](
-                rnnt_logits.log_softmax(dim=-1),
+                rnnt_logits,
                 decoder_inputs.to(self.device, dtype=torch.int32),
                 mel_input_length.to(dtype=torch.int32),
                 decoder_lengths.to(self.device, dtype=torch.int32),
@@ -381,7 +381,7 @@ class Trainer(object):
                 if decoder_inputs is None or decoder_lengths is None:
                     decoder_inputs, decoder_lengths = self._prepare_rnnt_inputs(text_input, text_input_length)
                 loss_rnnt = self.criterion['rnnt'](
-                    rnnt_logits.log_softmax(dim=-1),
+                    rnnt_logits,
                     decoder_inputs.to(self.device, dtype=torch.int32),
                     mel_input_length.to(dtype=torch.int32),
                     decoder_lengths.to(self.device, dtype=torch.int32),
