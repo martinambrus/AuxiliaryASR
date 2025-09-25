@@ -159,12 +159,14 @@ class MelDataset(torch.utils.data.Dataset):
                      "n_mels": 80
                  },
                  spec_augment_params=None,
-                 validation=False
+                 validation=False,
+                 auxiliary_objectives=None
                 ):
 
         self.data_list = data_list
         self.text_cleaner = TextCleaner(dict_path)
         self.sr = sr
+        self.auxiliary_objectives = auxiliary_objectives or {}
 
         mel_opts = {**{'sample_rate': sr}, **mel_params, **spect_params}
         print("Options for MEL spectrogram calculations:", mel_opts)
@@ -180,6 +182,20 @@ class MelDataset(torch.utils.data.Dataset):
 
         # https://github.com/yl4579/StyleTTS/issues/57
         self.mean, self.std = -4, 4
+
+        pron_cfg = self.auxiliary_objectives.get('pronunciation_error', {}) if self.auxiliary_objectives else {}
+        self.pronunciation_error_enabled = bool(pron_cfg.get('enabled', False))
+        self.pronunciation_error_map = {}
+        if self.pronunciation_error_enabled:
+            label_map_path = pron_cfg.get('label_map_path')
+            if label_map_path:
+                self.pronunciation_error_map = self._load_label_map(label_map_path)
+
+        frame_cfg = self.auxiliary_objectives.get('frame_phoneme', {}) if self.auxiliary_objectives else {}
+        self.frame_phoneme_enabled = bool(frame_cfg.get('enabled', False))
+        self.frame_label_source = frame_cfg.get('label_source', 'uniform_alignment')
+        self.frame_label_dir = frame_cfg.get('label_dir')
+        self.frame_label_extension = frame_cfg.get('label_extension', '.npy')
 
     def __len__(self):
         return len(self.data_list)
@@ -206,7 +222,16 @@ class MelDataset(torch.utils.data.Dataset):
             length_feature = acoustic_feature.size(1)
             acoustic_feature = acoustic_feature[:, :(length_feature - length_feature % 2)]
 
-            return wave_tensor, acoustic_feature, text_tensor, data[0]
+            aux_targets = {}
+            if self.pronunciation_error_enabled:
+                aux_targets['pronunciation_error'] = self._get_pronunciation_error_label(data[0])
+
+            if self.frame_phoneme_enabled and self.frame_label_source == 'file':
+                frame_labels = self._load_frame_labels(data[0])
+                if frame_labels is not None:
+                    aux_targets['frame_phoneme'] = frame_labels
+
+            return wave_tensor, acoustic_feature, text_tensor, data[0], int(speaker_id), aux_targets
         except Exception as e:
             try:
                 wave_path, text, speaker_id = data
@@ -273,6 +298,43 @@ class MelDataset(torch.utils.data.Dataset):
 
         return wave, text, speaker_id
 
+    def _load_label_map(self, path):
+        mapping = {}
+        if not os.path.exists(path):
+            logger.warning(f"Pronunciation error label map not found at {path}")
+            return mapping
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                cleaned = line.strip()
+                if not cleaned or cleaned.startswith('#'):
+                    continue
+                parts = cleaned.split('|')
+                if len(parts) != 2:
+                    continue
+                mapping[parts[0].strip()] = int(parts[1])
+        return mapping
+
+    def _get_pronunciation_error_label(self, path):
+        if not self.pronunciation_error_map:
+            return 0
+        return self.pronunciation_error_map.get(path, 0)
+
+    def _load_frame_labels(self, path):
+        if not self.frame_label_dir:
+            return None
+        base = os.path.splitext(os.path.basename(path))[0]
+        target_path = os.path.join(self.frame_label_dir, base + self.frame_label_extension)
+        if not os.path.exists(target_path):
+            return None
+        try:
+            labels = np.load(target_path)
+            if not isinstance(labels, np.ndarray):
+                return None
+            return torch.from_numpy(labels.astype(np.int64))
+        except Exception as exc:
+            logger.warning(f"Failed to load frame labels for {path}: {exc}")
+            return None
+
 
 
 
@@ -282,9 +344,21 @@ class Collater(object):
       return_wave (bool): if true, will return the wave data along with spectrogram. 
     """
 
-    def __init__(self, return_wave=False):
+    def __init__(self, return_wave=False, auxiliary_objectives=None, include_auxiliary_targets=False):
         self.text_pad_index = 0
         self.return_wave = return_wave
+        self.auxiliary_objectives = auxiliary_objectives or {}
+        self.include_auxiliary_targets = include_auxiliary_targets
+
+        frame_cfg = self.auxiliary_objectives.get('frame_phoneme', {}) if self.auxiliary_objectives else {}
+        self.frame_phoneme_enabled = bool(frame_cfg.get('enabled', False))
+        self.frame_label_source = frame_cfg.get('label_source', 'uniform_alignment')
+
+        speaker_cfg = self.auxiliary_objectives.get('speaker_embedding', {}) if self.auxiliary_objectives else {}
+        self.speaker_embedding_enabled = bool(speaker_cfg.get('enabled', False))
+
+        pron_cfg = self.auxiliary_objectives.get('pronunciation_error', {}) if self.auxiliary_objectives else {}
+        self.pronunciation_error_enabled = bool(pron_cfg.get('enabled', False))
 
     def __call__(self, batch):
         batch_size = len(batch)
@@ -303,7 +377,8 @@ class Collater(object):
         input_lengths = torch.zeros(batch_size).long()
         output_lengths = torch.zeros(batch_size).long()
         paths = ['' for _ in range(batch_size)]
-        for bid, (_, mel, text, path) in enumerate(batch):
+        aux_per_sample = []
+        for bid, (_, mel, text, path, speaker_id, aux_data) in enumerate(batch):
             mel_size = mel.size(1)
             text_size = text.size(0)
             mels[bid, :, :mel_size] = mel
@@ -312,12 +387,72 @@ class Collater(object):
             output_lengths[bid] = mel_size
             paths[bid] = path
             assert(text_size < (mel_size//2))
+            aux_per_sample.append({
+                'speaker_id': speaker_id,
+                'aux_data': aux_data,
+                'mel_length': mel_size,
+                'text_length': text_size,
+                'text': text
+            })
 
         if self.return_wave:
             waves = [b[0] for b in batch]
-            return texts, input_lengths, mels, output_lengths, paths, waves
+            base_outputs = [texts, input_lengths, mels, output_lengths, paths, waves]
+        else:
+            base_outputs = [texts, input_lengths, mels, output_lengths]
 
-        return texts, input_lengths, mels, output_lengths
+        if not self.include_auxiliary_targets:
+            return tuple(base_outputs)
+
+        aux_targets = {}
+
+        if self.speaker_embedding_enabled:
+            speaker_ids = torch.tensor([sample['speaker_id'] for sample in aux_per_sample]).long()
+            aux_targets['speaker_ids'] = speaker_ids
+
+        if self.frame_phoneme_enabled:
+            frame_targets = torch.full((batch_size, max_mel_length), fill_value=-100, dtype=torch.long)
+            for bid, sample in enumerate(aux_per_sample):
+                mel_len = sample['mel_length']
+                provided = sample['aux_data'].get('frame_phoneme') if sample['aux_data'] else None
+                if provided is not None:
+                    frame = provided
+                    if frame.dim() == 1:
+                        frame = frame.long()
+                    frame = frame[:mel_len]
+                else:
+                    frame = self._uniform_frame_targets(sample['text'], mel_len)
+                frame_targets[bid, :frame.shape[0]] = frame
+            aux_targets['frame_phoneme'] = frame_targets
+
+        if self.pronunciation_error_enabled:
+            pron_labels = torch.tensor([
+                (sample['aux_data'].get('pronunciation_error') if sample['aux_data'] else 0)
+                for sample in aux_per_sample
+            ]).long()
+            aux_targets['pronunciation_error'] = pron_labels
+
+        return tuple(base_outputs + [aux_targets])
+
+    def _uniform_frame_targets(self, text_tensor, mel_length):
+        if mel_length <= 0:
+            return torch.empty(0, dtype=torch.long)
+        token_length = int(text_tensor.size(0))
+        if token_length == 0:
+            return torch.zeros(mel_length, dtype=torch.long)
+        frame_targets = torch.zeros(mel_length, dtype=torch.long)
+        ratio = mel_length / float(token_length)
+        last_index = 0
+        for token_idx in range(token_length):
+            start = int(round(token_idx * ratio))
+            end = int(round((token_idx + 1) * ratio))
+            end = max(end, start + 1)
+            end = min(end, mel_length)
+            frame_targets[start:end] = text_tensor[token_idx]
+            last_index = end
+        if last_index < mel_length:
+            frame_targets[last_index:] = text_tensor[-1]
+        return frame_targets
 
 
 
@@ -331,8 +466,20 @@ def build_dataloader(path_list,
                      lengths=None,
                      bucket_sampler_config=None):
 
-    dataset = MelDataset(path_list, validation=validation, **dataset_config)
-    collate_fn = Collater(**collate_config)
+    auxiliary_objectives = dataset_config.get('auxiliary_objectives') if dataset_config else None
+    if dataset_config and 'auxiliary_objectives' in dataset_config:
+        dataset_config = {k: v for k, v in dataset_config.items() if k != 'auxiliary_objectives'}
+    dataset_config = dict(dataset_config) if dataset_config else {}
+    dataset = MelDataset(path_list, validation=validation, auxiliary_objectives=auxiliary_objectives, **dataset_config)
+    collate_aux_objectives = collate_config.get('auxiliary_objectives') if collate_config else None
+    include_aux = bool(collate_config.get('include_auxiliary_targets', False)) if collate_config else False
+    if collate_config and 'auxiliary_objectives' in collate_config:
+        collate_config = {k: v for k, v in collate_config.items() if k not in ('auxiliary_objectives', 'include_auxiliary_targets')}
+    else:
+        collate_config = dict(collate_config) if collate_config else {}
+    collate_fn = Collater(auxiliary_objectives=collate_aux_objectives or auxiliary_objectives,
+                          include_auxiliary_targets=include_aux,
+                          **collate_config)
 
     use_bucket_sampler = False
     batch_sampler = None

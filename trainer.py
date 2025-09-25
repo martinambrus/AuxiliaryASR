@@ -39,7 +39,9 @@ class Trainer(object):
                  use_diagonal_attention_prior = True,
                  diagonal_attention_prior_weight = 0.1,
                  ctc_weight=1.0,
-                 s2s_weight=1.0):
+                 s2s_weight=1.0,
+                 auxiliary_objectives=None,
+                 auxiliary_loss_weights=None):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -64,6 +66,51 @@ class Trainer(object):
         self.maxm_mem_usage = 0
         self.ctc_weight = ctc_weight
         self.s2s_weight = s2s_weight
+        self.auxiliary_objectives = auxiliary_objectives or {}
+        self.auxiliary_loss_weights = auxiliary_loss_weights or {}
+
+        self.auxiliary_loss_fns = {}
+        if self._is_objective_enabled('frame_phoneme'):
+            self.auxiliary_loss_fns['frame_phoneme'] = nn.CrossEntropyLoss(ignore_index=-100)
+        if self._is_objective_enabled('speaker_embedding'):
+            self.auxiliary_loss_fns['speaker_embedding'] = nn.MSELoss()
+        if self._is_objective_enabled('pronunciation_error'):
+            self.auxiliary_loss_fns['pronunciation_error'] = nn.CrossEntropyLoss()
+
+    def _is_objective_enabled(self, name):
+        if not isinstance(self.auxiliary_objectives, dict):
+            return False
+        cfg = self.auxiliary_objectives.get(name, {})
+        return isinstance(cfg, dict) and cfg.get('enabled', False)
+
+    def _extract_batch(self, batch):
+        aux_targets = {}
+        if isinstance(batch, dict):
+            text_input = batch['texts']
+            text_input_length = batch['text_lengths']
+            mel_input = batch['mels']
+            mel_input_length = batch['mel_lengths']
+            aux_targets = batch.get('auxiliary', {})
+        else:
+            core = batch
+            if isinstance(batch, (list, tuple)) and batch and isinstance(batch[-1], dict):
+                aux_targets = batch[-1]
+                core = batch[:-1]
+            if len(core) < 4:
+                raise ValueError("Batch must contain at least four tensors")
+            text_input, text_input_length, mel_input, mel_input_length = core[:4]
+        return text_input, text_input_length, mel_input, mel_input_length, aux_targets
+
+    def _move_aux_to_device(self, aux_targets):
+        if not isinstance(aux_targets, dict):
+            return {}
+        moved = {}
+        for key, value in aux_targets.items():
+            if torch.is_tensor(value):
+                moved[key] = value.to(self.device)
+            else:
+                moved[key] = value
+        return moved
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -181,15 +228,24 @@ class Trainer(object):
         # FIX: trying to fix OOM errors
         #torch.cuda.empty_cache()
         self.optimizer.zero_grad()
-        batch = [b.to(self.device) for b in batch]
-        text_input, text_input_length, mel_input, mel_input_length = batch
+        text_input, text_input_length, mel_input, mel_input_length, aux_targets = self._extract_batch(batch)
+        text_input = text_input.to(self.device)
+        text_input_length = text_input_length.to(self.device)
+        mel_input = mel_input.to(self.device)
+        mel_input_length = mel_input_length.to(self.device)
+        aux_targets = self._move_aux_to_device(aux_targets)
         mel_input_length = mel_input_length // (2 ** self.model.n_down)
         future_mask = self.model.get_future_mask(
             mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
         mel_mask = self.model.length_to_mask(mel_input_length)
         text_mask = self.model.length_to_mask(text_input_length)
-        ppgs, s2s_pred, s2s_attn = self.model(
+        model_outputs = self.model(
             mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+        if isinstance(model_outputs, tuple) and len(model_outputs) == 4:
+            ppgs, s2s_pred, s2s_attn, aux_outputs = model_outputs
+        else:
+            ppgs, s2s_pred, s2s_attn = model_outputs
+            aux_outputs = None
 
         if self.use_diagonal_attention_prior:
             loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, mel_input_length)
@@ -203,6 +259,27 @@ class Trainer(object):
         loss_s2s /= text_input.size(0)
 
         total_loss = self.ctc_weight * loss_ctc + self.s2s_weight * loss_s2s
+        aux_losses = {}
+
+        if isinstance(aux_outputs, dict) and aux_targets:
+            if self._is_objective_enabled('frame_phoneme') and 'frame_phoneme' in aux_outputs and 'frame_phoneme' in aux_targets:
+                logits = aux_outputs['frame_phoneme']
+                targets = aux_targets['frame_phoneme']
+                aux_losses['frame_phoneme'] = self.auxiliary_loss_fns['frame_phoneme'](
+                    logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+            if self._is_objective_enabled('speaker_embedding') and 'speaker_embedding' in aux_outputs and 'speaker_ids' in aux_targets:
+                embeddings = aux_outputs['speaker_embedding']
+                speaker_ids = aux_targets['speaker_ids']
+                target_embeddings = self.model.get_speaker_reference_embeddings(speaker_ids)
+                aux_losses['speaker_embedding'] = self.auxiliary_loss_fns['speaker_embedding'](embeddings, target_embeddings)
+            if self._is_objective_enabled('pronunciation_error') and 'pronunciation_error' in aux_outputs and 'pronunciation_error' in aux_targets:
+                logits = aux_outputs['pronunciation_error']
+                targets = aux_targets['pronunciation_error']
+                aux_losses['pronunciation_error'] = self.auxiliary_loss_fns['pronunciation_error'](logits, targets)
+
+        for name, aux_loss in aux_losses.items():
+            weight = float(self.auxiliary_loss_weights.get(name, 1.0))
+            total_loss = total_loss + weight * aux_loss
         if self.use_diagonal_attention_prior:
             total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
         loss = total_loss
@@ -210,9 +287,12 @@ class Trainer(object):
         torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
         self.optimizer.step()
         self.scheduler.step()
-        return {'loss': loss.item(),
-                'ctc': loss_ctc.item(),
-                's2s': loss_s2s.item()}
+        loss_dict = {'loss': loss.item(),
+                     'ctc': loss_ctc.item(),
+                     's2s': loss_s2s.item()}
+        for name, aux_loss in aux_losses.items():
+            loss_dict[f'aux/{name}'] = aux_loss.item()
+        return loss_dict
 
     def _train_epoch(self):
         # switch dataloader if we're above configured epoch
@@ -249,15 +329,24 @@ class Trainer(object):
         eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
         for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
-            batch = [b.to(self.device) for b in batch]
-            text_input, text_input_length, mel_input, mel_input_length = batch
+            text_input, text_input_length, mel_input, mel_input_length, aux_targets = self._extract_batch(batch)
+            text_input = text_input.to(self.device)
+            text_input_length = text_input_length.to(self.device)
+            mel_input = mel_input.to(self.device)
+            mel_input_length = mel_input_length.to(self.device)
+            aux_targets = self._move_aux_to_device(aux_targets)
             mel_input_length = mel_input_length // (2 ** self.model.n_down)
             future_mask = self.model.get_future_mask(
                 mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
             mel_mask = self.model.length_to_mask(mel_input_length)
             text_mask = self.model.length_to_mask(text_input_length)
-            ppgs, s2s_pred, s2s_attn = self.model(
+            model_outputs = self.model(
                 mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+            if isinstance(model_outputs, tuple) and len(model_outputs) == 4:
+                ppgs, s2s_pred, s2s_attn, aux_outputs = model_outputs
+            else:
+                ppgs, s2s_pred, s2s_attn = model_outputs
+                aux_outputs = None
             loss_ctc = self.criterion['ctc'](ppgs.log_softmax(dim=2).transpose(0, 1),
                                           text_input, mel_input_length, text_input_length)
             loss_s2s = 0
@@ -265,10 +354,32 @@ class Trainer(object):
                 loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
             loss_s2s /= text_input.size(0)
             loss = loss_ctc + loss_s2s
+            aux_losses = {}
+            if isinstance(aux_outputs, dict) and aux_targets:
+                if self._is_objective_enabled('frame_phoneme') and 'frame_phoneme' in aux_outputs and 'frame_phoneme' in aux_targets:
+                    logits = aux_outputs['frame_phoneme']
+                    targets = aux_targets['frame_phoneme']
+                    aux_losses['frame_phoneme'] = self.auxiliary_loss_fns['frame_phoneme'](
+                        logits.reshape(-1, logits.size(-1)), targets.reshape(-1))
+                if self._is_objective_enabled('speaker_embedding') and 'speaker_embedding' in aux_outputs and 'speaker_ids' in aux_targets:
+                    embeddings = aux_outputs['speaker_embedding']
+                    speaker_ids = aux_targets['speaker_ids']
+                    target_embeddings = self.model.get_speaker_reference_embeddings(speaker_ids)
+                    aux_losses['speaker_embedding'] = self.auxiliary_loss_fns['speaker_embedding'](embeddings, target_embeddings)
+                if self._is_objective_enabled('pronunciation_error') and 'pronunciation_error' in aux_outputs and 'pronunciation_error' in aux_targets:
+                    logits = aux_outputs['pronunciation_error']
+                    targets = aux_targets['pronunciation_error']
+                    aux_losses['pronunciation_error'] = self.auxiliary_loss_fns['pronunciation_error'](logits, targets)
+
+            for name, aux_loss in aux_losses.items():
+                weight = float(self.auxiliary_loss_weights.get(name, 1.0))
+                loss = loss + weight * aux_loss
 
             eval_losses["eval/ctc"].append(loss_ctc.item())
             eval_losses["eval/s2s"].append(loss_s2s.item())
             eval_losses["eval/loss"].append(loss.item())
+            for name, aux_loss in aux_losses.items():
+                eval_losses[f"eval/aux/{name}"].append(aux_loss.item())
 
             _, amax_ppgs = torch.max(ppgs, dim=2)
             wers = [calc_wer(target[:text_length],

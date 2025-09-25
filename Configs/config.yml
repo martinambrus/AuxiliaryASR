@@ -67,3 +67,22 @@ dataloader_params:
 loss_weights:
   ctc: 0.8
   s2s: 1.0
+
+auxiliary_objectives:
+  frame_phoneme:
+    enabled: false
+    weight: 0.2
+    num_classes: null  # defaults to the vocabulary size when null
+    label_source: "uniform_alignment"  # uniform_alignment|file
+    label_dir: ""  # used when label_source == "file"
+    label_extension: ".npy"
+  speaker_embedding:
+    enabled: false
+    weight: 0.1
+    embedding_dim: 128
+    num_speakers: null  # When null the trainer will infer it from the dataset if possible
+  pronunciation_error:
+    enabled: false
+    weight: 0.1
+    num_classes: 2
+    label_map_path: ""  # optional CSV/txt with `relative_path|label`

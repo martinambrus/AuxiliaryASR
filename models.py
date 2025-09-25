@@ -5,6 +5,15 @@ from torch.nn import TransformerEncoder
 import torch.nn.functional as F
 from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
 
+
+def _is_enabled(config, key):
+    if not config:
+        return False
+    objective_cfg = config.get(key, {})
+    if isinstance(objective_cfg, dict):
+        return bool(objective_cfg.get("enabled", False))
+    return bool(objective_cfg)
+
 def build_model(model_params={}, model_type='asr'):
     model = ASRCNN(**model_params)
     return model
@@ -18,10 +27,12 @@ class ASRCNN(nn.Module):
                  n_layers=6,
                  token_embedding_dim=256,
                  location_kernel_size=63,
+                 auxiliary_objectives=None,
     ):
         super().__init__()
         self.n_token = n_token
         self.n_down = 1
+        self.auxiliary_objectives = auxiliary_objectives or {}
         self.to_mfcc = MFCC()
         self.init_cnn = ConvNorm(input_dim//2, hidden_dim, kernel_size=7, padding=3, stride=2)
         self.cnns = nn.Sequential(
@@ -40,6 +51,40 @@ class ASRCNN(nn.Module):
             n_token=n_token,
             location_kernel_size=location_kernel_size)
 
+        frame_cfg = self.auxiliary_objectives.get("frame_phoneme", {})
+        if _is_enabled(self.auxiliary_objectives, "frame_phoneme"):
+            frame_num_classes = frame_cfg.get("num_classes") or n_token
+            self.frame_phoneme_head = LinearNorm(hidden_dim // 2, frame_num_classes)
+        else:
+            self.frame_phoneme_head = None
+
+        speaker_cfg = self.auxiliary_objectives.get("speaker_embedding", {})
+        if _is_enabled(self.auxiliary_objectives, "speaker_embedding"):
+            embedding_dim = int(speaker_cfg.get("embedding_dim", hidden_dim // 2))
+            num_speakers = int(speaker_cfg.get("num_speakers") or 1)
+            self.speaker_embedding_pool = nn.AdaptiveAvgPool1d(1)
+            self.speaker_embedding_head = nn.Sequential(
+                LinearNorm(hidden_dim // 2, hidden_dim // 2),
+                nn.ReLU(),
+                LinearNorm(hidden_dim // 2, embedding_dim),
+            )
+            self.speaker_reference_embeddings = nn.Parameter(torch.randn(num_speakers, embedding_dim))
+        else:
+            self.speaker_embedding_pool = None
+            self.speaker_embedding_head = None
+            self.register_parameter("speaker_reference_embeddings", None)
+
+        pron_cfg = self.auxiliary_objectives.get("pronunciation_error", {})
+        if _is_enabled(self.auxiliary_objectives, "pronunciation_error"):
+            pron_classes = int(pron_cfg.get("num_classes", 2))
+            self.pronunciation_error_head = nn.Sequential(
+                LinearNorm(hidden_dim // 2, hidden_dim // 2),
+                nn.ReLU(),
+                LinearNorm(hidden_dim // 2, pron_classes),
+            )
+        else:
+            self.pronunciation_error_head = None
+
     def forward(self, x, src_key_padding_mask=None, text_input=None):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
@@ -48,11 +93,25 @@ class ASRCNN(nn.Module):
         x = self.projection(x)
         x = x.transpose(1, 2)
         ctc_logit = self.ctc_linear(x)
+        aux_outputs = {}
+        if self.frame_phoneme_head is not None:
+            aux_outputs["frame_phoneme"] = self.frame_phoneme_head(x)
+        if self.speaker_embedding_head is not None:
+            pooled = self.speaker_embedding_pool(x.transpose(1, 2)).squeeze(-1)
+            aux_outputs["speaker_embedding"] = self.speaker_embedding_head(pooled)
+        if self.pronunciation_error_head is not None:
+            pooled = x.mean(dim=1)
+            aux_outputs["pronunciation_error"] = self.pronunciation_error_head(pooled)
+
+        if not aux_outputs:
+            aux_outputs = None
         if text_input is not None:
             _, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
-            return ctc_logit, s2s_logit, s2s_attn
+            return ctc_logit, s2s_logit, s2s_attn, aux_outputs
         else:
-            return ctc_logit
+            if aux_outputs is None:
+                return ctc_logit
+            return ctc_logit, aux_outputs
 
     def get_feature(self, x):
         x = self.to_mfcc(x)
@@ -83,6 +142,14 @@ class ASRCNN(nn.Module):
         index_tensor = torch.arange(out_length).unsqueeze(0).expand(out_length, -1)
         mask = torch.gt(index_tensor, index_tensor.T + unmask_future_steps)
         return mask
+
+    def get_speaker_reference_embeddings(self, speaker_ids):
+        if self.speaker_reference_embeddings is None:
+            raise RuntimeError("Speaker embedding head is not enabled")
+        speaker_ids = speaker_ids.to(self.speaker_reference_embeddings.device)
+        num_embeddings = self.speaker_reference_embeddings.size(0)
+        clipped_ids = speaker_ids.clamp_(min=0, max=num_embeddings - 1)
+        return self.speaker_reference_embeddings[clipped_ids]
 
 class ASRS2S(nn.Module):
     def __init__(self,

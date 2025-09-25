@@ -216,6 +216,8 @@ def main(config_path):
     train_path = cfg_get_nested( config, 'train_data', None)
     val_path = cfg_get_nested( config, 'val_data', None)
     enable_early_stopping = cfg_get_nested( config, 'enable_early_stopping', True)
+    auxiliary_objectives = cfg_get_nested(config, 'auxiliary_objectives', {}) or {}
+
     dataset_params = {
         'dict_path': cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'),
         'sr': cfg_get_nested( config, 'preprocess_params.sr', 24000),
@@ -224,7 +226,8 @@ def main(config_path):
             'win_length': 1024,
             'hop_length': 300
         }),
-        'mel_params': cfg_get_nested( config, 'preprocess_params.mel_params', { 'n_mels': 80 })
+        'mel_params': cfg_get_nested( config, 'preprocess_params.mel_params', { 'n_mels': 80 }),
+        'auxiliary_objectives': auxiliary_objectives,
     }
 
     dataset_additional_params = cfg_get_nested(config, 'dataset_params', {})
@@ -242,6 +245,18 @@ def main(config_path):
     train_entries, train_durations = prepare_data_list(raw_train_list, root_path="")
     val_entries, val_durations = prepare_data_list(raw_val_list, root_path="")
 
+    speaker_cfg = auxiliary_objectives.get('speaker_embedding') if isinstance(auxiliary_objectives, dict) else None
+    if speaker_cfg and speaker_cfg.get('enabled', False) and not speaker_cfg.get('num_speakers'):
+        unique_speakers = set()
+        for _, _, speaker in train_entries:
+            if speaker:
+                try:
+                    unique_speakers.add(int(speaker))
+                except ValueError:
+                    continue
+        if unique_speakers:
+            speaker_cfg['num_speakers'] = max(unique_speakers) + 1
+
     # sort data list by duration for consistent bucketing and batching
     # to reduce padding, improving both training stability and alignment accuracy
     train_list_sorted, _ = sort_data_list_by_duration(precomputed=(train_entries, train_durations))
@@ -252,10 +267,16 @@ def main(config_path):
     val_num_workers = int(dataloader_params.get('val_num_workers', 2))
     train_bucket_sampler_config = dataloader_params.get('train_bucket_sampler', {})
 
+    collate_aux_config = {
+        'auxiliary_objectives': auxiliary_objectives,
+        'include_auxiliary_targets': any(cfg.get('enabled', False) for cfg in auxiliary_objectives.values())
+    }
+
     sorted_train_dataloader = build_dataloader(train_list_sorted,
                                         batch_size=batch_size,
                                         num_workers=train_num_workers,
                                         dataset_config=dataset_params,
+                                        collate_config=collate_aux_config,
                                         device=device)
     shuffled_train_dataloader = build_dataloader(train_entries,
                                             batch_size=batch_size,
@@ -263,20 +284,23 @@ def main(config_path):
                                             dataset_config=dataset_params,
                                             device=device,
                                             lengths=train_durations,
-                                            bucket_sampler_config=train_bucket_sampler_config)
+                                            bucket_sampler_config=train_bucket_sampler_config,
+                                            collate_config=collate_aux_config)
 
     sorted_val_dataloader = build_dataloader(val_list_sorted,
                                       batch_size=batch_size,
                                       validation=True,
                                       num_workers=val_num_workers,
                                       device=device,
-                                      dataset_config=dataset_params)
+                                      dataset_config=dataset_params,
+                                      collate_config=collate_aux_config)
     shuffled_val_dataloader = build_dataloader(val_entries,
                                           batch_size=batch_size,
                                           validation=True,
                                           num_workers=val_num_workers,
                                           device=device,
-                                          dataset_config=dataset_params)
+                                          dataset_config=dataset_params,
+                                          collate_config=collate_aux_config)
 
     word_indexes = set(
         line.strip() for line in open(cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'))
@@ -297,6 +321,8 @@ def main(config_path):
 
     print("Using model parameters:", model_params)
 
+    model_params = dict(model_params)
+    model_params['auxiliary_objectives'] = auxiliary_objectives
     model = build_model(model_params=model_params)
 
     scheduler_params = {
@@ -325,6 +351,11 @@ def main(config_path):
     loss_weight_config = cfg_get_nested(config, 'loss_weights', {}) or {}
     ctc_weight = float(loss_weight_config.get('ctc', 1.0))
     s2s_weight = float(loss_weight_config.get('s2s', 1.0))
+    auxiliary_loss_weights = {
+        name: float(cfg.get('weight', 1.0))
+        for name, cfg in auxiliary_objectives.items()
+        if isinstance(cfg, dict) and cfg.get('enabled', False)
+    }
 
     trainer = Trainer(model=model,
                     criterion=criterion,
@@ -341,6 +372,8 @@ def main(config_path):
                     diagonal_attention_prior_weight=cfg_get_nested( config, 'diagonal_attention_prior_weight', 0.1),
                     ctc_weight=ctc_weight,
                     s2s_weight=s2s_weight,
+                    auxiliary_objectives=auxiliary_objectives,
+                    auxiliary_loss_weights=auxiliary_loss_weights,
                     )
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )
