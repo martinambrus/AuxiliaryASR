@@ -2,6 +2,7 @@ import csv
 import logging
 import os
 import re
+import unicodedata
 from collections import OrderedDict
 from pathlib import Path
 from typing import Iterable, Mapping, Optional, Sequence, Tuple
@@ -70,7 +71,7 @@ class TextCleaner:
             for token in tokens:
                 if not token and not self._keep_empty_tokens:
                     continue
-                symbol = self.mapper.map_token(token)
+                symbol = self.mapper.map_token(token, auto_extend=self._dynamic_vocabulary)
                 if symbol is None:
                     continue
                 index = self.word_index_dictionary.get(symbol)
@@ -260,8 +261,14 @@ class TextCleaner:
 
             if match is None:
                 match = char
+
+            end_index = index + len(match)
+            while end_index < length and unicodedata.combining(text[end_index]):
+                match += text[end_index]
+                end_index += 1
+
             tokens.append(match)
-            index += len(match)
+            index = end_index
 
         return tokens
 
@@ -326,7 +333,7 @@ def _collect_symbols_from_text(cleaner: TextCleaner, text: str) -> Iterable[str]
         for token in tokens:
             if not token and not cleaner._keep_empty_tokens:
                 continue
-            symbol = cleaner.mapper.map_token(token) if cleaner.mapper else token
+            symbol = cleaner.mapper.map_token(token, auto_extend=True) if cleaner.mapper else token
             if symbol is None:
                 continue
             yield symbol
@@ -385,6 +392,8 @@ def extend_token_map_from_metadata(
                                 if hasattr(cleaner, '_invalidate_segmenter_cache'):
                                     cleaner._invalidate_segmenter_cache()
                         working_map[symbol] = index
+                        if cleaner.mode == 'unified' and hasattr(cleaner, '_invalidate_segmenter_cache'):
+                            cleaner._invalidate_segmenter_cache()
                         if symbol not in seen_new:
                             new_symbols.append(symbol)
                             seen_new.add(symbol)

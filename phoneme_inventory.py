@@ -262,7 +262,7 @@ class UnifiedPhonemeMapper:
     # ------------------------------------------------------------------
     # token mapping API
     # ------------------------------------------------------------------
-    def map_token(self, token: str) -> Optional[str]:
+    def map_token(self, token: str, *, auto_extend: Optional[bool] = None) -> Optional[str]:
         if token in self.special_tokens:
             return token
         normalised = self._normalise_token(token)
@@ -274,14 +274,16 @@ class UnifiedPhonemeMapper:
             canonical = normalised
 
         if canonical is None:
-            return self._handle_missing_mapping(token)
+            if auto_extend is None:
+                auto_extend = self.allow_dynamic_extension
+            return self._handle_missing_mapping(token, auto_extend=bool(auto_extend))
 
         symbol = self._canonical_to_symbol(canonical)
         self._add_symbol(symbol)
         self.token_to_symbol[normalised] = symbol
         return symbol
 
-    def _handle_missing_mapping(self, token: str) -> Optional[str]:
+    def _handle_missing_mapping(self, token: str, *, auto_extend: bool = False) -> Optional[str]:
         behaviour = self.fallback_mode
         if behaviour == "error":
             raise KeyError(f"Token '{token}' has no mapping in the unified phoneme inventory")
@@ -290,7 +292,7 @@ class UnifiedPhonemeMapper:
             symbol = str(token)
             index = self.dictionary.get(symbol)
             if index is None:
-                if not self.allow_dynamic_extension:
+                if not (auto_extend or self.allow_dynamic_extension):
                     if token not in self.warned_tokens:
                         _LOGGER.warning(
                             "Encountered unmapped token '%s' but dynamic extension is disabled; falling back to default symbol '%s'.",
@@ -300,10 +302,27 @@ class UnifiedPhonemeMapper:
                         self.warned_tokens.add(token)
                     return self.default_symbol if self.default_symbol in self.dictionary else None
                 self._add_symbol(symbol)
+            elif auto_extend and symbol not in self.dictionary:
+                self._add_symbol(symbol)
+            return symbol
+
+        if auto_extend:
+            symbol = str(token)
+            if symbol not in self.dictionary:
+                self._add_symbol(symbol)
+            normalised = self._normalise_token(token)
+            self.token_to_symbol[normalised] = symbol
+            if token not in self.warned_tokens and behaviour != "silent":
+                _LOGGER.warning("Token '%s' was not found in the phoneme mapping. Automatically adding it to the vocabulary.", token)
+                self.warned_tokens.add(token)
             return symbol
 
         if token not in self.warned_tokens and behaviour != "silent":
-            _LOGGER.warning("Token '%s' was not found in the phoneme mapping. Using default symbol '%s'.", token, self.default_symbol)
+            _LOGGER.warning(
+                "Token '%s' was not found in the phoneme mapping. Using default symbol '%s'.",
+                token,
+                self.default_symbol,
+            )
             self.warned_tokens.add(token)
         if self.default_symbol in self.dictionary:
             return self.default_symbol
