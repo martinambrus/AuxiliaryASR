@@ -367,6 +367,10 @@ def main(config_path):
     if isinstance(intermediate_ctc_config, dict) and 'loss_weight' not in intermediate_ctc_config:
         intermediate_ctc_config = dict(intermediate_ctc_config)
         intermediate_ctc_config['loss_weight'] = float(loss_weight_config.get('intermediate_ctc', 0.0))
+    self_conditioned_ctc_config = stabilization_config.get('self_conditioned_ctc', {}) or {}
+    if isinstance(self_conditioned_ctc_config, dict) and 'loss_weight' not in self_conditioned_ctc_config:
+        self_conditioned_ctc_config = dict(self_conditioned_ctc_config)
+        self_conditioned_ctc_config['loss_weight'] = float(loss_weight_config.get('self_conditioned_ctc', 0.0))
 
     trainer = Trainer(model=model,
                     criterion=criterion,
@@ -390,7 +394,8 @@ def main(config_path):
                     enable_speaker=speaker_cfg.get('enabled', False),
                     enable_pronunciation_error=pron_cfg.get('enabled', False),
                     mixspeech_config=mixspeech_config,
-                    intermediate_ctc_config=intermediate_ctc_config
+                    intermediate_ctc_config=intermediate_ctc_config,
+                    self_conditioned_ctc_config=self_conditioned_ctc_config
                     )
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )

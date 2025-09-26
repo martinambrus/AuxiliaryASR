@@ -51,6 +51,16 @@ stabilization:
     alpha: 0.3
     prob: 0.5
     dominant_mix: true
+  self_conditioned_ctc:
+    enabled: false
+    layers:
+      - index: 2
+      - index: 4
+    conditioning_strategy: add  # options: add, concat
+    detach_conditioning: true
+    temperature: 1.0
+    predictor_dropout: 0.1
+    fusion_dropout: 0.1
   intermediate_ctc:
     enabled: true
     loss_weight: 0.3
@@ -104,3 +114,4 @@ loss_weights:
   speaker: 0.0
   pronunciation_error: 0.0
   intermediate_ctc: 0.0
+  self_conditioned_ctc: 0.0

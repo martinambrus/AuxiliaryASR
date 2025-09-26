@@ -48,7 +48,8 @@ class Trainer(object):
                  enable_speaker=False,
                  enable_pronunciation_error=False,
                  mixspeech_config=None,
-                 intermediate_ctc_config=None):
+                 intermediate_ctc_config=None,
+                 self_conditioned_ctc_config=None):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -90,6 +91,11 @@ class Trainer(object):
         self.intermediate_ctc_enabled = bool(ictc_cfg.get('enabled', False))
         self.intermediate_ctc_weight = float(ictc_cfg.get('loss_weight', 0.0))
         self.intermediate_ctc_layer_weights = self._parse_intermediate_layer_weights(ictc_cfg.get('layers'))
+
+        sctc_cfg = self_conditioned_ctc_config or {}
+        self.self_conditioned_ctc_enabled = bool(sctc_cfg.get('enabled', False))
+        self.self_conditioned_ctc_weight = float(sctc_cfg.get('loss_weight', 0.0))
+        self.self_conditioned_ctc_layer_weights = self._parse_intermediate_layer_weights(sctc_cfg.get('layers'))
 
     @staticmethod
     def _parse_intermediate_layer_weights(layers_config):
@@ -458,6 +464,25 @@ class Trainer(object):
 
             total_loss = total_loss + self.intermediate_ctc_weight * layer_losses
             losses['intermediate_ctc'] = layer_losses.item()
+
+        self_conditioned_outputs = model_outputs.get('self_conditioned_ctc_logits') or {}
+        if (
+            self.self_conditioned_ctc_enabled
+            and self.self_conditioned_ctc_weight > 0.0
+            and isinstance(self_conditioned_outputs, dict)
+            and self_conditioned_outputs
+        ):
+            sc_losses = torch.zeros(1, device=self.device)
+            for layer_key, logits in self_conditioned_outputs.items():
+                if not isinstance(logits, torch.Tensor):
+                    continue
+                sc_loss = self._compute_ctc_loss(logits, text_input, mel_input_length, text_input_length, mix_metadata)
+                weight = float(self.self_conditioned_ctc_layer_weights.get(str(layer_key), 1.0))
+                sc_losses = sc_losses + weight * sc_loss
+                losses[f'self_conditioned_ctc/layer_{layer_key}'] = sc_loss.item()
+
+            total_loss = total_loss + self.self_conditioned_ctc_weight * sc_losses
+            losses['self_conditioned_ctc'] = sc_losses.item()
 
         if self.enable_frame_classifier and self.frame_weight > 0:
             frame_logits = model_outputs.get('frame_phoneme_logits')
