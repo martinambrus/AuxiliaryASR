@@ -6,14 +6,12 @@ import time
 import math
 import random
 import numpy as np
-import random
 
 import torch
-from torch import nn
 import torch.nn.functional as F
 import torchaudio
 from torch.utils.data import DataLoader, Sampler
-from torchaudio import transforms as T
+from typing import Any, Dict, Optional
 
 from nltk.tokenize import word_tokenize
 #import phonemizer
@@ -40,25 +38,131 @@ DEFAULT_DICT_PATH = osp.join(osp.dirname(__file__), 'word_index_dict.txt')
 #global_phonemizer = phonemizer.backend.EspeakBackend(language='en-us', preserve_punctuation=True,  with_stress=True)
 
 
+def _to_int(value: Any) -> Optional[int]:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _to_float(value: Any) -> Optional[float]:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+class AdaptiveMaskingAxisConfig:
+    """Configuration for adaptive masking along a single spectrogram axis."""
+
+    def __init__(self, axis_name: str, global_enabled: bool, config: Optional[Dict[str, Any]] = None):
+        config = dict(config or {})
+        self.axis_name = axis_name
+        self._active = global_enabled and bool(config.get('enabled', True))
+        self.ratio = _to_float(config.get('ratio'))
+        self.min_ratio = _to_float(config.get('min_ratio'))
+        self.max_ratio = _to_float(config.get('max_ratio'))
+        self.min_masks = _to_int(config.get('min_masks'))
+        self.max_masks = _to_int(config.get('max_masks'))
+        self.min_width = _to_int(config.get('min_width'))
+        self.max_width = _to_int(config.get('max_width'))
+
+    def resolve_mask_count(self, base_count: int) -> int:
+        if not self._active:
+            return int(base_count)
+
+        count = int(base_count)
+        lower = self.min_masks if self.min_masks is not None else count
+        upper = self.max_masks if self.max_masks is not None else count
+        lower = max(0, lower)
+        upper = max(lower, upper)
+        if lower == upper:
+            return lower
+        return random.randint(lower, upper)
+
+    def resolve_mask_width(self, base_width: int, axis_length: int) -> int:
+        if axis_length <= 0:
+            return 0
+
+        width = int(base_width)
+        if self._active:
+            if self.ratio is not None:
+                width = int(round(axis_length * self.ratio))
+            if self.min_ratio is not None:
+                width = max(width, int(math.floor(axis_length * self.min_ratio)))
+            if self.max_ratio is not None:
+                width = min(width, int(math.ceil(axis_length * self.max_ratio)))
+            if self.min_width is not None:
+                width = max(width, self.min_width)
+            if self.max_width is not None:
+                width = min(width, self.max_width)
+
+        width = max(0, min(width, axis_length))
+        if axis_length > 0 and width == 0:
+            width = 1
+        return width
+
+
+class AdaptiveMaskingConfig:
+    """Helper class that normalises adaptive masking configuration."""
+
+    def __init__(self, config: Optional[Dict[str, Any]] = None):
+        config = dict(config or {})
+        self.enabled = bool(config.get('enabled', False))
+        time_cfg = self._merge_axis_config(config, 'time')
+        freq_cfg = self._merge_axis_config(config, 'freq')
+        self.time = AdaptiveMaskingAxisConfig('time', self.enabled, time_cfg)
+        self.freq = AdaptiveMaskingAxisConfig('freq', self.enabled, freq_cfg)
+
+    @staticmethod
+    def _merge_axis_config(config: Dict[str, Any], axis: str) -> Dict[str, Any]:
+        axis_config = dict(config.get(axis, {}))
+
+        legacy_keys = {
+            'ratio': f'{axis}_mask_ratio',
+            'max_ratio': f'{axis}_mask_max_ratio',
+            'min_ratio': f'{axis}_mask_min_ratio',
+            'min_masks': f'min_{axis}_masks',
+            'max_masks': f'max_{axis}_masks',
+            'min_width': f'min_{axis}_mask_width',
+            'max_width': f'max_{axis}_mask_width',
+        }
+
+        for target, legacy in legacy_keys.items():
+            if target not in axis_config and legacy in config:
+                axis_config[target] = config[legacy]
+
+        if 'enabled' not in axis_config and f'{axis}_enabled' in config:
+            axis_config['enabled'] = config[f'{axis}_enabled']
+
+        return axis_config
+
+
 class SpecAugment:
-    """Simple SpecAugment implementation for log-mel spectrograms."""
+    """SpecAugment implementation with optional adaptive masking."""
 
     def __init__(self,
-                 freq_mask_param=27,
-                 time_mask_param=40,
-                 num_freq_masks=2,
-                 num_time_masks=2,
-                 apply_prob=1.0):
+                 freq_mask_param: int = 27,
+                 time_mask_param: int = 40,
+                 num_freq_masks: int = 2,
+                 num_time_masks: int = 2,
+                 apply_prob: float = 1.0,
+                 enabled: bool = True,
+                 mask_value: float = 0.0,
+                 adaptive_masking: Optional[Dict[str, Any]] = None):
         self.freq_mask_param = int(freq_mask_param)
         self.time_mask_param = int(time_mask_param)
         self.num_freq_masks = int(num_freq_masks)
         self.num_time_masks = int(num_time_masks)
         self.apply_prob = float(apply_prob)
-
-        self._freq_mask = T.FrequencyMasking(freq_mask_param=self.freq_mask_param)
-        self._time_mask = T.TimeMasking(time_mask_param=self.time_mask_param)
+        self.enabled = bool(enabled)
+        self.mask_value = float(mask_value)
+        self.adaptive_masking = AdaptiveMaskingConfig(adaptive_masking)
 
     def __call__(self, mel_tensor: torch.Tensor) -> torch.Tensor:
+        if not self.enabled:
+            return mel_tensor
+
         if self.apply_prob < 1.0 and random.random() > self.apply_prob:
             return mel_tensor
 
@@ -69,16 +173,46 @@ class SpecAugment:
 
         augmented = mel_tensor.clone()
 
-        for _ in range(max(0, self.num_freq_masks)):
-            augmented = self._freq_mask(augmented)
+        freq_masks = self.adaptive_masking.freq.resolve_mask_count(self.num_freq_masks)
+        time_masks = self.adaptive_masking.time.resolve_mask_count(self.num_time_masks)
+        freq_width = self.adaptive_masking.freq.resolve_mask_width(self.freq_mask_param, augmented.size(-2))
+        time_width = self.adaptive_masking.time.resolve_mask_width(self.time_mask_param, augmented.size(-1))
 
-        for _ in range(max(0, self.num_time_masks)):
-            augmented = self._time_mask(augmented)
+        augmented = self._apply_mask_along_axis(augmented, axis=-2, max_width=freq_width, num_masks=freq_masks)
+        augmented = self._apply_mask_along_axis(augmented, axis=-1, max_width=time_width, num_masks=time_masks)
 
         if squeeze:
             augmented = augmented.squeeze(0)
 
         return augmented
+
+    def _apply_mask_along_axis(self, tensor: torch.Tensor, axis: int, max_width: int, num_masks: int) -> torch.Tensor:
+        if num_masks <= 0 or max_width <= 0:
+            return tensor
+
+        dim = tensor.size(axis)
+        if dim <= 0:
+            return tensor
+
+        max_width = max(0, min(max_width, dim))
+        if max_width == 0:
+            return tensor
+
+        for _ in range(num_masks):
+            width = random.randint(0, max_width)
+            if width == 0:
+                continue
+            start = random.randint(0, dim - width)
+            if axis == -1 or axis == tensor.dim() - 1:
+                tensor[..., start:start + width] = self.mask_value
+            elif axis == -2 or axis == tensor.dim() - 2:
+                tensor[..., start:start + width, :] = self.mask_value
+            else:
+                # Generic masking for arbitrary axes.
+                index = [slice(None)] * tensor.dim()
+                index[axis] = slice(start, start + width)
+                tensor[tuple(index)] = self.mask_value
+        return tensor
 
 
 class LengthAwareBatchSampler(Sampler):
@@ -173,10 +307,16 @@ class MelDataset(torch.utils.data.Dataset):
         self.spec_augment = None
         if spec_augment_params and not validation:
             try:
-                self.spec_augment = SpecAugment(**spec_augment_params)
-            except TypeError:
-                logger.warning(f"Invalid SpecAugment configuration: {spec_augment_params}. Skipping augmentation.")
-                self.spec_augment = None
+                enabled = spec_augment_params.get('enabled', True)
+            except AttributeError:
+                enabled = True
+
+            if enabled:
+                try:
+                    self.spec_augment = SpecAugment(**spec_augment_params)
+                except TypeError:
+                    logger.warning(f"Invalid SpecAugment configuration: {spec_augment_params}. Skipping augmentation.")
+                    self.spec_augment = None
 
         # https://github.com/yl4579/StyleTTS/issues/57
         self.mean, self.std = -4, 4

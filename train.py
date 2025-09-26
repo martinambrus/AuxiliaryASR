@@ -234,7 +234,7 @@ def main(config_path):
                 dataset_params[override_key] = dataset_additional_params[override_key]
 
         spec_augment_config = dataset_additional_params.get('spec_augment')
-        if spec_augment_config:
+        if isinstance(spec_augment_config, dict) and spec_augment_config.get('enabled', True):
             dataset_params['spec_augment_params'] = spec_augment_config
 
     raw_train_list, raw_val_list = get_data_path_list(train_path, val_path)
