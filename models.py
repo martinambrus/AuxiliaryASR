@@ -62,6 +62,77 @@ class IntermediateCTCHead(nn.Module):
         logits = self.layers(x)
         return logits.transpose(1, 2)
 
+
+class SelfConditionedCTCBlock(nn.Module):
+    """Predicts self-conditioned CTC distributions and feeds them back to the encoder."""
+
+    def __init__(
+        self,
+        hidden_dim: int,
+        n_token: int,
+        strategy: str = "add",
+        detach_conditioning: bool = True,
+        temperature: float = 1.0,
+        predictor_dropout: float = 0.1,
+        fusion_dropout: float = 0.1,
+    ) -> None:
+        super().__init__()
+        self.strategy = str(strategy).lower()
+        if self.strategy not in {"add", "concat"}:
+            raise ValueError(f"Unsupported self-conditioned strategy: {self.strategy}")
+
+        self.detach_conditioning = bool(detach_conditioning)
+        self.temperature = max(1e-5, float(temperature))
+
+        projection_dim = max(1, hidden_dim // 2)
+        self.predictor = nn.Sequential(
+            ConvNorm(hidden_dim, hidden_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Dropout(predictor_dropout),
+            ConvNorm(hidden_dim, projection_dim, kernel_size=1),
+            nn.GELU(),
+            nn.Dropout(predictor_dropout),
+            ConvNorm(projection_dim, n_token, kernel_size=1),
+        )
+
+        self.condition_projector = nn.Sequential(
+            nn.Dropout(predictor_dropout),
+            ConvNorm(n_token, hidden_dim, kernel_size=1),
+        )
+
+        if self.strategy == "concat":
+            self.fusion = nn.Sequential(
+                nn.Dropout(fusion_dropout),
+                ConvNorm(hidden_dim * 2, hidden_dim, kernel_size=1),
+                nn.GELU(),
+            )
+        else:
+            self.fusion = None
+
+    def forward(self, features: torch.Tensor) -> Dict[str, torch.Tensor]:
+        """Return conditioned features along with logits and log-probabilities."""
+
+        logits = self.predictor(features)
+        scaled_logits = logits / self.temperature
+        log_probs = F.log_softmax(scaled_logits, dim=1)
+        probs = log_probs.exp()
+
+        conditioning_source = probs.detach() if self.detach_conditioning else probs
+        conditioning = self.condition_projector(conditioning_source)
+
+        if self.strategy == "concat" and self.fusion is not None:
+            fused = torch.cat([features, conditioning], dim=1)
+            conditioned_features = self.fusion(fused)
+        else:
+            conditioned_features = features + conditioning
+
+        return {
+            "features": conditioned_features,
+            "logits": logits.transpose(1, 2),
+            "log_probs": log_probs.transpose(1, 2),
+        }
+
+
 def build_model(model_params={}, model_type='asr'):
     model = ASRCNN(**model_params)
     return model
@@ -106,6 +177,25 @@ class ASRCNN(nn.Module):
             })
         else:
             self.intermediate_ctc_heads = nn.ModuleDict()
+
+        sctc_cfg = self.stabilization_config.get('self_conditioned_ctc', {}) or {}
+        self.enable_self_conditioned_ctc = bool(sctc_cfg.get('enabled', False))
+        self.self_conditioning_layers = self._parse_intermediate_layers(sctc_cfg.get('layers'), n_layers)
+        if self.enable_self_conditioned_ctc and self.self_conditioning_layers:
+            self.self_conditioning_blocks = nn.ModuleDict({
+                str(layer_idx): SelfConditionedCTCBlock(
+                    hidden_dim=hidden_dim,
+                    n_token=n_token,
+                    strategy=sctc_cfg.get('conditioning_strategy', 'add'),
+                    detach_conditioning=sctc_cfg.get('detach_conditioning', True),
+                    temperature=sctc_cfg.get('temperature', 1.0),
+                    predictor_dropout=sctc_cfg.get('predictor_dropout', 0.1),
+                    fusion_dropout=sctc_cfg.get('fusion_dropout', 0.1),
+                )
+                for layer_idx in self.self_conditioning_layers
+            })
+        else:
+            self.self_conditioning_blocks = nn.ModuleDict()
 
         self.projection = ConvNorm(hidden_dim, hidden_dim // 2)
         self.multi_task_config = multi_task_config or {}
@@ -222,11 +312,18 @@ class ASRCNN(nn.Module):
         x = self.to_mfcc(x)
         x = self.init_cnn(x)
         intermediate_outputs: Dict[str, torch.Tensor] = {}
+        self_conditioned_outputs: Dict[str, torch.Tensor] = {}
+        self_conditioned_log_probs: Dict[str, torch.Tensor] = {}
         for layer_idx, layer in enumerate(self.encoder_layers, start=1):
             x = layer(x)
             key = str(layer_idx)
             if key in self.intermediate_ctc_heads:
                 intermediate_outputs[key] = self.intermediate_ctc_heads[key](x)
+            if key in self.self_conditioning_blocks:
+                conditioning = self.self_conditioning_blocks[key](x)
+                x = conditioning["features"]
+                self_conditioned_outputs[key] = conditioning["logits"]
+                self_conditioned_log_probs[key] = conditioning["log_probs"]
 
         x = self.projection(x)
         x = x.transpose(1, 2)
@@ -234,6 +331,10 @@ class ASRCNN(nn.Module):
 
         if intermediate_outputs:
             outputs["intermediate_ctc_logits"] = intermediate_outputs
+
+        if self_conditioned_outputs:
+            outputs["self_conditioned_ctc_logits"] = self_conditioned_outputs
+            outputs["self_conditioned_ctc_log_probs"] = self_conditioned_log_probs
 
         if self.use_ctc and self.ctc_linear is not None:
             ctc_logit = self.ctc_linear(x)

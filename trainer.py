@@ -48,7 +48,9 @@ class Trainer(object):
                  enable_speaker=False,
                  enable_pronunciation_error=False,
                  mixspeech_config=None,
-                 intermediate_ctc_config=None):
+                 intermediate_ctc_config=None,
+                 self_conditioned_ctc_config=None,
+                 steps_per_epoch=None):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -71,6 +73,7 @@ class Trainer(object):
         self.use_diagonal_attention_prior = use_diagonal_attention_prior
         self.diagonal_attention_prior_weight = diagonal_attention_prior_weight
         self.maxm_mem_usage = 0
+        self.steps_per_epoch = steps_per_epoch if steps_per_epoch is None else int(steps_per_epoch)
         self.ctc_weight = ctc_weight
         self.s2s_weight = s2s_weight
         self.frame_weight = frame_weight
@@ -90,6 +93,26 @@ class Trainer(object):
         self.intermediate_ctc_enabled = bool(ictc_cfg.get('enabled', False))
         self.intermediate_ctc_weight = float(ictc_cfg.get('loss_weight', 0.0))
         self.intermediate_ctc_layer_weights = self._parse_intermediate_layer_weights(ictc_cfg.get('layers'))
+
+        sctc_cfg = self_conditioned_ctc_config or {}
+        self.self_conditioned_ctc_enabled = bool(sctc_cfg.get('enabled', False))
+        self.self_conditioned_ctc_weight = float(sctc_cfg.get('loss_weight', 0.0))
+        self.self_conditioned_ctc_layer_weights = self._parse_intermediate_layer_weights(sctc_cfg.get('layers'))
+
+        self._resumed_from_checkpoint = bool(initial_epochs)
+        self._scheduler_aligned = False
+        self._sortagrad_active = bool(
+            self.sorted_train_dataloader
+            and self.shuffled_train_dataloader
+            and self.switch_sortagrad_dataset_epoch is not None
+            and self.switch_sortagrad_dataset_epoch > 0
+        )
+
+        if not self._sortagrad_active:
+            if self.shuffled_train_dataloader is not None:
+                self.train_dataloader = self.shuffled_train_dataloader
+            if self.shuffled_val_dataloader is not None:
+                self.val_dataloader = self.shuffled_val_dataloader
 
     @staticmethod
     def _parse_intermediate_layer_weights(layers_config):
@@ -118,6 +141,97 @@ class Trainer(object):
                 continue
 
         return weights
+
+    def _switch_to_shuffled(self, reason=None):
+        if self.shuffled_train_dataloader is None:
+            return
+
+        self.train_dataloader = self.shuffled_train_dataloader
+        if self.shuffled_val_dataloader is not None:
+            self.val_dataloader = self.shuffled_val_dataloader
+
+        if self._sortagrad_active:
+            if reason:
+                self.logger.info("")
+                self.logger.info(reason)
+                self.logger.info("")
+            else:
+                self.logger.info("")
+                self.logger.info("[SortaGrad]: switching sorted to shuffled dataloader at configured epoch %i" % self.epochs)
+                self.logger.info("")
+
+        self._sortagrad_active = False
+
+    def handle_sortagrad_after_resume(self):
+        if not self._sortagrad_active:
+            return
+
+        if self.switch_sortagrad_dataset_epoch is None:
+            self._switch_to_shuffled("[SortaGrad]: resuming with shuffled dataloader (no switch epoch configured)")
+            return
+
+        if self.switch_sortagrad_dataset_epoch <= 0 or self.epochs >= self.switch_sortagrad_dataset_epoch:
+            self._switch_to_shuffled(
+                "[SortaGrad]: resuming from epoch %i, switching to shuffled dataloader immediately" % self.epochs
+            )
+
+    def sync_scheduler_to_progress(self):
+        if self._scheduler_aligned:
+            return
+
+        if not self._resumed_from_checkpoint:
+            return
+
+        if self.scheduler is None or self.steps_per_epoch is None or self.steps_per_epoch <= 0:
+            return
+
+        completed_steps = int(self.epochs * self.steps_per_epoch)
+        if completed_steps <= 0:
+            return
+
+        target_step = completed_steps - 1
+        if target_step < 0:
+            return
+
+        total_steps = getattr(self.scheduler, 'total_steps', None)
+        if isinstance(total_steps, int) and total_steps > 0:
+            target_step = min(target_step, max(total_steps - 1, 0))
+
+        if hasattr(self.scheduler, '_step_count'):
+            self.scheduler._step_count = max(target_step, 1)
+
+        if hasattr(self.optimizer, '_step_count'):
+            self.optimizer._step_count = max(getattr(self.optimizer, '_step_count', 0), target_step + 1)
+
+        try:
+            self.scheduler.step(target_step)
+        except TypeError:
+            if hasattr(self.scheduler, 'last_epoch'):
+                self.scheduler.last_epoch = target_step
+            if hasattr(self.scheduler, '_get_lr_called_within_step'):
+                previous_flag = self.scheduler._get_lr_called_within_step
+                self.scheduler._get_lr_called_within_step = True
+            else:
+                previous_flag = None
+
+            try:
+                lrs = self.scheduler.get_lr()
+            finally:
+                if previous_flag is not None:
+                    self.scheduler._get_lr_called_within_step = previous_flag
+
+            if hasattr(self.scheduler, '_last_lr'):
+                self.scheduler._last_lr = lrs
+            for param_group, lr in zip(self.optimizer.param_groups, lrs):
+                param_group['lr'] = lr
+
+        self._scheduler_aligned = True
+        if self.logger:
+            self.logger.info("")
+            self.logger.info(
+                "[Scheduler]: resumed from epoch %i, skipping warm-up by advancing to step %i" % (self.epochs, target_step)
+            )
+            self.logger.info("")
 
     def save_checkpoint(self, checkpoint_path):
         """Save checkpoint.
@@ -157,6 +271,11 @@ class Trainer(object):
             # overwrite schedular argument parameters
             state_dict["scheduler"].update(**self.config.get("scheduler_params", {}))
             self.scheduler.load_state_dict(state_dict["scheduler"])
+
+        if not load_only_params:
+            self._resumed_from_checkpoint = True
+            self.handle_sortagrad_after_resume()
+            self.sync_scheduler_to_progress()
 
         return self.epochs
 
@@ -459,6 +578,25 @@ class Trainer(object):
             total_loss = total_loss + self.intermediate_ctc_weight * layer_losses
             losses['intermediate_ctc'] = layer_losses.item()
 
+        self_conditioned_outputs = model_outputs.get('self_conditioned_ctc_logits') or {}
+        if (
+            self.self_conditioned_ctc_enabled
+            and self.self_conditioned_ctc_weight > 0.0
+            and isinstance(self_conditioned_outputs, dict)
+            and self_conditioned_outputs
+        ):
+            sc_losses = torch.zeros(1, device=self.device)
+            for layer_key, logits in self_conditioned_outputs.items():
+                if not isinstance(logits, torch.Tensor):
+                    continue
+                sc_loss = self._compute_ctc_loss(logits, text_input, mel_input_length, text_input_length, mix_metadata)
+                weight = float(self.self_conditioned_ctc_layer_weights.get(str(layer_key), 1.0))
+                sc_losses = sc_losses + weight * sc_loss
+                losses[f'self_conditioned_ctc/layer_{layer_key}'] = sc_loss.item()
+
+            total_loss = total_loss + self.self_conditioned_ctc_weight * sc_losses
+            losses['self_conditioned_ctc'] = sc_losses.item()
+
         if self.enable_frame_classifier and self.frame_weight > 0:
             frame_logits = model_outputs.get('frame_phoneme_logits')
             if frame_logits is not None:
@@ -520,13 +658,17 @@ class Trainer(object):
         return losses
 
     def _train_epoch(self):
-        # switch dataloader if we're above configured epoch
-        if ( self.epochs == self.switch_sortagrad_dataset_epoch) or ( self.epochs == 0 and self.switch_sortagrad_dataset_epoch <= 0 ) :
-            self.train_dataloader = self.shuffled_train_dataloader
-            self.val_dataloader = self.shuffled_val_dataloader
-            self.logger.info("")
-            self.logger.info("[SortaGrad]: switching sorted to shuffled dataloader at configured epoch %i" % self.epochs)
-            self.logger.info("")
+        if self._sortagrad_active:
+            should_switch_now = False
+            if self.switch_sortagrad_dataset_epoch is None:
+                should_switch_now = True
+            elif self.switch_sortagrad_dataset_epoch <= 0 and self.epochs == 0:
+                should_switch_now = True
+            elif self.epochs == self.switch_sortagrad_dataset_epoch:
+                should_switch_now = True
+
+            if should_switch_now:
+                self._switch_to_shuffled(None)
 
         train_losses = defaultdict(list)
         self.model.train()
@@ -605,6 +747,56 @@ class Trainer(object):
                 total_eval_loss = total_eval_loss + self.ctc_weight * loss_ctc
             if self.s2s_weight > 0:
                 total_eval_loss = total_eval_loss + self.s2s_weight * loss_s2s
+
+            intermediate_outputs = model_outputs.get('intermediate_ctc_logits') or {}
+            if (
+                self.intermediate_ctc_enabled
+                and self.intermediate_ctc_weight > 0.0
+                and isinstance(intermediate_outputs, dict)
+                and intermediate_outputs
+            ):
+                layer_losses = torch.zeros(1, device=self.device)
+                for layer_key, logits in intermediate_outputs.items():
+                    if not isinstance(logits, torch.Tensor):
+                        continue
+                    layer_loss = self._compute_ctc_loss(
+                        logits,
+                        text_input,
+                        mel_input_length,
+                        text_input_length,
+                        mix_metadata=None,
+                    )
+                    weight = float(self.intermediate_ctc_layer_weights.get(str(layer_key), 1.0))
+                    layer_losses = layer_losses + weight * layer_loss
+                    eval_losses[f'eval/intermediate_ctc/layer_{layer_key}'].append(layer_loss.item())
+
+                total_eval_loss = total_eval_loss + self.intermediate_ctc_weight * layer_losses
+                eval_losses['eval/intermediate_ctc'].append(layer_losses.item())
+
+            self_conditioned_outputs = model_outputs.get('self_conditioned_ctc_logits') or {}
+            if (
+                self.self_conditioned_ctc_enabled
+                and self.self_conditioned_ctc_weight > 0.0
+                and isinstance(self_conditioned_outputs, dict)
+                and self_conditioned_outputs
+            ):
+                sc_losses = torch.zeros(1, device=self.device)
+                for layer_key, logits in self_conditioned_outputs.items():
+                    if not isinstance(logits, torch.Tensor):
+                        continue
+                    sc_loss = self._compute_ctc_loss(
+                        logits,
+                        text_input,
+                        mel_input_length,
+                        text_input_length,
+                        mix_metadata=None,
+                    )
+                    weight = float(self.self_conditioned_ctc_layer_weights.get(str(layer_key), 1.0))
+                    sc_losses = sc_losses + weight * sc_loss
+                    eval_losses[f'eval/self_conditioned_ctc/layer_{layer_key}'].append(sc_loss.item())
+
+                total_eval_loss = total_eval_loss + self.self_conditioned_ctc_weight * sc_losses
+                eval_losses['eval/self_conditioned_ctc'].append(sc_losses.item())
 
             if self.enable_frame_classifier and self.frame_weight > 0:
                 frame_logits = model_outputs.get('frame_phoneme_logits')
