@@ -351,6 +351,8 @@ def main(config_path):
         early_stopping = None
 
     loss_weight_config = cfg_get_nested(config, 'loss_weights', {}) or {}
+    regularization_config = cfg_get_nested(config, 'regularization', {}) or {}
+    entropy_regularization_config = cfg_get_nested(regularization_config, 'entropy', {}) or {}
     use_ctc = bool(multi_task_config.get('use_ctc', True))
     use_s2s = bool(multi_task_config.get('use_seq2seq', True))
     frame_cfg = multi_task_config.get('frame_phoneme', {}) or {}
@@ -399,6 +401,7 @@ def main(config_path):
                     mixspeech_config=mixspeech_config,
                     intermediate_ctc_config=intermediate_ctc_config,
                     self_conditioned_ctc_config=self_conditioned_ctc_config,
+                    entropy_regularization_config=entropy_regularization_config,
                     steps_per_epoch=steps_per_epoch
                     )
 

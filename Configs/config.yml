@@ -126,6 +126,24 @@ loss_weights:
   # Weight applied to the auxiliary loss from the self-conditioned CTC predictor.
   self_conditioned_ctc: 0.0
 
+regularization:
+  entropy:
+    enabled: false
+    # Choose whether to minimise (sharpen) or maximise (smooth) the model's output distributions.
+    mode: minimize  # options: minimize, maximize
+    # Numerical stability constant added inside the log operation.
+    eps: 1.0e-6
+    targets:
+      # Entropy penalties can be enabled independently for each prediction head.
+      ctc:
+        enabled: true
+        weight: 0.0
+        length_normalize: true
+      s2s:
+        enabled: true
+        weight: 0.0
+        length_normalize: true
+
 decoding:
   beam_search:
     enabled: true

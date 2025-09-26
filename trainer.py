@@ -50,6 +50,7 @@ class Trainer(object):
                  mixspeech_config=None,
                  intermediate_ctc_config=None,
                  self_conditioned_ctc_config=None,
+                 entropy_regularization_config=None,
                  steps_per_epoch=None):
 
         self.steps = initial_steps
@@ -99,6 +100,16 @@ class Trainer(object):
         self.self_conditioned_ctc_weight = float(sctc_cfg.get('loss_weight', 0.0))
         self.self_conditioned_ctc_layer_weights = self._parse_intermediate_layer_weights(sctc_cfg.get('layers'))
 
+        entropy_cfg = entropy_regularization_config or {}
+        self.entropy_regularization_enabled = bool(entropy_cfg.get('enabled', False))
+        mode = str(entropy_cfg.get('mode', 'minimize')).lower()
+        if mode not in ('minimize', 'maximize'):
+            mode = 'minimize'
+        self.entropy_regularization_mode = mode
+        self.entropy_regularization_eps = float(entropy_cfg.get('eps', 1.0e-6))
+        targets_cfg = entropy_cfg.get('targets', {}) if isinstance(entropy_cfg, dict) else {}
+        self.entropy_regularization_targets = self._parse_entropy_regularization_targets(targets_cfg, entropy_cfg)
+
         self._resumed_from_checkpoint = bool(initial_epochs)
         self._scheduler_aligned = False
         self._sortagrad_active = bool(
@@ -141,6 +152,103 @@ class Trainer(object):
                 continue
 
         return weights
+
+    @staticmethod
+    def _parse_entropy_regularization_targets(targets_config, root_config):
+        supported = ('ctc', 's2s')
+        parsed = {}
+        for key in supported:
+            cfg = {}
+            if isinstance(targets_config, dict):
+                raw = targets_config.get(key, {})
+            else:
+                raw = {}
+            if isinstance(raw, bool):
+                cfg['enabled'] = raw
+            elif isinstance(raw, (int, float)):
+                cfg['weight'] = float(raw)
+            elif isinstance(raw, dict):
+                cfg.update(raw)
+            weight = float(cfg.get('weight', root_config.get(f'{key}_weight', 0.0) if isinstance(root_config, dict) else 0.0))
+            enabled = cfg.get('enabled', None)
+            if enabled is None:
+                enabled = bool(weight)
+            parsed[key] = {
+                'enabled': bool(enabled),
+                'weight': weight,
+                'length_normalize': bool(cfg.get('length_normalize', True)),
+                'reduction': str(cfg.get('reduction', 'mean')).lower(),
+            }
+        return parsed
+
+    def _entropy_target_config(self, key):
+        if not self.entropy_regularization_enabled:
+            return None
+        cfg = self.entropy_regularization_targets.get(key, {})
+        if not cfg.get('enabled', False):
+            return None
+        weight = float(cfg.get('weight', 0.0))
+        if weight == 0.0:
+            return None
+        return cfg
+
+    def _compute_entropy_regularization(self, logits, lengths=None, key='ctc'):
+        cfg = self._entropy_target_config(key)
+        if cfg is None:
+            return None
+
+        logits = logits.float()
+        probs = torch.softmax(logits, dim=-1)
+        eps = max(self.entropy_regularization_eps, 0.0)
+        if eps > 0.0:
+            probs = probs.clamp_min(eps)
+            probs = probs / probs.sum(dim=-1, keepdim=True)
+        log_probs = torch.log(probs)
+        entropy = -(probs * log_probs).sum(dim=-1)
+
+        if lengths is not None:
+            if lengths.dim() == 1:
+                max_steps = entropy.size(1)
+                mask = torch.arange(max_steps, device=entropy.device).unsqueeze(0)
+                mask = mask < lengths.unsqueeze(1)
+            else:
+                mask = lengths
+                if mask.dim() < entropy.dim():
+                    mask = mask.unsqueeze(-1)
+            mask = mask.to(entropy.dtype)
+            entropy = entropy * mask
+            if cfg.get('length_normalize', True):
+                reduce_dims = tuple(range(1, entropy.dim()))
+                denom = mask.sum(dim=reduce_dims)
+                denom = denom.clamp_min(1.0)
+                entropy = entropy.sum(dim=reduce_dims) / denom
+            else:
+                entropy = entropy.sum(dim=tuple(range(1, entropy.dim())))
+        else:
+            entropy = entropy.mean(dim=tuple(range(1, entropy.dim())))
+
+        reduction = cfg.get('reduction', 'mean')
+        if reduction == 'sum':
+            entropy_value = entropy.sum()
+        elif reduction == 'none':
+            entropy_value = entropy
+        else:
+            entropy_value = entropy.mean()
+
+        if self.entropy_regularization_mode == 'maximize':
+            entropy_value = -entropy_value
+
+        if isinstance(entropy_value, torch.Tensor) and entropy_value.dim() > 0:
+            entropy_value = entropy_value.mean()
+
+        reg_weight = float(cfg.get('weight', 0.0))
+        reg_loss = entropy_value * reg_weight
+        if not torch.is_tensor(reg_loss):
+            reg_loss = torch.tensor(reg_loss, device=logits.device, dtype=logits.dtype)
+        else:
+            reg_loss = reg_loss.to(device=logits.device, dtype=logits.dtype)
+
+        return reg_loss
 
     def _switch_to_shuffled(self, reason=None):
         if self.shuffled_train_dataloader is None:
@@ -559,6 +667,18 @@ class Trainer(object):
         else:
             loss_s2s = torch.zeros(1, device=self.device)
 
+        if self.entropy_regularization_enabled:
+            if ppgs is not None:
+                entropy_ctc = self._compute_entropy_regularization(ppgs, lengths=mel_input_length, key='ctc')
+                if entropy_ctc is not None:
+                    total_loss = total_loss + entropy_ctc
+                    losses['entropy/ctc'] = entropy_ctc.item() if torch.is_tensor(entropy_ctc) else float(entropy_ctc)
+            if s2s_pred is not None:
+                entropy_s2s = self._compute_entropy_regularization(s2s_pred, lengths=text_input_length, key='s2s')
+                if entropy_s2s is not None:
+                    total_loss = total_loss + entropy_s2s
+                    losses['entropy/s2s'] = entropy_s2s.item() if torch.is_tensor(entropy_s2s) else float(entropy_s2s)
+
         intermediate_outputs = model_outputs.get('intermediate_ctc_logits') or {}
         if (
             self.intermediate_ctc_enabled
@@ -747,6 +867,18 @@ class Trainer(object):
                 total_eval_loss = total_eval_loss + self.ctc_weight * loss_ctc
             if self.s2s_weight > 0:
                 total_eval_loss = total_eval_loss + self.s2s_weight * loss_s2s
+
+            if self.entropy_regularization_enabled:
+                if ppgs is not None:
+                    entropy_ctc = self._compute_entropy_regularization(ppgs, lengths=mel_input_length, key='ctc')
+                    if entropy_ctc is not None:
+                        total_eval_loss = total_eval_loss + entropy_ctc
+                        eval_losses['eval/entropy_ctc'].append(entropy_ctc.item())
+                if s2s_pred is not None:
+                    entropy_s2s = self._compute_entropy_regularization(s2s_pred, lengths=text_input_length, key='s2s')
+                    if entropy_s2s is not None:
+                        total_eval_loss = total_eval_loss + entropy_s2s
+                        eval_losses['eval/entropy_s2s'].append(entropy_s2s.item())
 
             intermediate_outputs = model_outputs.get('intermediate_ctc_logits') or {}
             if (
