@@ -52,14 +52,21 @@ stabilization:
     prob: 0.5
     dominant_mix: true
   self_conditioned_ctc:
+    # Enables the self-conditioned CTC feedback block inside the encoder.
     enabled: false
+    # List encoder layer indices that should consume the CTC feedback signal.
     layers:
       - index: 2
       - index: 4
+    # How the feedback logits are fused with the encoder hidden states.
     conditioning_strategy: add  # options: add, concat
+    # Whether to stop gradients from flowing from the conditioned layers back into the CTC predictor.
     detach_conditioning: true
+    # Temperature applied to the softmax before forming the conditioning distribution.
     temperature: 1.0
+    # Dropout rate used on the CTC predictor head that produces the feedback signal.
     predictor_dropout: 0.1
+    # Dropout rate applied to the fused representation inside the encoder layer.
     fusion_dropout: 0.1
   intermediate_ctc:
     enabled: true
@@ -114,4 +121,5 @@ loss_weights:
   speaker: 0.0
   pronunciation_error: 0.0
   intermediate_ctc: 0.0
+  # Weight applied to the auxiliary loss from the self-conditioned CTC predictor.
   self_conditioned_ctc: 0.0
