@@ -10,7 +10,7 @@ val_data: "Data/val_list.txt"
 ood_data: "Data/OOD_texts.txt"
 phoneme_maps_path: "Data/word_index_dict.txt"
 
-preprocess_parasm:
+preprocess_params:
   sr: 24000
   spect_params:
     n_fft: 1024
