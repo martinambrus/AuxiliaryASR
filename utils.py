@@ -5,6 +5,7 @@ import time
 from collections import defaultdict
 
 import matplotlib
+matplotlib.use("Agg")
 import numpy as np
 import soundfile as sf
 import torch
