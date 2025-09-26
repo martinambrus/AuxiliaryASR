@@ -142,7 +142,7 @@ decoding:
     smoothing: 1.0
     lm_weight: 0.3
   cold_fusion:
-    enabled: false
+    enabled: true
     fusion_weight: 0.4
     gate_bias: 0.0
     gate_scale: 1.0
