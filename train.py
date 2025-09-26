@@ -351,6 +351,8 @@ def main(config_path):
         early_stopping = None
 
     loss_weight_config = cfg_get_nested(config, 'loss_weights', {}) or {}
+    sequence_objectives = cfg_get_nested(config, 'sequence_objectives', {}) or {}
+    mwer_config = sequence_objectives.get('mwer', {}) or {}
     use_ctc = bool(multi_task_config.get('use_ctc', True))
     use_s2s = bool(multi_task_config.get('use_seq2seq', True))
     frame_cfg = multi_task_config.get('frame_phoneme', {}) or {}
@@ -362,6 +364,7 @@ def main(config_path):
     frame_weight = float(loss_weight_config.get('frame_phoneme', 0.0)) if frame_cfg.get('enabled', False) else 0.0
     speaker_weight = float(loss_weight_config.get('speaker', 0.0)) if speaker_cfg.get('enabled', False) else 0.0
     pron_weight = float(loss_weight_config.get('pronunciation_error', 0.0)) if pron_cfg.get('enabled', False) else 0.0
+    mwer_weight = float(loss_weight_config.get('mwer', 0.0)) if mwer_config.get('enabled', False) else 0.0
     mixspeech_config = stabilization_config.get('mix_speech', {}) or {}
     intermediate_ctc_config = stabilization_config.get('intermediate_ctc', {}) or {}
     if isinstance(intermediate_ctc_config, dict) and 'loss_weight' not in intermediate_ctc_config:
@@ -399,6 +402,8 @@ def main(config_path):
                     mixspeech_config=mixspeech_config,
                     intermediate_ctc_config=intermediate_ctc_config,
                     self_conditioned_ctc_config=self_conditioned_ctc_config,
+                    mwer_config=mwer_config,
+                    mwer_weight=mwer_weight,
                     steps_per_epoch=steps_per_epoch
                     )
 

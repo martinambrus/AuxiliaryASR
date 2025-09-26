@@ -40,6 +40,15 @@ multi_task:
     enabled: false
     num_classes: 2  # set to the number of pronunciation error categories your dataset annotates
 
+sequence_objectives:
+  mwer:
+    enabled: false
+    num_samples: 4
+    ignore_indexes:
+      - 0
+      - -1
+    length_normalize: false
+
 stabilization:
   stochastic_depth:
     enabled: false
@@ -125,6 +134,7 @@ loss_weights:
   intermediate_ctc: 0.0
   # Weight applied to the auxiliary loss from the self-conditioned CTC predictor.
   self_conditioned_ctc: 0.0
+  mwer: 0.0
 
 decoding:
   beam_search:

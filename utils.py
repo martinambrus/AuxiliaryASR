@@ -74,6 +74,9 @@ def calc_wer(target, pred, ignore_indexes=[0]):
     return error
 
 def drop_duplicated(chars):
+    if not chars:
+        return []
+
     ret_chars = [chars[0]]
     for prev, curr in zip(chars[:-1], chars[1:]):
         if prev != curr:

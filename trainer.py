@@ -15,7 +15,7 @@ from tqdm import tqdm
 from utils import calc_wer
 
 import logging
-from torch.distributions import Beta
+from torch.distributions import Beta, Categorical
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 
@@ -50,6 +50,8 @@ class Trainer(object):
                  mixspeech_config=None,
                  intermediate_ctc_config=None,
                  self_conditioned_ctc_config=None,
+                 mwer_config=None,
+                 mwer_weight=0.0,
                  steps_per_epoch=None):
 
         self.steps = initial_steps
@@ -82,6 +84,16 @@ class Trainer(object):
         self.enable_frame_classifier = enable_frame_classifier
         self.enable_speaker = enable_speaker
         self.enable_pronunciation_error = enable_pronunciation_error
+
+        self.mwer_config = mwer_config or {}
+        self.mwer_enabled = bool(self.mwer_config.get('enabled', False))
+        self.mwer_weight = float(mwer_weight) if self.mwer_enabled else 0.0
+        self.mwer_num_samples = int(self.mwer_config.get('num_samples', 4))
+        self.mwer_length_normalize = bool(self.mwer_config.get('length_normalize', False))
+        ignore_indexes = self.mwer_config.get('ignore_indexes', [0, -1])
+        if isinstance(ignore_indexes, (int, float, str)):
+            ignore_indexes = [ignore_indexes]
+        self.mwer_ignore_indexes = list(ignore_indexes)
 
         self.mixspeech_config = mixspeech_config or {}
         self.mixspeech_enabled = bool(self.mixspeech_config.get('enabled', False))
@@ -476,6 +488,69 @@ class Trainer(object):
 
         return total_loss.mean()
 
+    def _compute_mwer_loss(self, logits, targets, target_lengths):
+        if logits is None:
+            return torch.zeros(1, device=self.device), {}
+
+        if self.mwer_num_samples <= 0:
+            return torch.zeros(1, device=self.device), {}
+
+        log_probs = torch.log_softmax(logits, dim=-1)
+        batch_size = log_probs.size(0)
+
+        total_loss = logits.new_zeros(())
+        total_wer = 0.0
+        valid_sequences = 0
+
+        for batch_idx in range(batch_size):
+            target_len = int(target_lengths[batch_idx].item())
+            if target_len <= 0:
+                continue
+
+            step_log_probs = log_probs[batch_idx, :target_len]
+            if step_log_probs.numel() == 0:
+                continue
+
+            dist = Categorical(logits=step_log_probs)
+            samples = dist.sample((self.mwer_num_samples,))
+
+            expanded = step_log_probs.unsqueeze(0).expand(self.mwer_num_samples, -1, -1)
+            token_log_probs = torch.gather(expanded, 2, samples.unsqueeze(-1)).squeeze(-1)
+            seq_log_probs = token_log_probs.sum(dim=1)
+            if self.mwer_length_normalize:
+                seq_log_probs = seq_log_probs / max(1, target_len)
+
+            target_seq = targets[batch_idx, :target_len].detach().cpu()
+            wers = []
+            for sample in samples:
+                wers.append(
+                    calc_wer(
+                        target_seq,
+                        sample.detach().cpu(),
+                        ignore_indexes=self.mwer_ignore_indexes,
+                    )
+                )
+
+            wers_tensor = step_log_probs.new_tensor(wers)
+            baseline = wers_tensor.mean()
+            advantages = wers_tensor - baseline
+
+            # Detach the reward term to avoid gradients flowing through the WER estimate
+            total_loss = total_loss + torch.sum(advantages.detach() * seq_log_probs) / max(1, self.mwer_num_samples)
+            total_wer += float(baseline.item())
+            valid_sequences += 1
+
+        if valid_sequences == 0:
+            return logits.new_zeros(()), {}
+
+        total_loss = total_loss / max(1, valid_sequences)
+        average_wer = total_wer / max(1, valid_sequences)
+
+        if torch.isnan(total_loss):
+            total_loss = logits.new_zeros(())
+
+        return total_loss, {"sample_mean_wer": average_wer, "num_samples": float(self.mwer_num_samples)}
+
     def run(self, batch):
         # FIX: trying to fix OOM errors
         #torch.cuda.empty_cache()
@@ -558,6 +633,22 @@ class Trainer(object):
             losses['s2s'] = loss_s2s.item()
         else:
             loss_s2s = torch.zeros(1, device=self.device)
+
+        if (
+            self.mwer_enabled
+            and self.mwer_weight > 0.0
+            and isinstance(s2s_pred, torch.Tensor)
+            and self.mwer_num_samples > 0
+        ):
+            loss_mwer, stats_mwer = self._compute_mwer_loss(
+                s2s_pred,
+                text_input,
+                text_input_length,
+            )
+            total_loss = total_loss + self.mwer_weight * loss_mwer
+            losses['mwer'] = loss_mwer.item()
+            for key, value in stats_mwer.items():
+                losses[f'mwer/{key}'] = float(value)
 
         intermediate_outputs = model_outputs.get('intermediate_ctc_logits') or {}
         if (
