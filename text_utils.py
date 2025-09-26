@@ -46,6 +46,8 @@ class TextCleaner:
         )
 
         if self.mode == 'unified':
+            self._segment_symbol_buckets = None
+            self._segment_max_symbol_length = 0
             self._init_unified_mapper(word_index_dict_path)
         else:
             dict_path = self.config.get('dict_path', word_index_dict_path)
@@ -126,11 +128,13 @@ class TextCleaner:
         # to keep the mapping consistent across datasets.
         self.word_index_dictionary = self.mapper.dictionary
         self.inverse_mapping = self.mapper.inverse_dictionary
-        self._tokenization_config.setdefault('type', 'whitespace')
+        self._tokenization_config.setdefault('type', 'phoneme')
         self._dynamic_vocabulary = allow_dynamic
 
     def _tokenize(self, text: str) -> list:
         token_type = str(self._tokenization_config.get('type', 'whitespace')).lower()
+        if token_type == 'phoneme':
+            return self._tokenize_phonemes(text)
         if token_type == 'regex':
             pattern = self._tokenization_config.get('pattern', r'\S+')
             tokens = re.findall(pattern, text)
@@ -162,8 +166,104 @@ class TextCleaner:
             index = len(self.word_index_dictionary)
             self.word_index_dictionary[symbol] = index
             self.inverse_mapping[index] = symbol
+            if self.mode == 'unified':
+                self._invalidate_segmenter_cache()
             return index
         return self.word_index_dictionary[symbol]
+
+    def _invalidate_segmenter_cache(self) -> None:
+        """Reset cached segmentation helpers used for phoneme tokenization."""
+
+        self._segment_symbol_buckets = None
+        self._segment_max_symbol_length = 0
+
+    def _prepare_segmenter_symbols(self) -> None:
+        """Compute lookup tables used to segment IPA/X-SAMPA strings."""
+
+        if self._segment_symbol_buckets is not None:
+            return
+
+        symbols = set()
+        for symbol in self.word_index_dictionary:
+            if not symbol:
+                continue
+            if symbol in self.special_tokens:
+                continue
+            if symbol.isspace():
+                continue
+            symbols.add(symbol)
+
+        # Include explicitly registered mapping tokens as they may not be part
+        # of the base dictionary when ``include_all_inventory_symbols`` is
+        # disabled.
+        if self.mapper is not None:
+            for token in self.mapper.token_to_canonical:
+                if token and not token.isspace():
+                    symbols.add(token)
+
+        buckets = {}
+        max_length = 0
+        for symbol in symbols:
+            length = len(symbol)
+            if length == 0:
+                continue
+            max_length = max(max_length, length)
+            buckets.setdefault(length, set()).add(symbol)
+
+        self._segment_symbol_buckets = buckets
+        self._segment_max_symbol_length = max_length
+
+    def _tokenize_phonemes(self, text: str) -> list:
+        """Split a transcription into phoneme-sized tokens.
+
+        The segmentation favours the longest known symbol from the mapper's
+        inventory to preserve multi-character phonemes such as diphthongs or
+        affricates. Characters that are unknown to the mapper are yielded as
+        single-character tokens so they can be added to the vocabulary later.
+        """
+
+        if not text:
+            return []
+
+        # Build lookup tables lazily to keep initialisation costs low.
+        self._prepare_segmenter_symbols()
+
+        if not self._segment_symbol_buckets:
+            # Fall back to character level tokenisation when the mapper does
+            # not expose any known symbols yet.
+            return [char for char in text if char or self._keep_empty_tokens]
+
+        tokens = []
+        length = len(text)
+        index = 0
+        max_symbol_length = self._segment_max_symbol_length or 1
+
+        while index < length:
+            char = text[index]
+            if char.isspace():
+                if self._keep_empty_tokens:
+                    tokens.append('')
+                index += 1
+                continue
+
+            remaining = length - index
+            match = None
+            max_span = min(max_symbol_length, remaining)
+            for span in range(max_span, 0, -1):
+                bucket = self._segment_symbol_buckets.get(span)
+                if not bucket:
+                    continue
+                candidate = text[index:index + span]
+                if candidate in bucket:
+                    match = candidate
+                    break
+
+            if match is None:
+                match = char
+            tokens.append(match)
+            index += len(match)
+
+        return tokens
 
     # ------------------------------------------------------------------
     # legacy helpers
@@ -273,6 +373,8 @@ def extend_token_map_from_metadata(
                                 index = len(cleaner.word_index_dictionary)
                                 cleaner.word_index_dictionary[symbol] = index
                                 cleaner.inverse_mapping[index] = symbol
+                                if hasattr(cleaner, '_invalidate_segmenter_cache'):
+                                    cleaner._invalidate_segmenter_cache()
                             index = cleaner.word_index_dictionary[symbol]
                         else:
                             index = cleaner.word_index_dictionary.get(symbol)
@@ -280,6 +382,8 @@ def extend_token_map_from_metadata(
                                 index = len(cleaner.word_index_dictionary)
                                 cleaner.word_index_dictionary[symbol] = index
                                 cleaner.inverse_mapping[index] = symbol
+                                if hasattr(cleaner, '_invalidate_segmenter_cache'):
+                                    cleaner._invalidate_segmenter_cache()
                         working_map[symbol] = index
                         if symbol not in seen_new:
                             new_symbols.append(symbol)

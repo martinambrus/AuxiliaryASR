@@ -32,7 +32,7 @@ phoneme_settings:
     default_symbol: "<unk>"
     allow_identity: true
   tokenization:
-    type: whitespace
+    type: phoneme
 
 preprocess_parasm:
   sr: 24000
