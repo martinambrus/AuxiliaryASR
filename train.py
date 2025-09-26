@@ -3,6 +3,7 @@ from optimizers import build_optimizer
 from utils import *
 from models import build_model
 from trainer import Trainer
+from distillation import prepare_distillation_config
 
 import os
 import os.path as osp
@@ -239,6 +240,9 @@ def main(config_path):
 
     raw_train_list, raw_val_list = get_data_path_list(train_path, val_path)
 
+    distillation_config = prepare_distillation_config(cfg_get_nested(config, 'distillation', {}))
+    dataset_params['distillation'] = distillation_config
+
     train_entries, train_durations = prepare_data_list(raw_train_list, root_path="")
     val_entries, val_durations = prepare_data_list(raw_val_list, root_path="")
 
@@ -252,7 +256,10 @@ def main(config_path):
     val_num_workers = int(dataloader_params.get('val_num_workers', 2))
     train_bucket_sampler_config = dataloader_params.get('train_bucket_sampler', {})
 
-    collate_config = {'return_speaker_ids': True}
+    collate_config = {
+        'return_speaker_ids': True,
+        'return_distillation': bool(distillation_config.enabled and distillation_config.teachers),
+    }
 
     sorted_train_dataloader = build_dataloader(train_list_sorted,
                                         batch_size=batch_size,
@@ -402,6 +409,7 @@ def main(config_path):
                     intermediate_ctc_config=intermediate_ctc_config,
                     self_conditioned_ctc_config=self_conditioned_ctc_config,
                     entropy_regularization_config=entropy_regularization_config,
+                    distillation_config=distillation_config,
                     steps_per_epoch=steps_per_epoch
                     )
 

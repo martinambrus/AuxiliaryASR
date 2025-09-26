@@ -22,6 +22,7 @@ import logging
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
 from text_utils import TextCleaner
+from distillation import DistillationConfig, TeacherLogitsLoader, prepare_distillation_config
 np.random.seed(1)
 random.seed(1)
 DEFAULT_DICT_PATH = osp.join(osp.dirname(__file__), 'word_index_dict.txt')
@@ -159,7 +160,8 @@ class MelDataset(torch.utils.data.Dataset):
                      "n_mels": 80
                  },
                  spec_augment_params=None,
-                 validation=False
+                 validation=False,
+                 distillation=None,
                 ):
 
         self.data_list = data_list
@@ -180,6 +182,14 @@ class MelDataset(torch.utils.data.Dataset):
 
         # https://github.com/yl4579/StyleTTS/issues/57
         self.mean, self.std = -4, 4
+
+        if isinstance(distillation, dict):
+            distillation = prepare_distillation_config(distillation)
+        if isinstance(distillation, DistillationConfig):
+            self.distillation_loader = TeacherLogitsLoader(distillation)
+        else:
+            self.distillation_loader = TeacherLogitsLoader(DistillationConfig(enabled=False))
+        self.distillation_enabled = self.distillation_loader.enabled
 
     def __len__(self):
         return len(self.data_list)
@@ -206,7 +216,15 @@ class MelDataset(torch.utils.data.Dataset):
             length_feature = acoustic_feature.size(1)
             acoustic_feature = acoustic_feature[:, :(length_feature - length_feature % 2)]
 
-            return wave_tensor, acoustic_feature, text_tensor, speaker_id
+            distillation_targets = None
+            if self.distillation_enabled:
+                distillation_targets = self._load_distillation_targets(
+                    wave_path,
+                    mel_frames=acoustic_feature.size(1),
+                    text_tokens=text_tensor.size(0),
+                )
+
+            return wave_tensor, acoustic_feature, text_tensor, speaker_id, distillation_targets
         except Exception as e:
             try:
                 wave_path, text, speaker_id = data
@@ -217,6 +235,18 @@ class MelDataset(torch.utils.data.Dataset):
             # Fallback to another index to keep training going
             new_idx = (idx + 1) % len(self.data_list)
             return self.__getitem__(new_idx)
+
+    def _load_distillation_targets(self, wave_path, mel_frames=None, text_tokens=None):
+        try:
+            targets = self.distillation_loader.fetch(
+                wave_path,
+                mel_frames=mel_frames,
+                text_tokens=text_tokens,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            logger.warning("Failed to fetch distillation targets for %s: %s", wave_path, exc)
+            targets = None
+        return targets
 
     def _load_tensor(self, data):
         wave_path, text, speaker_id = data
@@ -282,10 +312,11 @@ class Collater(object):
       return_wave (bool): if true, will return the wave data along with spectrogram. 
     """
 
-    def __init__(self, return_wave=False, return_speaker_ids=False):
+    def __init__(self, return_wave=False, return_speaker_ids=False, return_distillation=False):
         self.text_pad_index = 0
         self.return_wave = return_wave
         self.return_speaker_ids = return_speaker_ids
+        self.return_distillation = return_distillation
 
     def __call__(self, batch):
         batch_size = len(batch)
@@ -304,7 +335,14 @@ class Collater(object):
         input_lengths = torch.zeros(batch_size).long()
         output_lengths = torch.zeros(batch_size).long()
         speaker_ids = torch.zeros(batch_size).long()
-        for bid, (_, mel, text, speaker_id) in enumerate(batch):
+        distillation_batch = []
+
+        for bid, sample in enumerate(batch):
+            wave = sample[0]
+            mel = sample[1]
+            text = sample[2]
+            speaker_id = sample[3]
+            distillation_entry = sample[4] if len(sample) > 4 else None
             mel_size = mel.size(1)
             text_size = text.size(0)
             mels[bid, :, :mel_size] = mel
@@ -313,11 +351,16 @@ class Collater(object):
             output_lengths[bid] = mel_size
             speaker_ids[bid] = int(speaker_id)
             assert(text_size < (mel_size//2))
+            if self.return_distillation:
+                distillation_batch.append(distillation_entry)
 
         outputs = [texts, input_lengths, mels, output_lengths]
 
         if self.return_speaker_ids:
             outputs.append(speaker_ids)
+
+        if self.return_distillation:
+            outputs.append(distillation_batch)
 
         if self.return_wave:
             waves = [b[0] for b in batch]

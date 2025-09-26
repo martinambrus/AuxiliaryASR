@@ -126,6 +126,25 @@ loss_weights:
   # Weight applied to the auxiliary loss from the self-conditioned CTC predictor.
   self_conditioned_ctc: 0.0
 
+distillation:
+  enabled: false
+  temperature: 1.0
+  loss_weight: 1.0
+  strict_loading: false
+  missing_strategy: skip  # options: skip, warn, error
+  targets:
+    ctc:
+      enabled: true
+      weight: 1.0
+    s2s:
+      enabled: true
+      weight: 1.0
+    attention:
+      enabled: false
+      weight: 1.0
+      loss: kl  # options: kl, mse
+  teachers: []  # Populate with teacher definitions containing storage path and key mappings.
+
 regularization:
   entropy:
     enabled: false

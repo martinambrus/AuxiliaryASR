@@ -9,10 +9,12 @@ from collections import defaultdict
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
 from utils import calc_wer
+from distillation import DistillationConfig, EnsembleDistillationHelper, prepare_distillation_config
 
 import logging
 from torch.distributions import Beta
@@ -51,6 +53,7 @@ class Trainer(object):
                  intermediate_ctc_config=None,
                  self_conditioned_ctc_config=None,
                  entropy_regularization_config=None,
+                 distillation_config=None,
                  steps_per_epoch=None):
 
         self.steps = initial_steps
@@ -109,6 +112,15 @@ class Trainer(object):
         self.entropy_regularization_eps = float(entropy_cfg.get('eps', 1.0e-6))
         targets_cfg = entropy_cfg.get('targets', {}) if isinstance(entropy_cfg, dict) else {}
         self.entropy_regularization_targets = self._parse_entropy_regularization_targets(targets_cfg, entropy_cfg)
+
+        if isinstance(distillation_config, dict):
+            distillation_config = prepare_distillation_config(distillation_config)
+        elif not isinstance(distillation_config, DistillationConfig):
+            distillation_config = prepare_distillation_config(None)
+
+        self.distillation_config = distillation_config
+        self.distillation_helper = EnsembleDistillationHelper(distillation_config, self.device)
+        self.expect_distillation = bool(distillation_config.enabled and distillation_config.teachers)
 
         self._resumed_from_checkpoint = bool(initial_epochs)
         self._scheduler_aligned = False
@@ -597,11 +609,24 @@ class Trainer(object):
         batch = processed_batch
 
         text_input, text_input_length, mel_input, mel_input_length = batch[:4]
-        if len(batch) > 4:
-            speaker_ids = batch[4]
-        else:
-            speaker_ids = torch.zeros(text_input.size(0), device=self.device, dtype=torch.long)
-        speaker_ids = speaker_ids.long()
+
+        batch_size = text_input.size(0)
+        speaker_ids = torch.zeros(batch_size, device=self.device, dtype=torch.long)
+        distillation_targets = None
+
+        extra_index = 4
+        if len(batch) > extra_index and isinstance(batch[extra_index], torch.Tensor) and batch[extra_index].dtype == torch.long:
+            speaker_ids = batch[extra_index].long()
+            extra_index += 1
+
+        if self.expect_distillation and len(batch) > extra_index:
+            candidate = batch[extra_index]
+            if isinstance(candidate, (list, tuple)):
+                distillation_targets = list(candidate)
+                extra_index += 1
+
+        if distillation_targets is None and self.expect_distillation:
+            distillation_targets = [None for _ in range(batch_size)]
 
         mix_metadata = None
         if self.mixspeech_enabled and self.model.training:
@@ -760,6 +785,18 @@ class Trainer(object):
         else:
             pron_loss = torch.zeros(1, device=self.device)
 
+        if self.distillation_config.enabled:
+            distill_loss, distill_logs = self.distillation_helper.compute_losses(
+                model_outputs,
+                distillation_targets,
+                mel_input_length,
+                text_input_length,
+            )
+            if distill_loss is not None:
+                total_loss = total_loss + distill_loss
+                for key, value in distill_logs.items():
+                    losses[key] = value
+
         if self.use_diagonal_attention_prior and s2s_attn is not None:
             loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, mel_input_length)
             total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
@@ -825,10 +862,23 @@ class Trainer(object):
             batch = processed_batch
 
             text_input, text_input_length, mel_input, mel_input_length = batch[:4]
-            if len(batch) > 4:
-                speaker_ids = batch[4].long()
-            else:
-                speaker_ids = torch.zeros(text_input.size(0), device=self.device, dtype=torch.long)
+            batch_size = text_input.size(0)
+            speaker_ids = torch.zeros(batch_size, device=self.device, dtype=torch.long)
+            distillation_targets = None
+
+            extra_index = 4
+            if len(batch) > extra_index and isinstance(batch[extra_index], torch.Tensor) and batch[extra_index].dtype == torch.long:
+                speaker_ids = batch[extra_index].long()
+                extra_index += 1
+
+            if self.expect_distillation and len(batch) > extra_index:
+                candidate = batch[extra_index]
+                if isinstance(candidate, (list, tuple)):
+                    distillation_targets = list(candidate)
+                    extra_index += 1
+
+            if distillation_targets is None and self.expect_distillation:
+                distillation_targets = [None for _ in range(batch_size)]
             mel_input_length = mel_input_length // (2 ** self.model.n_down)
             future_mask = self.model.get_future_mask(
                 mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
@@ -960,6 +1010,18 @@ class Trainer(object):
                     pron_pred = torch.argmax(pron_logits, dim=2)
                     pron_acc = self._sequence_accuracy(pron_pred, pron_targets)
                     eval_losses['eval/pronunciation_error_acc'].append(pron_acc)
+
+            if self.distillation_config.enabled:
+                distill_loss, distill_logs = self.distillation_helper.compute_losses(
+                    model_outputs,
+                    distillation_targets,
+                    mel_input_length,
+                    text_input_length,
+                )
+                if distill_loss is not None:
+                    total_eval_loss = total_eval_loss + distill_loss
+                    for key, value in distill_logs.items():
+                        eval_losses[f'eval/{key}'].append(value)
 
             eval_losses["eval/loss"].append(total_eval_loss.item())
 
