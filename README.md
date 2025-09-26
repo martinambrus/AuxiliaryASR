@@ -43,10 +43,17 @@ Fine-tuning on very small corpora (a few hours of speech or less) tends to overf
 dataset_params:
   spec_augment:
     apply_prob: 0.5    # probability of applying SpecAugment on a batch
-    freq_mask_param: 13
-    time_mask_param: 50
-    num_freq_masks: 2
-    num_time_masks: 2
+    frequency_masking:
+      enabled: true
+      freq_mask_param: 13
+      num_masks: 2
+    time_masking:
+      enabled: true
+      time_mask_param: 50
+      num_masks: 2
+    time_warp:
+      enabled: false   # set to true to activate the new time-warp stage
+      time_warp_param: 5
 
 loss_weights:
   ctc: 0.8             # reduce to 0.5-0.7 for extremely small datasets

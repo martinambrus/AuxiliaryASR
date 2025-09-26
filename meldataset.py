@@ -44,19 +44,91 @@ class SpecAugment:
     """Simple SpecAugment implementation for log-mel spectrograms."""
 
     def __init__(self,
-                 freq_mask_param=27,
-                 time_mask_param=40,
-                 num_freq_masks=2,
-                 num_time_masks=2,
-                 apply_prob=1.0):
-        self.freq_mask_param = int(freq_mask_param)
-        self.time_mask_param = int(time_mask_param)
-        self.num_freq_masks = int(num_freq_masks)
-        self.num_time_masks = int(num_time_masks)
+                 apply_prob=1.0,
+                 frequency_masking=None,
+                 time_masking=None,
+                 time_warp=None,
+                 **legacy_kwargs):
         self.apply_prob = float(apply_prob)
 
-        self._freq_mask = T.FrequencyMasking(freq_mask_param=self.freq_mask_param)
-        self._time_mask = T.TimeMasking(time_mask_param=self.time_mask_param)
+        legacy_freq_param = legacy_kwargs.pop('freq_mask_param', None)
+        legacy_num_freq_masks = legacy_kwargs.pop('num_freq_masks', None)
+        legacy_time_param = legacy_kwargs.pop('time_mask_param', None)
+        legacy_num_time_masks = legacy_kwargs.pop('num_time_masks', None)
+        legacy_time_warp_param = legacy_kwargs.pop('time_warp_param', None)
+
+        if legacy_kwargs:
+            raise TypeError(f"Unsupported SpecAugment parameters: {list(legacy_kwargs.keys())}")
+
+        if legacy_freq_param is not None or legacy_num_freq_masks is not None:
+            frequency_masking = dict(frequency_masking or {})
+            frequency_masking.setdefault('enabled', True)
+            if legacy_freq_param is not None:
+                frequency_masking.setdefault('freq_mask_param', legacy_freq_param)
+            if legacy_num_freq_masks is not None:
+                frequency_masking.setdefault('num_masks', legacy_num_freq_masks)
+
+        if legacy_time_param is not None or legacy_num_time_masks is not None:
+            time_masking = dict(time_masking or {})
+            time_masking.setdefault('enabled', True)
+            if legacy_time_param is not None:
+                time_masking.setdefault('time_mask_param', legacy_time_param)
+            if legacy_num_time_masks is not None:
+                time_masking.setdefault('num_masks', legacy_num_time_masks)
+
+        if legacy_time_warp_param is not None:
+            time_warp = dict(time_warp or {})
+            time_warp.setdefault('enabled', True)
+            time_warp.setdefault('time_warp_param', legacy_time_warp_param)
+
+        if frequency_masking is None:
+            frequency_masking = {
+                'enabled': True,
+                'freq_mask_param': 27,
+                'num_masks': 2,
+            }
+
+        if time_masking is None:
+            time_masking = {
+                'enabled': True,
+                'time_mask_param': 40,
+                'num_masks': 2,
+            }
+
+        if time_warp is None:
+            time_warp = {
+                'enabled': False,
+                'time_warp_param': 5,
+            }
+
+        freq_cfg = dict(frequency_masking)
+        time_cfg = dict(time_masking)
+        warp_cfg = dict(time_warp)
+
+        self.freq_mask_enabled = bool(freq_cfg.get('enabled', bool(frequency_masking)))
+        self.freq_mask_param = int(freq_cfg.get('freq_mask_param', freq_cfg.get('mask_param', 27)))
+        self.num_freq_masks = int(freq_cfg.get('num_masks', freq_cfg.get('num_freq_masks', 2)))
+        if self.freq_mask_param <= 0 or self.num_freq_masks <= 0:
+            self.freq_mask_enabled = False
+
+        self.time_mask_enabled = bool(time_cfg.get('enabled', bool(time_masking)))
+        self.time_mask_param = int(time_cfg.get('time_mask_param', time_cfg.get('mask_param', 40)))
+        self.num_time_masks = int(time_cfg.get('num_masks', time_cfg.get('num_time_masks', 2)))
+        if self.time_mask_param <= 0 or self.num_time_masks <= 0:
+            self.time_mask_enabled = False
+
+        self.time_warp_enabled = bool(warp_cfg.get('enabled', bool(time_warp)))
+        self.time_warp_param = int(warp_cfg.get('time_warp_param', warp_cfg.get('param', 5)))
+        if self.time_warp_param <= 0:
+            self.time_warp_enabled = False
+
+        self._freq_mask = None
+        if self.freq_mask_enabled:
+            self._freq_mask = T.FrequencyMasking(freq_mask_param=max(1, self.freq_mask_param))
+
+        self._time_mask = None
+        if self.time_mask_enabled:
+            self._time_mask = T.TimeMasking(time_mask_param=max(1, self.time_mask_param))
 
     def __call__(self, mel_tensor: torch.Tensor) -> torch.Tensor:
         if self.apply_prob < 1.0 and random.random() > self.apply_prob:
@@ -69,16 +141,123 @@ class SpecAugment:
 
         augmented = mel_tensor.clone()
 
-        for _ in range(max(0, self.num_freq_masks)):
-            augmented = self._freq_mask(augmented)
+        if self.time_warp_enabled:
+            augmented = self._apply_time_warp(augmented)
 
-        for _ in range(max(0, self.num_time_masks)):
-            augmented = self._time_mask(augmented)
+        if self.freq_mask_enabled and self._freq_mask is not None:
+            for _ in range(max(0, self.num_freq_masks)):
+                augmented = self._freq_mask(augmented)
+
+        if self.time_mask_enabled and self._time_mask is not None:
+            for _ in range(max(0, self.num_time_masks)):
+                augmented = self._time_mask(augmented)
 
         if squeeze:
             augmented = augmented.squeeze(0)
 
         return augmented
+
+    def _apply_time_warp(self, mel_batch: torch.Tensor) -> torch.Tensor:
+        if mel_batch.dim() != 3:
+            return mel_batch
+
+        warped = mel_batch.clone()
+        batch, _, _ = warped.shape
+        for idx in range(batch):
+            warped[idx] = self._time_warp_single(warped[idx])
+        return warped
+
+    def _time_warp_single(self, spec: torch.Tensor) -> torch.Tensor:
+        if spec.dim() != 2:
+            return spec
+
+        num_mels, num_steps = spec.shape
+        if num_steps < 2:
+            return spec
+
+        max_warp = min(self.time_warp_param, num_steps // 2)
+        if max_warp < 1:
+            return spec
+
+        low = max_warp
+        high = num_steps - max_warp - 1
+        if low > high:
+            return spec
+        if low == high:
+            center = low
+        else:
+            center = random.randint(low, high)
+        min_target = max(1, center - max_warp)
+        max_target = min(num_steps - 2, center + max_warp)
+
+        if min_target >= max_target:
+            return spec
+
+        new_center = random.randint(min_target, max_target)
+        if new_center == center:
+            return spec
+
+        grid = self._build_time_warp_grid(num_mels, num_steps, center, new_center, spec.device, spec.dtype)
+        warped = F.grid_sample(
+            spec.unsqueeze(0).unsqueeze(0),
+            grid,
+            mode='bilinear',
+            padding_mode='border',
+            align_corners=True,
+        )
+        return warped.squeeze(0).squeeze(0)
+
+    @staticmethod
+    def _build_time_warp_grid(num_mels, num_steps, center, new_center, device, dtype):
+        if new_center <= 0 or new_center >= num_steps - 1:
+            return SpecAugment._identity_grid(num_mels, num_steps, device, dtype)
+
+        t_max = num_steps - 1
+        if center <= 0 or center >= t_max:
+            return SpecAugment._identity_grid(num_mels, num_steps, device, dtype)
+
+        left_scale = center / new_center
+        right_scale_den = (t_max - new_center)
+        if right_scale_den == 0:
+            return SpecAugment._identity_grid(num_mels, num_steps, device, dtype)
+        right_scale = (t_max - center) / right_scale_den
+
+        time_idx = torch.arange(num_steps, device=device, dtype=dtype)
+        src_time = torch.empty_like(time_idx)
+
+        if new_center > 0:
+            left_mask = time_idx < new_center
+            src_time[left_mask] = time_idx[left_mask] * left_scale
+        else:
+            left_mask = torch.zeros_like(time_idx, dtype=torch.bool)
+
+        right_mask = ~left_mask
+        src_time[right_mask] = center + (time_idx[right_mask] - new_center) * right_scale
+        src_time = torch.clamp(src_time, 0, t_max)
+
+        if num_steps == 1:
+            grid_time = torch.zeros(num_mels, num_steps, device=device, dtype=dtype)
+        else:
+            grid_time = (src_time / t_max) * 2.0 - 1.0
+            grid_time = grid_time.expand(num_mels, -1)
+
+        grid_freq = torch.linspace(-1.0, 1.0, num_mels, device=device, dtype=dtype).unsqueeze(1)
+        grid_freq = grid_freq.expand(-1, num_steps)
+
+        grid = torch.stack((grid_time, grid_freq), dim=-1).unsqueeze(0)
+        return grid
+
+    @staticmethod
+    def _identity_grid(num_mels, num_steps, device, dtype):
+        if num_steps <= 1:
+            grid_time = torch.zeros(num_mels, num_steps, device=device, dtype=dtype)
+        else:
+            base = torch.linspace(-1.0, 1.0, num_steps, device=device, dtype=dtype)
+            grid_time = base.expand(num_mels, -1)
+        grid_freq = torch.linspace(-1.0, 1.0, num_mels, device=device, dtype=dtype).unsqueeze(1)
+        grid_freq = grid_freq.expand(-1, num_steps)
+        grid = torch.stack((grid_time, grid_freq), dim=-1).unsqueeze(0)
+        return grid
 
 
 class LengthAwareBatchSampler(Sampler):
