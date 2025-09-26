@@ -15,6 +15,8 @@ import jiwer
 import matplotlib.pylab as plt
 from pathlib import Path
 
+from decoding import build_decoder_from_config
+
 
 def select_logits_from_output(model_output, preferred_order=(
     "primary_logits",
@@ -113,6 +115,30 @@ def get_data_path_list(train_path=None, val_path=None):
         val_list = f.readlines()
 
     return train_list, val_list
+
+
+def build_beam_search_decoder(config=None, vocab_size=None):
+    """Construct a :class:`~decoding.CTCBeamSearchDecoder` from a config dict."""
+
+    if config is None:
+        return None
+    try:
+        if (
+            vocab_size is not None
+            and isinstance(config, dict)
+            and "decoding" in config
+            and "shallow_fusion" in config["decoding"]
+        ):
+            config = dict(config)
+            decoding_cfg = dict(config.get("decoding", {}))
+            shallow_cfg = dict(decoding_cfg.get("shallow_fusion", {}))
+            shallow_cfg["vocab_size"] = int(vocab_size)
+            decoding_cfg["shallow_fusion"] = shallow_cfg
+            config["decoding"] = decoding_cfg
+        decoder = build_decoder_from_config(config)
+    except Exception:
+        return None
+    return decoder
 
 
 def plot_image(image):
