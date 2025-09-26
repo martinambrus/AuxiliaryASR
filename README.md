@@ -56,10 +56,27 @@ loss_weights:
 Increasing the warm-up ratio (`optimizer_params.pct_start`) or reducing the batch size can also help when the number of training utterances is limited.
 
 ### Languages
-This repo is set up for English with the [phonemizer](https://github.com/bootphon/phonemizer) package and espeak-ng backend. You can train it with other languages. If you would like to train for datasets in different languages, you will need to change the vocabulary file ([word_index_dict.txt](https://github.com/martinambrus/AuxiliaryASR/blob/main/word_index_dict.txt)) to contain the phonemes in your dataset. There is a utility script ([words_index_extractor.py](https://github.com/martinambrus/AuxiliaryASR/blob/main/words_index_extractor.py)) which will generate (and **_rewrite_**!) the file words_index_dict.txt when ran. Here's the syntax to use to generate this file:
-```bash
-python words_index_extractor.py --config_path ./Configs/config.yml
+The project now ships with a unified multilingual phoneme inventory that can emit either IPA or X-SAMPA symbols. The active standard and language overrides are controlled through `phoneme_settings` in `Configs/config.yml`. By default the configuration enables the IPA inventory defined in [`Configs/unified_phoneme_inventory.csv`](Configs/unified_phoneme_inventory.csv) and applies a set of reusable mappings from [`Configs/language_token_mappings.yml`](Configs/language_token_mappings.yml). During training the loader now inspects the metadata listed in `train_data`, `val_data`, and `ood_data`, extending the phoneme map with any previously unseen symbols before the first epoch. The resulting map is verified against [`Data/phoneme_map.txt`](Data/phoneme_map.txt) (which is generated automatically for new runs) so that accidental dataset changes or dictionary reorderings are caught early.
+
+Every checkpoint now stores the vocabulary size it was trained with, letting the trainer abort early if a run is resumed with a mismatched phoneme inventory. If you intentionally change datasets, update or remove `Data/phoneme_map.txt` before starting a new run so the freshly derived map reflects your new data.
+
+To adjust the behaviour you can toggle the individual options in the `phoneme_settings` block:
+
+```yaml
+phoneme_settings:
+  enabled: true            # set to false to revert to the legacy per-language dictionaries
+  mode: unified            # or 'legacy' to use a custom dictionary file
+  standard: xsampa         # switch between 'ipa' and 'xsampa' without modifying the dataset
+  apply_language_mappings: true
+  active_mappings:         # choose which mapping groups should be active
+    - identity_uppercase
+    - identity_lowercase
+    - arpabet_core
+    - arpabet_extended
+  allow_dynamic_extension: false  # enable to grow the vocabulary on the fly when encountering unseen tokens
 ```
+
+You can extend the mapping file with additional language specific groups or provide dataset level overrides via `dataset_params.text_cleaner`. Legacy workflows that rely on a hand-crafted dictionary are still supported by setting `phoneme_settings.enabled` to `false` and pointing `phoneme_maps_path` (or `dataset_params.text_cleaner.dict_path`) at your vocabulary file.
 
 ## References
 - [NVIDIA/tacotron2](https://github.com/NVIDIA/tacotron2)

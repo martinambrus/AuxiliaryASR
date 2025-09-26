@@ -3,6 +3,13 @@ from optimizers import build_optimizer
 from utils import *
 from models import build_model
 from trainer import Trainer
+from text_utils import (
+    ensure_token_map_matches_reference,
+    extend_token_map_from_metadata,
+    load_token_map_from_config,
+    save_token_map_to_file,
+)
+from phoneme_inventory import merge_phoneme_configs
 
 import os
 import os.path as osp
@@ -18,6 +25,7 @@ from torch.utils.tensorboard import SummaryWriter
 import click
 import importlib
 import importlib.util
+from typing import Mapping
 
 # enable better memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -216,18 +224,54 @@ def main(config_path):
     train_path = cfg_get_nested( config, 'train_data', None)
     val_path = cfg_get_nested( config, 'val_data', None)
     enable_early_stopping = cfg_get_nested( config, 'enable_early_stopping', True)
+
+    token_map, vocab_cleaner = load_token_map_from_config(config, return_cleaner=True)
+
+    metadata_paths = [
+        cfg_get_nested(config, 'train_data', None),
+        cfg_get_nested(config, 'val_data', None),
+        cfg_get_nested(config, 'ood_data', None),
+    ]
+    token_map, discovered_symbols = extend_token_map_from_metadata(
+        token_map,
+        vocab_cleaner,
+        metadata_paths,
+    )
+
+    if discovered_symbols:
+        print(
+            "Extended phoneme map with %d new symbol(s): %s"
+            % (len(discovered_symbols), ', '.join(discovered_symbols))
+        )
+
+    phoneme_map_reference = cfg_get_nested(config, 'phoneme_reference_path', 'Data/phoneme_map.txt')
+    ensure_token_map_matches_reference(token_map, phoneme_map_reference)
+
+    dataset_additional_params = dict(cfg_get_nested(config, 'dataset_params', {}) or {})
+    text_cleaner_override = {}
+    if isinstance(dataset_additional_params, dict):
+        text_cleaner_override = dataset_additional_params.pop('text_cleaner', {}) or {}
+    text_cleaner_config = merge_phoneme_configs(vocab_cleaner.config, text_cleaner_override)
+
+    configured_dict_source = text_cleaner_config.get('dict_path')
+    if configured_dict_source is None:
+        configured_dict_source = cfg_get_nested(config, 'phoneme_maps_path', None)
+
+    text_cleaner_config = dict(text_cleaner_config)
+    text_cleaner_config['dict_path'] = token_map
+
     dataset_params = {
-        'dict_path': cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'),
+        'dict_path': token_map,
         'sr': cfg_get_nested( config, 'preprocess_params.sr', 24000),
         'spect_params': cfg_get_nested( config, 'preprocess_params.spect_params', {
             'n_fft': 1024,
             'win_length': 1024,
             'hop_length': 300
         }),
-        'mel_params': cfg_get_nested( config, 'preprocess_params.mel_params', { 'n_mels': 80 })
+        'mel_params': cfg_get_nested( config, 'preprocess_params.mel_params', { 'n_mels': 80 }),
+        'text_cleaner_config': text_cleaner_config
     }
 
-    dataset_additional_params = cfg_get_nested(config, 'dataset_params', {})
     if isinstance(dataset_additional_params, dict):
         for override_key in ('dict_path', 'sr', 'spect_params', 'mel_params'):
             if override_key in dataset_additional_params:
@@ -236,6 +280,24 @@ def main(config_path):
         spec_augment_config = dataset_additional_params.get('spec_augment')
         if spec_augment_config:
             dataset_params['spec_augment_params'] = spec_augment_config
+
+        if 'text_cleaner_config' in dataset_additional_params:
+            dataset_params['text_cleaner_config'] = merge_phoneme_configs(
+                dataset_params['text_cleaner_config'],
+                dataset_additional_params['text_cleaner_config']
+            )
+
+    if isinstance(dataset_params.get('text_cleaner_config'), Mapping):
+        dataset_params['text_cleaner_config'] = dict(dataset_params['text_cleaner_config'])
+        dataset_params['text_cleaner_config'].setdefault('dict_path', token_map)
+
+    vocabulary_size = len(token_map)
+    if getattr(vocab_cleaner, 'mode', 'legacy') == 'unified' and getattr(vocab_cleaner, 'mapper', None) is not None:
+        mapper_info = vocab_cleaner.mapper.export_config()
+        print(f"Unified phoneme mapper active ({mapper_info.get('standard', 'ipa')}) with {mapper_info.get('dictionary_size', vocabulary_size)} symbols.")
+    else:
+        source_display = configured_dict_source or cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt')
+        print(f"Legacy phoneme dictionary loaded from {source_display} with {vocabulary_size} symbols.")
 
     raw_train_list, raw_val_list = get_data_path_list(train_path, val_path)
 
@@ -284,22 +346,17 @@ def main(config_path):
                                           dataset_config=dataset_params,
                                           collate_config=collate_config)
 
-    word_indexes = set(
-        line.strip() for line in open(cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'))
-        if line.strip()
-    )
-
     model_params = cfg_get_nested( config, 'model_params', {
         'input_dim': 80,
         'hidden_dim': 256,
-        'n_token': len( word_indexes ),
+        'n_token': vocabulary_size,
         'token_embedding_dim': 512,
         'n_layers': 5,
         'location_kernel_size': 31
     })
 
-    if not 'n_token' in model_params:
-        model_params['n_token'] = len( word_indexes )
+    model_params = dict(model_params)
+    model_params['n_token'] = vocabulary_size
 
     multi_task_config = cfg_get_nested(config, 'multi_task', {}) or {}
 
@@ -326,6 +383,17 @@ def main(config_path):
     print("Using model parameters:", model_params)
 
     model = build_model(model_params=model_params)
+
+    def _assert_model_token_count(model_obj):
+        trained_tensor = getattr(model_obj, 'trained_n_tokens', None)
+        if trained_tensor is None:
+            return
+        trained_count = int(trained_tensor.item())
+        if trained_count != vocabulary_size:
+            raise ValueError(
+                "Checkpoint vocabulary size mismatch: expected %d tokens but checkpoint was trained with %d tokens."
+                % (vocabulary_size, trained_count)
+            )
 
     scheduler_params = {
             'max_lr': float(cfg_get_nested( config, 'optimizer_params.lr', 5e-4)),
@@ -395,6 +463,7 @@ def main(config_path):
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )
     load_only_params = cfg_get_nested( config, 'load_only_params', False )
+    loaded_checkpoint = False
     if isinstance(pretrained_model, bool) and pretrained_model == True:
         try:
             files = os.listdir(log_dir)
@@ -409,6 +478,8 @@ def main(config_path):
                 checkpoint_file = log_dir + f"/epoch_{iters:05}.pth"
                 print(f"Starting to train from checkpoint {checkpoint_file}")
                 start_epoch = trainer.load_checkpoint(checkpoint_file, load_only_params=load_only_params)
+                _assert_model_token_count(trainer.model)
+                loaded_checkpoint = True
             else:
                 print(f"No previous checkpoints found, starting training from epoch 1.")
                 start_epoch = 1
@@ -417,6 +488,8 @@ def main(config_path):
             start_epoch = 1
     elif isinstance(pretrained_model, str) and pretrained_model != "":
         start_epoch = trainer.load_checkpoint(pretrained_model, load_only_params=load_only_params)
+        _assert_model_token_count(trainer.model)
+        loaded_checkpoint = True
         start_epoch += 1
         print(f"Checkpoint {pretrained_model} loaded, starting training from epoch {start_epoch}.")
     elif ( isinstance(pretrained_model, str) and pretrained_model == "" ) or ( isinstance(pretrained_model, bool) and pretrained_model == False ):
@@ -425,6 +498,9 @@ def main(config_path):
     else:
         print(f"Unrecognized value for load_checkpoint config option, starting training from epoch 1 - {pretrained_model}")
         start_epoch = 1
+
+    if not loaded_checkpoint:
+        save_token_map_to_file(token_map, phoneme_map_reference)
 
     for epoch in range(start_epoch, epochs+1):
         train_results = trainer._train_epoch()

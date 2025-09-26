@@ -8,7 +8,31 @@ load_only_params: false
 train_data: "Data/train_list.txt"
 val_data: "Data/val_list.txt"
 ood_data: "Data/OOD_texts.txt"
-phoneme_maps_path: "Data/word_index_dict.txt"
+phoneme_maps_path: null
+phoneme_reference_path: "Data/phoneme_map.txt"
+
+phoneme_settings:
+  enabled: true
+  mode: unified  # options: unified, legacy
+  standard: ipa  # options: ipa, xsampa
+  inventory_path: "Configs/unified_phoneme_inventory.csv"
+  mapping_path: "Configs/language_token_mappings.yml"
+  active_mappings:
+    - identity_uppercase
+    - identity_lowercase
+    - identity_digits
+    - punctuation
+    - arpabet_core
+    - arpabet_extended
+  include_all_inventory_symbols: true
+  apply_language_mappings: true
+  allow_dynamic_extension: false
+  fallback:
+    on_missing_mapping: warn
+    default_symbol: "<unk>"
+    allow_identity: true
+  tokenization:
+    type: whitespace
 
 preprocess_parasm:
   sr: 24000

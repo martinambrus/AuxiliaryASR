@@ -112,6 +112,16 @@ class ASRCNN(nn.Module):
         self.use_ctc = bool(self.multi_task_config.get('use_ctc', True))
         self.use_seq2seq = bool(self.multi_task_config.get('use_seq2seq', True))
 
+        # Persist the vocabulary size inside the model state so checkpoints carry
+        # the exact phoneme inventory they were trained with.  This allows
+        # future training runs to verify the runtime vocabulary matches the
+        # checkpoint configuration before continuing.
+        self.register_buffer(
+            "trained_n_tokens",
+            torch.tensor(int(n_token), dtype=torch.long),
+            persistent=True,
+        )
+
         if self.use_ctc:
             self.ctc_linear = nn.Sequential(
                 LinearNorm(hidden_dim//2, hidden_dim),

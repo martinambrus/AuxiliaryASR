@@ -149,6 +149,7 @@ class MelDataset(torch.utils.data.Dataset):
     def __init__(self,
                  data_list,
                  dict_path=DEFAULT_DICT_PATH,
+                 text_cleaner_config=None,
                  sr=24000,
                  spect_params={
                      "n_fft": 2048,
@@ -163,7 +164,7 @@ class MelDataset(torch.utils.data.Dataset):
                 ):
 
         self.data_list = data_list
-        self.text_cleaner = TextCleaner(dict_path)
+        self.text_cleaner = TextCleaner(dict_path, config=text_cleaner_config)
         self.sr = sr
 
         mel_opts = {**{'sample_rate': sr}, **mel_params, **spect_params}
