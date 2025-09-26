@@ -262,12 +262,40 @@ class UnifiedPhonemeMapper:
     # ------------------------------------------------------------------
     # token mapping API
     # ------------------------------------------------------------------
+    def import_vocabulary(self, mapping: Mapping[str, int]) -> None:
+        """Seed the mapper dictionary from an existing ``mapping``."""
+
+        if not isinstance(mapping, Mapping) or not mapping:
+            return
+
+        # Ensure special tokens are present even if the external mapping omits
+        # them.  They are inserted with their default indices when missing.
+        merged_items = {**{k: int(v) for k, v in self.special_tokens.items()},
+                        **{str(symbol): int(index) for symbol, index in mapping.items()}}
+
+        sorted_items = sorted(merged_items.items(), key=lambda item: item[1])
+
+        self.dictionary.clear()
+        self.inverse_dictionary.clear()
+
+        for symbol, index in sorted_items:
+            self.dictionary[symbol] = index
+            self.inverse_dictionary[index] = symbol
+            normalised = self._normalise_token(symbol)
+            if normalised:
+                self.token_to_symbol[normalised] = symbol
+
     def map_token(self, token: str, *, auto_extend: Optional[bool] = None) -> Optional[str]:
         if token in self.special_tokens:
             return token
         normalised = self._normalise_token(token)
         if not normalised:
             return None
+
+        cached_symbol = self.token_to_symbol.get(normalised)
+        if cached_symbol is not None:
+            self._add_symbol(cached_symbol)
+            return cached_symbol
 
         canonical = self.token_to_canonical.get(normalised)
         if canonical is None and self.allow_identity and normalised in self.inventory:

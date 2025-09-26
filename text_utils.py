@@ -111,6 +111,13 @@ class TextCleaner:
         enable_overrides = self.config.get('apply_language_mappings', True)
         case_sensitive = self.config.get('case_sensitive', True)
 
+        dict_override = self.config.get('dict_path')
+        preloaded_mapping = None
+        if isinstance(dict_override, Mapping):
+            preloaded_mapping = dict_override
+        elif isinstance(default_dict_path, Mapping):
+            preloaded_mapping = default_dict_path
+
         self.mapper = UnifiedPhonemeMapper(
             inventory_path=inventory_path,
             standard=standard,
@@ -124,6 +131,12 @@ class TextCleaner:
             enable_language_overrides=enable_overrides,
             case_sensitive=case_sensitive,
         )
+
+        if isinstance(dict_override, str) and dict_override and os.path.isfile(dict_override):
+            preloaded_mapping = load_token_map_file(dict_override)
+
+        if preloaded_mapping:
+            self.mapper.import_vocabulary(preloaded_mapping)
 
         # When using a unified mapper we always reference the internal dictionary
         # to keep the mapping consistent across datasets.
