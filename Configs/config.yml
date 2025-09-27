@@ -195,6 +195,31 @@ dataloader_params:
     shuffle_within_bucket: true
     shuffle_batches: true
 
+training_curriculum:
+  batch_size_schedule:
+    enabled: false
+    base_batch_size: 64
+    initial_batch_size: 32
+    apply_to_validation: false
+    evaluation_epoch: null
+    strategies:
+      milestones:
+        enabled: true
+        schedule:
+          - epoch: 1
+            batch_size: 32
+          - epoch: 5
+            batch_size: 48
+          - epoch: 10
+            batch_size: 64
+      linear:
+        enabled: false
+        update_interval: 1
+        start_epoch: 1
+        end_epoch: 10
+        start_batch_size: 32
+        end_batch_size: 64
+
 loss_weights:
   ctc: 0.8
   s2s: 1.0

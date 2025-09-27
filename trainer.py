@@ -182,6 +182,39 @@ class Trainer(object):
             if self.shuffled_val_dataloader is not None:
                 self.val_dataloader = self.shuffled_val_dataloader
 
+    def update_dataloaders(
+        self,
+        sorted_train=None,
+        shuffled_train=None,
+        sorted_val=None,
+        shuffled_val=None,
+        steps_per_epoch=None,
+    ):
+        """Update dataloaders when curriculum settings change."""
+
+        if sorted_train is not None:
+            self.sorted_train_dataloader = sorted_train
+            if self._sortagrad_active:
+                self.train_dataloader = sorted_train
+
+        if shuffled_train is not None:
+            self.shuffled_train_dataloader = shuffled_train
+            if not self._sortagrad_active:
+                self.train_dataloader = shuffled_train
+
+        if sorted_val is not None:
+            self.sorted_val_dataloader = sorted_val
+            if self._sortagrad_active:
+                self.val_dataloader = sorted_val
+
+        if shuffled_val is not None:
+            self.shuffled_val_dataloader = shuffled_val
+            if not self._sortagrad_active:
+                self.val_dataloader = shuffled_val
+
+        if steps_per_epoch is not None:
+            self.steps_per_epoch = int(steps_per_epoch)
+
     @staticmethod
     def _parse_intermediate_layer_weights(layers_config):
         weights = {}
@@ -357,17 +390,22 @@ class Trainer(object):
                 "[SortaGrad]: resuming from epoch %i, switching to shuffled dataloader immediately" % self.epochs
             )
 
-    def sync_scheduler_to_progress(self):
+    def sync_scheduler_to_progress(self, completed_steps=None):
         if self._scheduler_aligned:
             return
 
         if not self._resumed_from_checkpoint:
             return
 
-        if self.scheduler is None or self.steps_per_epoch is None or self.steps_per_epoch <= 0:
+        if self.scheduler is None:
             return
 
-        completed_steps = int(self.epochs * self.steps_per_epoch)
+        if completed_steps is None:
+            if self.steps_per_epoch is None or self.steps_per_epoch <= 0:
+                return
+            completed_steps = int(self.epochs * self.steps_per_epoch)
+        else:
+            completed_steps = int(completed_steps)
         if completed_steps <= 0:
             return
 
@@ -456,8 +494,6 @@ class Trainer(object):
 
         if not load_only_params:
             self._resumed_from_checkpoint = True
-            self.handle_sortagrad_after_resume()
-            self.sync_scheduler_to_progress()
 
         return self.epochs
 
