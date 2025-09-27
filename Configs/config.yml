@@ -3,6 +3,35 @@ save_freq: 10
 device: "cuda"
 epochs: 200
 batch_size: 64
+
+curriculum:
+  batch_growth:
+    enabled: false
+    base_batch_size: 64
+    min_batch_size: 1
+    max_batch_size: null
+    enforce_monotonic: true
+    strategies:
+      milestones:
+        enabled: false
+        schedule:
+          - epoch: 1
+            batch_size: 32
+          - epoch: 5
+            batch_size: 64
+      linear:
+        enabled: false
+        start_epoch: 1
+        end_epoch: 10
+        start_batch_size: 32
+        end_batch_size: 64
+      exponential:
+        enabled: false
+        start_epoch: 1
+        end_epoch: 10
+        start_batch_size: 16
+        growth_factor: 1.5
+        target_batch_size: 64
 pretrained_model: true
 load_only_params: false
 train_data: "Data/train_list.txt"

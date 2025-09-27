@@ -77,6 +77,7 @@ class Trainer(object):
         self.diagonal_attention_prior_weight = diagonal_attention_prior_weight
         self.maxm_mem_usage = 0
         self.steps_per_epoch = steps_per_epoch if steps_per_epoch is None else int(steps_per_epoch)
+        self.current_batch_size = self._infer_batch_size(self.train_dataloader)
         self.ctc_weight = ctc_weight
         self.s2s_weight = s2s_weight
         self.frame_weight = frame_weight
@@ -182,6 +183,15 @@ class Trainer(object):
             if self.shuffled_val_dataloader is not None:
                 self.val_dataloader = self.shuffled_val_dataloader
 
+        if self.train_dataloader is not None and self.steps_per_epoch is None:
+            try:
+                self.steps_per_epoch = len(self.train_dataloader)
+            except TypeError:
+                self.steps_per_epoch = None
+
+        if self.current_batch_size is None:
+            self.current_batch_size = self._infer_batch_size(self.train_dataloader)
+
     @staticmethod
     def _parse_intermediate_layer_weights(layers_config):
         weights = {}
@@ -209,6 +219,57 @@ class Trainer(object):
                 continue
 
         return weights
+
+    @staticmethod
+    def _infer_batch_size(dataloader):
+        if dataloader is None:
+            return None
+        batch_size = getattr(dataloader, 'batch_size', None)
+        if batch_size is not None:
+            try:
+                return int(batch_size)
+            except (TypeError, ValueError):
+                pass
+        batch_sampler = getattr(dataloader, 'batch_sampler', None)
+        if batch_sampler is not None:
+            sampler_batch_size = getattr(batch_sampler, 'batch_size', None)
+            if sampler_batch_size is not None:
+                try:
+                    return int(sampler_batch_size)
+                except (TypeError, ValueError):
+                    return None
+        return None
+
+    def update_dataloaders(self,
+                           sorted_train=None,
+                           shuffled_train=None,
+                           sorted_val=None,
+                           shuffled_val=None):
+        if sorted_train is not None:
+            self.sorted_train_dataloader = sorted_train
+        if shuffled_train is not None:
+            self.shuffled_train_dataloader = shuffled_train
+        if sorted_val is not None:
+            self.sorted_val_dataloader = sorted_val
+        if shuffled_val is not None:
+            self.shuffled_val_dataloader = shuffled_val
+
+        if self._sortagrad_active or self.shuffled_train_dataloader is None:
+            self.train_dataloader = self.sorted_train_dataloader
+        else:
+            self.train_dataloader = self.shuffled_train_dataloader or self.sorted_train_dataloader
+
+        if self._sortagrad_active or self.shuffled_val_dataloader is None:
+            self.val_dataloader = self.sorted_val_dataloader or self.shuffled_val_dataloader
+        else:
+            self.val_dataloader = self.shuffled_val_dataloader or self.sorted_val_dataloader
+
+        try:
+            self.steps_per_epoch = len(self.train_dataloader)
+        except (TypeError, ValueError, AttributeError):
+            self.steps_per_epoch = None
+
+        self.current_batch_size = self._infer_batch_size(self.train_dataloader)
 
     @staticmethod
     def _parse_entropy_regularization_targets(targets_config, root_config):
@@ -343,6 +404,11 @@ class Trainer(object):
                 self.logger.info("")
 
         self._sortagrad_active = False
+        try:
+            self.steps_per_epoch = len(self.train_dataloader)
+        except (TypeError, ValueError, AttributeError):
+            self.steps_per_epoch = None
+        self.current_batch_size = self._infer_batch_size(self.train_dataloader)
 
     def handle_sortagrad_after_resume(self):
         if not self._sortagrad_active:
@@ -881,6 +947,7 @@ class Trainer(object):
 
         train_losses = defaultdict(list)
         self.model.train()
+        current_batch_size = self.current_batch_size or self._infer_batch_size(self.train_dataloader)
         for train_steps_per_epoch, batch in enumerate(tqdm(self.train_dataloader, desc="[train]"), 1):
             losses = self.run(batch)
             for key, value in losses.items():
@@ -888,6 +955,8 @@ class Trainer(object):
 
         train_losses = {key: np.mean(value) for key, value in train_losses.items()}
         train_losses['train/learning_rate'] = self._get_lr()
+        if current_batch_size is not None:
+            train_losses['train/batch_size'] = current_batch_size
         self.epochs += 1
 
         gpu_id = 0

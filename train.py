@@ -175,6 +175,165 @@ def cfg_get_nested(cfg: dict, path, default=None, sep="."):
             return default
     return cur
 
+
+def _coerce_int(value, default=None, minimum=None):
+    try:
+        if isinstance(value, bool):
+            raise TypeError
+        int_value = int(float(value))
+    except (TypeError, ValueError):
+        return default
+    if minimum is not None:
+        int_value = max(int_value, minimum)
+    return int_value
+
+
+def _parse_milestone_schedule(config, total_epochs):
+    if not isinstance(config, dict):
+        return {}
+    if not bool(config.get('enabled', False)):
+        return {}
+
+    raw_schedule = config.get('schedule')
+    if raw_schedule is None:
+        raw_schedule = config.get('values')
+    if raw_schedule is None:
+        raw_schedule = config.get('milestones')
+
+    entries = []
+    if isinstance(raw_schedule, dict):
+        raw_iter = raw_schedule.items()
+    else:
+        raw_iter = raw_schedule or []
+
+    for item in raw_iter:
+        if isinstance(raw_schedule, dict):
+            epoch, batch_size = item
+            epoch = _coerce_int(epoch, None, minimum=1)
+            batch_size = _coerce_int(batch_size, None, minimum=1)
+        elif isinstance(item, dict):
+            epoch = _coerce_int(item.get('epoch') or item.get('start_epoch') or item.get('at'), None, minimum=1)
+            batch_size = _coerce_int(item.get('batch_size') or item.get('value') or item.get('size'), None, minimum=1)
+        else:
+            continue
+        if epoch is None or batch_size is None:
+            continue
+        entries.append((epoch, batch_size))
+
+    if not entries:
+        return {}
+
+    entries.sort(key=lambda x: x[0])
+    schedule = {}
+    pointer = 0
+    current_batch = None
+    while pointer < len(entries) and entries[pointer][0] <= 1:
+        current_batch = entries[pointer][1]
+        pointer += 1
+    for epoch in range(1, total_epochs + 1):
+        while pointer < len(entries) and epoch >= entries[pointer][0]:
+            current_batch = entries[pointer][1]
+            pointer += 1
+        if current_batch is not None:
+            schedule[epoch] = current_batch
+    return schedule
+
+
+def build_batch_size_schedule(config, default_batch_size, total_epochs):
+    if total_epochs <= 0:
+        return {}, False
+
+    schedule = {epoch: default_batch_size for epoch in range(1, total_epochs + 1)}
+    if not isinstance(config, dict) or not bool(config.get('enabled', False)):
+        return schedule, False
+
+    base_batch_size = _coerce_int(config.get('base_batch_size'), default_batch_size, minimum=1)
+    schedule = {epoch: base_batch_size for epoch in range(1, total_epochs + 1)}
+
+    has_override = base_batch_size != default_batch_size
+
+    strategies = config.get('strategies', {}) or {}
+    if not isinstance(strategies, dict):
+        strategies = {}
+
+    milestone_values = _parse_milestone_schedule(strategies.get('milestones'), total_epochs)
+    if milestone_values:
+        for epoch, value in milestone_values.items():
+            schedule[epoch] = value
+        has_override = True
+
+    linear_cfg = strategies.get('linear', {})
+    if isinstance(linear_cfg, dict) and bool(linear_cfg.get('enabled', False)):
+        start_epoch = _coerce_int(linear_cfg.get('start_epoch'), 1, minimum=1)
+        end_epoch = _coerce_int(linear_cfg.get('end_epoch'), total_epochs, minimum=1)
+        if end_epoch < start_epoch:
+            start_epoch, end_epoch = end_epoch, start_epoch
+        span = max(end_epoch - start_epoch, 1)
+        start_batch = _coerce_int(linear_cfg.get('start_batch_size'), schedule.get(start_epoch, base_batch_size), minimum=1)
+        end_batch = _coerce_int(linear_cfg.get('end_batch_size'), default_batch_size, minimum=1)
+        if end_batch is None:
+            end_batch = schedule.get(end_epoch, base_batch_size)
+        for epoch in range(start_epoch, end_epoch + 1):
+            position = (epoch - start_epoch) / span
+            target = start_batch + position * (end_batch - start_batch)
+            schedule[epoch] = max(schedule.get(epoch, base_batch_size), int(round(target)))
+        has_override = True
+
+    exp_cfg = strategies.get('exponential', {})
+    if isinstance(exp_cfg, dict) and bool(exp_cfg.get('enabled', False)):
+        start_epoch = _coerce_int(exp_cfg.get('start_epoch'), 1, minimum=1)
+        end_epoch = _coerce_int(exp_cfg.get('end_epoch'), total_epochs, minimum=1)
+        if end_epoch < start_epoch:
+            start_epoch, end_epoch = end_epoch, start_epoch
+        growth_factor = exp_cfg.get('growth_factor', 2.0)
+        try:
+            growth_factor = float(growth_factor)
+        except (TypeError, ValueError):
+            growth_factor = 2.0
+        growth_factor = max(1.0, growth_factor)
+        start_batch = _coerce_int(exp_cfg.get('start_batch_size'), schedule.get(start_epoch, base_batch_size), minimum=1)
+        target_batch = exp_cfg.get('target_batch_size', exp_cfg.get('end_batch_size'))
+        target_batch = _coerce_int(target_batch, None, minimum=1)
+        for epoch in range(start_epoch, end_epoch + 1):
+            steps = epoch - start_epoch
+            value = start_batch * (growth_factor ** steps)
+            if target_batch is not None:
+                value = min(value, target_batch)
+            schedule[epoch] = max(schedule.get(epoch, base_batch_size), int(round(value)))
+        has_override = True
+
+    min_batch = _coerce_int(config.get('min_batch_size'), 1, minimum=1)
+    max_batch = config.get('max_batch_size')
+    max_batch = _coerce_int(max_batch, None, minimum=1)
+    enforce_monotonic = bool(config.get('enforce_monotonic', True))
+
+    previous = None
+    for epoch in range(1, total_epochs + 1):
+        value = schedule.get(epoch, base_batch_size)
+        value = int(round(value))
+        if max_batch is not None:
+            value = min(value, max_batch)
+        if value < min_batch:
+            value = min_batch
+        if enforce_monotonic and previous is not None and value < previous:
+            value = previous
+        schedule[epoch] = value
+        previous = value
+
+    has_override = has_override or any(schedule[epoch] != default_batch_size for epoch in schedule)
+    return schedule, has_override
+
+
+def summarise_schedule(schedule):
+    summary = []
+    last_value = None
+    for epoch in sorted(schedule.keys()):
+        value = schedule[epoch]
+        if value != last_value:
+            summary.append((epoch, value))
+            last_value = value
+    return summary
+
 class EarlyStoppingWithNoLearningRate:
     def __init__(self, patience=5):
         self.patience = patience  # Number of epochs to wait for improvement
@@ -258,35 +417,59 @@ def main(config_path):
 
     collate_config = {'return_speaker_ids': True}
 
-    sorted_train_dataloader = build_dataloader(train_list_sorted,
-                                        batch_size=batch_size,
-                                        num_workers=train_num_workers,
-                                        dataset_config=dataset_params,
-                                        device=device,
-                                        collate_config=collate_config)
-    shuffled_train_dataloader = build_dataloader(train_entries,
-                                            batch_size=batch_size,
-                                            num_workers=train_num_workers,
-                                            dataset_config=dataset_params,
-                                            device=device,
-                                            lengths=train_durations,
-                                            bucket_sampler_config=train_bucket_sampler_config,
-                                            collate_config=collate_config)
+    curriculum_config = cfg_get_nested(config, 'curriculum.batch_growth', {}) or {}
+    batch_schedule, schedule_enabled = build_batch_size_schedule(curriculum_config, batch_size, epochs)
+    current_batch_size = batch_schedule.get(1, batch_size)
 
-    sorted_val_dataloader = build_dataloader(val_list_sorted,
-                                      batch_size=batch_size,
-                                      validation=True,
-                                      num_workers=val_num_workers,
-                                      device=device,
-                                      dataset_config=dataset_params,
-                                      collate_config=collate_config)
-    shuffled_val_dataloader = build_dataloader(val_entries,
-                                          batch_size=batch_size,
-                                          validation=True,
-                                          num_workers=val_num_workers,
-                                          device=device,
-                                          dataset_config=dataset_params,
-                                          collate_config=collate_config)
+    if schedule_enabled:
+        print("Curriculum batch-size schedule (epoch -> batch size):")
+        for epoch_marker, batch_value in summarise_schedule(batch_schedule):
+            print(f"  epoch {epoch_marker}: batch_size = {batch_value}")
+
+    def create_dataloaders_for_batch_size(target_batch_size):
+        target_batch_size = int(target_batch_size)
+        sorted_train = build_dataloader(
+            train_list_sorted,
+            batch_size=target_batch_size,
+            num_workers=train_num_workers,
+            dataset_config=dataset_params,
+            device=device,
+            collate_config=collate_config,
+        )
+        shuffled_train = build_dataloader(
+            train_entries,
+            batch_size=target_batch_size,
+            num_workers=train_num_workers,
+            dataset_config=dataset_params,
+            device=device,
+            lengths=train_durations,
+            bucket_sampler_config=train_bucket_sampler_config,
+            collate_config=collate_config,
+        )
+        sorted_val = build_dataloader(
+            val_list_sorted,
+            batch_size=target_batch_size,
+            validation=True,
+            num_workers=val_num_workers,
+            device=device,
+            dataset_config=dataset_params,
+            collate_config=collate_config,
+        )
+        shuffled_val = build_dataloader(
+            val_entries,
+            batch_size=target_batch_size,
+            validation=True,
+            num_workers=val_num_workers,
+            device=device,
+            dataset_config=dataset_params,
+            collate_config=collate_config,
+        )
+        return sorted_train, shuffled_train, sorted_val, shuffled_val
+
+    (sorted_train_dataloader,
+     shuffled_train_dataloader,
+     sorted_val_dataloader,
+     shuffled_val_dataloader) = create_dataloaders_for_batch_size(current_batch_size)
 
     word_indexes = set(
         line.strip() for line in open(cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'))
@@ -445,7 +628,38 @@ def main(config_path):
         print(f"Unrecognized value for load_checkpoint config option, starting training from epoch 1 - {pretrained_model}")
         start_epoch = 1
 
+    current_batch_size = trainer.current_batch_size or current_batch_size
+    initial_target_batch_size = batch_schedule.get(start_epoch, current_batch_size)
+    if initial_target_batch_size != current_batch_size:
+        (sorted_train_dataloader,
+         shuffled_train_dataloader,
+         sorted_val_dataloader,
+         shuffled_val_dataloader) = create_dataloaders_for_batch_size(initial_target_batch_size)
+        trainer.update_dataloaders(
+            sorted_train=sorted_train_dataloader,
+            shuffled_train=shuffled_train_dataloader,
+            sorted_val=sorted_val_dataloader,
+            shuffled_val=shuffled_val_dataloader,
+        )
+        current_batch_size = initial_target_batch_size
+        logger.info(f"[Curriculum] Resumed at epoch {start_epoch} with batch size {current_batch_size}")
+
     for epoch in range(start_epoch, epochs+1):
+        target_batch_size = batch_schedule.get(epoch, current_batch_size)
+        if target_batch_size != current_batch_size:
+            (sorted_train_dataloader,
+             shuffled_train_dataloader,
+             sorted_val_dataloader,
+             shuffled_val_dataloader) = create_dataloaders_for_batch_size(target_batch_size)
+            trainer.update_dataloaders(
+                sorted_train=sorted_train_dataloader,
+                shuffled_train=shuffled_train_dataloader,
+                sorted_val=sorted_val_dataloader,
+                shuffled_val=shuffled_val_dataloader,
+            )
+            current_batch_size = target_batch_size
+            logger.info(f"[Curriculum] Updated batch size to {current_batch_size} for epoch {epoch}")
+
         train_results = trainer._train_epoch()
         eval_results = trainer._eval_epoch()
 
