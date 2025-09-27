@@ -234,11 +234,32 @@ class ASRCNN(nn.Module):
         self.use_ctc = bool(self.multi_task_config.get('use_ctc', True))
         self.use_seq2seq = bool(self.multi_task_config.get('use_seq2seq', True))
 
+        head_sharing_cfg = (self.multi_task_config.get('head_sharing', {}) or {})
+        ctc_seq2seq_cfg = (head_sharing_cfg.get('ctc_seq2seq', {}) or {})
+        self.enable_ctc_seq2seq_sharing = bool(
+            ctc_seq2seq_cfg.get('enabled', False)
+            and self.use_ctc
+            and self.use_seq2seq
+        )
+        self.ctc_seq2seq_detach = bool(ctc_seq2seq_cfg.get('detach_for_seq2seq', False))
+
+        self.ctc_state_projector: Optional[nn.Module] = None
+        self.ctc_state_activation: Optional[nn.Module] = None
+        self.ctc_classifier: Optional[nn.Module] = None
+        self.ctc_seq2seq_adapter: Optional[nn.Module] = None
+
         if self.use_ctc:
-            self.ctc_linear = nn.Sequential(
-                LinearNorm(hidden_dim//2, hidden_dim),
-                nn.ReLU(),
-                LinearNorm(hidden_dim, n_token))
+            if self.enable_ctc_seq2seq_sharing:
+                self.ctc_state_projector = LinearNorm(hidden_dim//2, hidden_dim)
+                self.ctc_state_activation = nn.ReLU()
+                self.ctc_classifier = LinearNorm(hidden_dim, n_token)
+                self.ctc_seq2seq_adapter = LinearNorm(hidden_dim, hidden_dim//2)
+                self.ctc_linear = None
+            else:
+                self.ctc_linear = nn.Sequential(
+                    LinearNorm(hidden_dim//2, hidden_dim),
+                    nn.ReLU(),
+                    LinearNorm(hidden_dim, n_token))
         else:
             self.ctc_linear = None
 
@@ -410,7 +431,10 @@ class ASRCNN(nn.Module):
 
         x = self.projection(x)
         x = x.transpose(1, 2)
-        outputs = {"encoder_features": x}
+        raw_encoder_features = x
+        decoder_memory = x
+        shared_states: Optional[torch.Tensor] = None
+        outputs: Dict[str, torch.Tensor] = {}
 
         if intermediate_outputs:
             outputs["intermediate_ctc_logits"] = intermediate_outputs
@@ -419,16 +443,31 @@ class ASRCNN(nn.Module):
             outputs["self_conditioned_ctc_logits"] = self_conditioned_outputs
             outputs["self_conditioned_ctc_log_probs"] = self_conditioned_log_probs
 
-        if self.use_ctc and self.ctc_linear is not None:
-            ctc_logit = self.ctc_linear(x)
+        if self.enable_ctc_seq2seq_sharing and self.ctc_state_projector is not None:
+            shared_states = self.ctc_state_projector(decoder_memory)
+            if self.ctc_state_activation is not None:
+                shared_states = self.ctc_state_activation(shared_states)
+            if self.use_ctc and self.ctc_classifier is not None:
+                ctc_logit = self.ctc_classifier(shared_states)
+                outputs["ctc_logits"] = ctc_logit
+            if self.use_seq2seq and self.ctc_seq2seq_adapter is not None:
+                adapter_input = shared_states.detach() if self.ctc_seq2seq_detach else shared_states
+                decoder_memory = self.ctc_seq2seq_adapter(adapter_input)
+        elif self.use_ctc and self.ctc_linear is not None:
+            ctc_logit = self.ctc_linear(decoder_memory)
             outputs["ctc_logits"] = ctc_logit
 
+        outputs["encoder_features"] = decoder_memory
+        if shared_states is not None:
+            outputs["ctc_seq2seq_shared_states"] = shared_states
+            outputs["raw_encoder_features"] = raw_encoder_features
+
         if self.enable_frame_classifier and self.frame_classifier is not None:
-            frame_logits = self.frame_classifier(x)
+            frame_logits = self.frame_classifier(decoder_memory)
             outputs["frame_phoneme_logits"] = frame_logits
 
         if self.enable_speaker and self.speaker_projection is not None:
-            pooled = x.mean(dim=1)
+            pooled = decoder_memory.mean(dim=1)
             speaker_embedding = torch.tanh(self.speaker_projection(pooled))
             speaker_embedding = self.speaker_norm(speaker_embedding)
             speaker_logits = self.speaker_classifier(speaker_embedding)
@@ -436,7 +475,7 @@ class ASRCNN(nn.Module):
             outputs["speaker_logits"] = speaker_logits
 
         if text_input is not None and self.use_seq2seq:
-            hidden_outputs, s2s_logit, s2s_attn = self.asr_s2s(x, src_key_padding_mask, text_input)
+            hidden_outputs, s2s_logit, s2s_attn = self.asr_s2s(decoder_memory, src_key_padding_mask, text_input)
             outputs["s2s_hidden"] = hidden_outputs
             outputs["s2s_logits"] = s2s_logit
             outputs["s2s_attn"] = s2s_attn
@@ -478,8 +517,22 @@ class ASRCNN(nn.Module):
 
     def _optional_state_prefixes(self):
         prefixes = []
-        if not self.use_ctc or self.ctc_linear is None:
-            prefixes.append("ctc_linear")
+        if not self.use_ctc:
+            prefixes.extend([
+                "ctc_linear",
+                "ctc_state_projector",
+                "ctc_classifier",
+                "ctc_seq2seq_adapter",
+            ])
+        else:
+            if self.ctc_linear is None:
+                prefixes.append("ctc_linear")
+            if not self.enable_ctc_seq2seq_sharing:
+                prefixes.extend([
+                    "ctc_state_projector",
+                    "ctc_classifier",
+                    "ctc_seq2seq_adapter",
+                ])
         if not self.enable_frame_classifier or self.frame_classifier is None:
             prefixes.append("frame_classifier")
         if not self.enable_speaker or self.speaker_projection is None:
@@ -512,6 +565,13 @@ class ASRCNN(nn.Module):
 
         remapped = filtered_state.__class__()
         for key, value in filtered_state.items():
+            if self.enable_ctc_seq2seq_sharing and key.startswith('ctc_linear.'):
+                if key.startswith('ctc_linear.0.'):
+                    key = key.replace('ctc_linear.0.', 'ctc_state_projector.linear_layer.', 1)
+                elif key.startswith('ctc_linear.2.'):
+                    key = key.replace('ctc_linear.2.', 'ctc_classifier.linear_layer.', 1)
+                else:
+                    continue
             if key.startswith('cnns.'):
                 segments = key.split('.')
                 if len(segments) >= 3:
