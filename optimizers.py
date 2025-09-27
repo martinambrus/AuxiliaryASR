@@ -34,11 +34,11 @@ class MultiOptimizer:
         else:
             _ = [self.optimizers[key].step() for key in self.keys]
 
-    def zero_grad(self, key=None):
+    def zero_grad(self, key=None, **kwargs):
         if key is not None:
-            self.optimizers[key].zero_grad()
+            self.optimizers[key].zero_grad(**kwargs)
         else:
-            _ = [self.optimizers[key].zero_grad() for key in self.keys]
+            _ = [self.optimizers[key].zero_grad(**kwargs) for key in self.keys]
 
     def scheduler(self, *args, key=None):
         if key is not None:

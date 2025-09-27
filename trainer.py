@@ -122,6 +122,25 @@ class Trainer(object):
         self.skip_future_mask_allocation = lazy_enabled and bool(lazy_masks_cfg.get('future_mask', True))
         self.skip_text_mask_allocation = lazy_enabled and bool(lazy_masks_cfg.get('text_mask', True))
 
+        optimizer_cfg = {}
+        if isinstance(self.config, dict):
+            optimizer_cfg = self.config.get('optimizer_params', {}) or {}
+            if not isinstance(optimizer_cfg, dict):
+                optimizer_cfg = {}
+        zero_grad_cfg = optimizer_cfg.get('zero_grad', {}) if isinstance(optimizer_cfg, dict) else {}
+        zero_grad_enabled = True
+        zero_grad_set_to_none = True
+        if isinstance(zero_grad_cfg, bool):
+            zero_grad_enabled = bool(zero_grad_cfg)
+            zero_grad_set_to_none = bool(zero_grad_cfg)
+        elif isinstance(zero_grad_cfg, dict):
+            zero_grad_enabled = bool(zero_grad_cfg.get('enabled', True))
+            zero_grad_set_to_none = bool(zero_grad_cfg.get('set_to_none', True))
+        self.optimizer_zero_grad_enabled = zero_grad_enabled
+        self.optimizer_zero_grad_kwargs = {}
+        if self.optimizer_zero_grad_enabled:
+            self.optimizer_zero_grad_kwargs['set_to_none'] = zero_grad_set_to_none
+
         precision_cfg = {}
         if isinstance(self.config, dict):
             precision_cfg = self.config.get('precision', {}) or {}
@@ -661,7 +680,10 @@ class Trainer(object):
     def run(self, batch):
         # FIX: trying to fix OOM errors
         #torch.cuda.empty_cache()
-        self.optimizer.zero_grad()
+        if self.optimizer_zero_grad_enabled:
+            self.optimizer.zero_grad(**self.optimizer_zero_grad_kwargs)
+        else:
+            self.optimizer.zero_grad()
         processed_batch = []
         for element in batch:
             if hasattr(element, 'to'):
