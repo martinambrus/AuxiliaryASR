@@ -637,7 +637,14 @@ class Trainer(object):
     def _autocast_context(self):
         if not self.autocast_enabled or self.device.type != 'cuda':
             return nullcontext()
-        return torch.cuda.amp.autocast(device_type='cuda', dtype=self.autocast_dtype)
+        autocast_kwargs = {}
+        if self.autocast_dtype is not None:
+            autocast_kwargs['dtype'] = self.autocast_dtype
+        try:
+            return torch.cuda.amp.autocast(**autocast_kwargs)
+        except TypeError:
+            # Fallback for PyTorch versions that do not support the dtype argument
+            return torch.cuda.amp.autocast()
 
     def run(self, batch):
         # FIX: trying to fix OOM errors
