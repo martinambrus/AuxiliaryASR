@@ -5,6 +5,11 @@ epochs: 200
 batch_size: 64
 pretrained_model: true
 load_only_params: false
+training:
+  mixed_precision:
+    enabled: false
+    autocast_dtype: float16  # options: float16, bfloat16
+    use_grad_scaler: true
 train_data: "Data/train_list.txt"
 val_data: "Data/val_list.txt"
 ood_data: "Data/OOD_texts.txt"

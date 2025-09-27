@@ -12,6 +12,8 @@ from torch import nn
 from PIL import Image
 from tqdm import tqdm
 
+from torch.cuda.amp import autocast, GradScaler
+
 from utils import calc_wer
 
 import logging
@@ -51,7 +53,8 @@ class Trainer(object):
                  intermediate_ctc_config=None,
                  self_conditioned_ctc_config=None,
                  entropy_regularization_config=None,
-                 steps_per_epoch=None):
+                 steps_per_epoch=None,
+                 mixed_precision_config=None):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -69,7 +72,7 @@ class Trainer(object):
         self.device = device
         self.finish_train = False
         self.logger = logger
-        self.fp16_run = False
+        device_str = device.type if isinstance(device, torch.device) else str(device)
         self.switch_sortagrad_dataset_epoch = switch_sortagrad_dataset_epoch
         self.use_diagonal_attention_prior = use_diagonal_attention_prior
         self.diagonal_attention_prior_weight = diagonal_attention_prior_weight
@@ -109,6 +112,24 @@ class Trainer(object):
         self.entropy_regularization_eps = float(entropy_cfg.get('eps', 1.0e-6))
         targets_cfg = entropy_cfg.get('targets', {}) if isinstance(entropy_cfg, dict) else {}
         self.entropy_regularization_targets = self._parse_entropy_regularization_targets(targets_cfg, entropy_cfg)
+
+        mp_cfg = mixed_precision_config or {}
+        mp_enabled = bool(mp_cfg.get('enabled', False))
+        autocast_dtype = str(mp_cfg.get('autocast_dtype', 'float16')).lower()
+        if autocast_dtype in ('bf16', 'bfloat16'):
+            autocast_dtype = torch.bfloat16
+        else:
+            autocast_dtype = torch.float16
+
+        use_cuda = torch.cuda.is_available() and isinstance(device_str, str) and device_str.startswith('cuda')
+        self.mixed_precision_enabled = bool(mp_enabled and use_cuda)
+        self.autocast_dtype = autocast_dtype if self.mixed_precision_enabled else None
+
+        scaler_requested = bool(mp_cfg.get('use_grad_scaler', True))
+        # GradScaler is not required for bfloat16 mixed-precision runs.
+        scaler_enabled = self.mixed_precision_enabled and scaler_requested and self.autocast_dtype == torch.float16
+        self.grad_scaler = GradScaler(enabled=scaler_enabled)
+        self.fp16_run = scaler_enabled
 
         self._resumed_from_checkpoint = bool(initial_epochs)
         self._scheduler_aligned = False
@@ -353,6 +374,8 @@ class Trainer(object):
             "epochs": self.epochs,
         }
         state_dict["model"] = self.model.state_dict()
+        if self.grad_scaler is not None and self.grad_scaler.is_enabled():
+            state_dict["grad_scaler"] = self.grad_scaler.state_dict()
 
         if not os.path.exists(os.path.dirname(checkpoint_path)):
             os.makedirs(os.path.dirname(checkpoint_path))
@@ -375,6 +398,9 @@ class Trainer(object):
             self.epochs = state_dict["epochs"]
             self.optimizer.load_state_dict(state_dict["optimizer"])
             self.logger.info("Starting training from epoch %i" % state_dict["epochs"])
+
+            if "grad_scaler" in state_dict and self.grad_scaler is not None and self.grad_scaler.is_enabled():
+                self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
 
             # overwrite schedular argument parameters
             state_dict["scheduler"].update(**self.config.get("scheduler_params", {}))
@@ -587,7 +613,7 @@ class Trainer(object):
     def run(self, batch):
         # FIX: trying to fix OOM errors
         #torch.cuda.empty_cache()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         processed_batch = []
         for element in batch:
             if hasattr(element, 'to'):
@@ -612,163 +638,175 @@ class Trainer(object):
             mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
         mel_mask = self.model.length_to_mask(mel_input_length)
         text_mask = self.model.length_to_mask(text_input_length)
-        model_outputs = self.model(
-            mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+        use_autocast = self.mixed_precision_enabled and self.autocast_dtype is not None
+        autocast_dtype = self.autocast_dtype if use_autocast else torch.float32
+        with autocast(enabled=use_autocast, dtype=autocast_dtype):
+            model_outputs = self.model(
+                mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 
-        losses = {}
-        if mix_metadata:
-            losses['mixspeech/avg_lambda'] = mix_metadata['avg_lambda']
-            active_ratio = (mix_metadata['secondary_indices'] >= 0).float().mean().item()
-            losses['mixspeech/applicable_ratio'] = active_ratio
-        total_loss = torch.zeros(1, device=self.device)
+            losses = {}
+            if mix_metadata:
+                losses['mixspeech/avg_lambda'] = mix_metadata['avg_lambda']
+                active_ratio = (mix_metadata['secondary_indices'] >= 0).float().mean().item()
+                losses['mixspeech/applicable_ratio'] = active_ratio
+            total_loss = torch.zeros(1, device=self.device)
 
-        ppgs = model_outputs.get('ctc_logits')
-        if self.ctc_weight > 0 and ppgs is not None:
-            loss_ctc = self._compute_ctc_loss(ppgs, text_input, mel_input_length, text_input_length, mix_metadata)
-            total_loss = total_loss + self.ctc_weight * loss_ctc
-            losses['ctc'] = loss_ctc.item()
-        else:
-            loss_ctc = torch.zeros(1, device=self.device)
+            ppgs = model_outputs.get('ctc_logits')
+            if self.ctc_weight > 0 and ppgs is not None:
+                loss_ctc = self._compute_ctc_loss(ppgs, text_input, mel_input_length, text_input_length, mix_metadata)
+                total_loss = total_loss + self.ctc_weight * loss_ctc
+                losses['ctc'] = loss_ctc.item()
+            else:
+                loss_ctc = torch.zeros(1, device=self.device)
 
-        s2s_pred = model_outputs.get('s2s_logits')
-        s2s_attn = model_outputs.get('s2s_attn')
-        if self.s2s_weight > 0 and s2s_pred is not None:
-            loss_s2s = torch.zeros(1, device=self.device)
-            total_samples = text_input.size(0)
-            lam_primary = mix_metadata['lam_primary'] if mix_metadata else None
-            lam_secondary = mix_metadata['lam_secondary'] if mix_metadata else None
-            secondary_indices = mix_metadata['secondary_indices'] if mix_metadata else None
-            fallback_indices = torch.arange(total_samples, device=self.device, dtype=torch.long)
+            s2s_pred = model_outputs.get('s2s_logits')
+            s2s_attn = model_outputs.get('s2s_attn')
+            if self.s2s_weight > 0 and s2s_pred is not None:
+                loss_s2s = torch.zeros(1, device=self.device)
+                total_samples = text_input.size(0)
+                lam_primary = mix_metadata['lam_primary'] if mix_metadata else None
+                lam_secondary = mix_metadata['lam_secondary'] if mix_metadata else None
+                secondary_indices = mix_metadata['secondary_indices'] if mix_metadata else None
+                fallback_indices = torch.arange(total_samples, device=self.device, dtype=torch.long)
 
-            for idx, (_s2s_pred, _text_input, _text_length) in enumerate(zip(s2s_pred, text_input, text_input_length)):
-                main_len = int(_text_length.item())
-                main_len = min(main_len, _s2s_pred.size(0))
-                if main_len <= 0:
-                    continue
-                ce_loss = self.criterion['ce'](_s2s_pred[:main_len], _text_input[:main_len])
-                weight_primary = lam_primary[idx] if lam_primary is not None else 1.0
-                sample_loss = ce_loss * weight_primary
+                for idx, (_s2s_pred, _text_input, _text_length) in enumerate(zip(s2s_pred, text_input, text_input_length)):
+                    main_len = int(_text_length.item())
+                    main_len = min(main_len, _s2s_pred.size(0))
+                    if main_len <= 0:
+                        continue
+                    ce_loss = self.criterion['ce'](_s2s_pred[:main_len], _text_input[:main_len])
+                    weight_primary = lam_primary[idx] if lam_primary is not None else 1.0
+                    sample_loss = ce_loss * weight_primary
 
-                if lam_secondary is not None and lam_secondary[idx] > 0:
-                    partner_idx = secondary_indices[idx] if secondary_indices[idx] >= 0 else fallback_indices[idx]
-                    partner_idx = int(partner_idx.item())
-                    partner_len = int(text_input_length[partner_idx].item())
-                    partner_len = min(partner_len, _s2s_pred.size(0))
-                    if partner_len > 0:
-                        partner_target = text_input[partner_idx, :partner_len]
-                        ce_partner = self.criterion['ce'](_s2s_pred[:partner_len], partner_target)
-                        sample_loss = sample_loss + ce_partner * lam_secondary[idx]
+                    if lam_secondary is not None and lam_secondary[idx] > 0:
+                        partner_idx = secondary_indices[idx] if secondary_indices[idx] >= 0 else fallback_indices[idx]
+                        partner_idx = int(partner_idx.item())
+                        partner_len = int(text_input_length[partner_idx].item())
+                        partner_len = min(partner_len, _s2s_pred.size(0))
+                        if partner_len > 0:
+                            partner_target = text_input[partner_idx, :partner_len]
+                            ce_partner = self.criterion['ce'](_s2s_pred[:partner_len], partner_target)
+                            sample_loss = sample_loss + ce_partner * lam_secondary[idx]
 
-                loss_s2s = loss_s2s + sample_loss
+                    loss_s2s = loss_s2s + sample_loss
 
-            loss_s2s = loss_s2s / max(1, text_input.size(0))
-            total_loss = total_loss + self.s2s_weight * loss_s2s
-            losses['s2s'] = loss_s2s.item()
-        else:
-            loss_s2s = torch.zeros(1, device=self.device)
+                loss_s2s = loss_s2s / max(1, text_input.size(0))
+                total_loss = total_loss + self.s2s_weight * loss_s2s
+                losses['s2s'] = loss_s2s.item()
+            else:
+                loss_s2s = torch.zeros(1, device=self.device)
 
-        if self.entropy_regularization_enabled:
-            if ppgs is not None:
-                entropy_ctc = self._compute_entropy_regularization(ppgs, lengths=mel_input_length, key='ctc')
-                if entropy_ctc is not None:
-                    total_loss = total_loss + entropy_ctc
-                    losses['entropy/ctc'] = entropy_ctc.item() if torch.is_tensor(entropy_ctc) else float(entropy_ctc)
-            if s2s_pred is not None:
-                entropy_s2s = self._compute_entropy_regularization(s2s_pred, lengths=text_input_length, key='s2s')
-                if entropy_s2s is not None:
-                    total_loss = total_loss + entropy_s2s
-                    losses['entropy/s2s'] = entropy_s2s.item() if torch.is_tensor(entropy_s2s) else float(entropy_s2s)
+            if self.entropy_regularization_enabled:
+                if ppgs is not None:
+                    entropy_ctc = self._compute_entropy_regularization(ppgs, lengths=mel_input_length, key='ctc')
+                    if entropy_ctc is not None:
+                        total_loss = total_loss + entropy_ctc
+                        losses['entropy/ctc'] = entropy_ctc.item() if torch.is_tensor(entropy_ctc) else float(entropy_ctc)
+                if s2s_pred is not None:
+                    entropy_s2s = self._compute_entropy_regularization(s2s_pred, lengths=text_input_length, key='s2s')
+                    if entropy_s2s is not None:
+                        total_loss = total_loss + entropy_s2s
+                        losses['entropy/s2s'] = entropy_s2s.item() if torch.is_tensor(entropy_s2s) else float(entropy_s2s)
 
-        intermediate_outputs = model_outputs.get('intermediate_ctc_logits') or {}
-        if (
-            self.intermediate_ctc_enabled
-            and self.intermediate_ctc_weight > 0.0
-            and isinstance(intermediate_outputs, dict)
-            and intermediate_outputs
-        ):
-            layer_losses = torch.zeros(1, device=self.device)
-            for layer_key, logits in intermediate_outputs.items():
-                if not isinstance(logits, torch.Tensor):
-                    continue
-                layer_loss = self._compute_ctc_loss(logits, text_input, mel_input_length, text_input_length, mix_metadata)
-                weight = float(self.intermediate_ctc_layer_weights.get(str(layer_key), 1.0))
-                layer_losses = layer_losses + weight * layer_loss
-                losses[f'intermediate_ctc/layer_{layer_key}'] = layer_loss.item()
+            intermediate_outputs = model_outputs.get('intermediate_ctc_logits') or {}
+            if (
+                self.intermediate_ctc_enabled
+                and self.intermediate_ctc_weight > 0.0
+                and isinstance(intermediate_outputs, dict)
+                and intermediate_outputs
+            ):
+                layer_losses = torch.zeros(1, device=self.device)
+                for layer_key, logits in intermediate_outputs.items():
+                    if not isinstance(logits, torch.Tensor):
+                        continue
+                    layer_loss = self._compute_ctc_loss(logits, text_input, mel_input_length, text_input_length, mix_metadata)
+                    weight = float(self.intermediate_ctc_layer_weights.get(str(layer_key), 1.0))
+                    layer_losses = layer_losses + weight * layer_loss
+                    losses[f'intermediate_ctc/layer_{layer_key}'] = layer_loss.item()
 
-            total_loss = total_loss + self.intermediate_ctc_weight * layer_losses
-            losses['intermediate_ctc'] = layer_losses.item()
+                total_loss = total_loss + self.intermediate_ctc_weight * layer_losses
+                losses['intermediate_ctc'] = layer_losses.item()
 
-        self_conditioned_outputs = model_outputs.get('self_conditioned_ctc_logits') or {}
-        if (
-            self.self_conditioned_ctc_enabled
-            and self.self_conditioned_ctc_weight > 0.0
-            and isinstance(self_conditioned_outputs, dict)
-            and self_conditioned_outputs
-        ):
-            sc_losses = torch.zeros(1, device=self.device)
-            for layer_key, logits in self_conditioned_outputs.items():
-                if not isinstance(logits, torch.Tensor):
-                    continue
-                sc_loss = self._compute_ctc_loss(logits, text_input, mel_input_length, text_input_length, mix_metadata)
-                weight = float(self.self_conditioned_ctc_layer_weights.get(str(layer_key), 1.0))
-                sc_losses = sc_losses + weight * sc_loss
-                losses[f'self_conditioned_ctc/layer_{layer_key}'] = sc_loss.item()
+            self_conditioned_outputs = model_outputs.get('self_conditioned_ctc_logits') or {}
+            if (
+                self.self_conditioned_ctc_enabled
+                and self.self_conditioned_ctc_weight > 0.0
+                and isinstance(self_conditioned_outputs, dict)
+                and self_conditioned_outputs
+            ):
+                sc_losses = torch.zeros(1, device=self.device)
+                for layer_key, logits in self_conditioned_outputs.items():
+                    if not isinstance(logits, torch.Tensor):
+                        continue
+                    sc_loss = self._compute_ctc_loss(logits, text_input, mel_input_length, text_input_length, mix_metadata)
+                    weight = float(self.self_conditioned_ctc_layer_weights.get(str(layer_key), 1.0))
+                    sc_losses = sc_losses + weight * sc_loss
+                    losses[f'self_conditioned_ctc/layer_{layer_key}'] = sc_loss.item()
 
-            total_loss = total_loss + self.self_conditioned_ctc_weight * sc_losses
-            losses['self_conditioned_ctc'] = sc_losses.item()
+                total_loss = total_loss + self.self_conditioned_ctc_weight * sc_losses
+                losses['self_conditioned_ctc'] = sc_losses.item()
 
-        if self.enable_frame_classifier and self.frame_weight > 0:
-            frame_logits = model_outputs.get('frame_phoneme_logits')
-            if frame_logits is not None:
-                frame_targets = self._build_frame_targets(text_input, text_input_length, mel_input_length, frame_logits.size(1))
-                frame_loss = self.criterion['frame_ce'](frame_logits.reshape(-1, frame_logits.size(2)),
-                                                        frame_targets.view(-1))
-                total_loss = total_loss + self.frame_weight * frame_loss
-                losses['frame_phoneme'] = frame_loss.item()
+            if self.enable_frame_classifier and self.frame_weight > 0:
+                frame_logits = model_outputs.get('frame_phoneme_logits')
+                if frame_logits is not None:
+                    frame_targets = self._build_frame_targets(text_input, text_input_length, mel_input_length, frame_logits.size(1))
+                    frame_loss = self.criterion['frame_ce'](frame_logits.reshape(-1, frame_logits.size(2)),
+                                                            frame_targets.view(-1))
+                    total_loss = total_loss + self.frame_weight * frame_loss
+                    losses['frame_phoneme'] = frame_loss.item()
+                else:
+                    frame_loss = torch.zeros(1, device=self.device)
             else:
                 frame_loss = torch.zeros(1, device=self.device)
-        else:
-            frame_loss = torch.zeros(1, device=self.device)
 
-        if self.enable_speaker and self.speaker_weight > 0:
-            speaker_logits = model_outputs.get('speaker_logits')
-            if speaker_logits is not None:
-                loss_speaker = self.criterion['speaker_ce'](speaker_logits, speaker_ids)
-                total_loss = total_loss + self.speaker_weight * loss_speaker
-                speaker_pred = torch.argmax(speaker_logits, dim=1)
-                speaker_acc = torch.eq(speaker_pred, speaker_ids).float().mean().item()
-                losses['speaker'] = loss_speaker.item()
-                losses['speaker_acc'] = speaker_acc
+            if self.enable_speaker and self.speaker_weight > 0:
+                speaker_logits = model_outputs.get('speaker_logits')
+                if speaker_logits is not None:
+                    loss_speaker = self.criterion['speaker_ce'](speaker_logits, speaker_ids)
+                    total_loss = total_loss + self.speaker_weight * loss_speaker
+                    speaker_pred = torch.argmax(speaker_logits, dim=1)
+                    speaker_acc = torch.eq(speaker_pred, speaker_ids).float().mean().item()
+                    losses['speaker'] = loss_speaker.item()
+                    losses['speaker_acc'] = speaker_acc
+                else:
+                    loss_speaker = torch.zeros(1, device=self.device)
             else:
                 loss_speaker = torch.zeros(1, device=self.device)
-        else:
-            loss_speaker = torch.zeros(1, device=self.device)
 
-        if self.enable_pronunciation_error and self.pron_error_weight > 0:
-            pron_logits = model_outputs.get('pron_error_logits')
-            if pron_logits is not None:
-                pron_targets = self._build_pronunciation_targets(text_input, text_input_length, pron_logits.size(1))
-                pron_loss = self.criterion['pron_error_ce'](pron_logits.reshape(-1, pron_logits.size(2)),
-                                                            pron_targets.view(-1))
-                total_loss = total_loss + self.pron_error_weight * pron_loss
-                pron_pred = torch.argmax(pron_logits, dim=2)
-                pron_acc = self._sequence_accuracy(pron_pred, pron_targets)
-                losses['pronunciation_error'] = pron_loss.item()
-                losses['pronunciation_error_acc'] = pron_acc
+            if self.enable_pronunciation_error and self.pron_error_weight > 0:
+                pron_logits = model_outputs.get('pron_error_logits')
+                if pron_logits is not None:
+                    pron_targets = self._build_pronunciation_targets(text_input, text_input_length, pron_logits.size(1))
+                    pron_loss = self.criterion['pron_error_ce'](pron_logits.reshape(-1, pron_logits.size(2)),
+                                                                pron_targets.view(-1))
+                    total_loss = total_loss + self.pron_error_weight * pron_loss
+                    pron_pred = torch.argmax(pron_logits, dim=2)
+                    pron_acc = self._sequence_accuracy(pron_pred, pron_targets)
+                    losses['pronunciation_error'] = pron_loss.item()
+                    losses['pronunciation_error_acc'] = pron_acc
+                else:
+                    pron_loss = torch.zeros(1, device=self.device)
             else:
                 pron_loss = torch.zeros(1, device=self.device)
-        else:
-            pron_loss = torch.zeros(1, device=self.device)
 
-        if self.use_diagonal_attention_prior and s2s_attn is not None:
-            loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, mel_input_length)
-            total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
-            losses['diag_attn'] = loss_diagonal.item()
-        
-        loss = total_loss
-        loss.backward()
-        torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
-        self.optimizer.step()
+            if self.use_diagonal_attention_prior and s2s_attn is not None:
+                loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, mel_input_length)
+                total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
+                losses['diag_attn'] = loss_diagonal.item()
+
+            loss = total_loss
+
+        if self.grad_scaler is not None and self.grad_scaler.is_enabled():
+            self.grad_scaler.scale(loss).backward()
+            self.grad_scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
+            self.optimizer.step()
+
         self.scheduler.step()
         losses['loss'] = loss.item()
         if 'ctc' not in losses:
@@ -834,8 +872,10 @@ class Trainer(object):
                 mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
             mel_mask = self.model.length_to_mask(mel_input_length)
             text_mask = self.model.length_to_mask(text_input_length)
-            model_outputs = self.model(
-                mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+            use_autocast = self.mixed_precision_enabled and self.autocast_dtype is not None
+            with autocast(enabled=use_autocast, dtype=self.autocast_dtype if use_autocast else torch.float32):
+                model_outputs = self.model(
+                    mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 
             ppgs = model_outputs.get('ctc_logits')
             s2s_pred = model_outputs.get('s2s_logits')

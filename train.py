@@ -406,7 +406,8 @@ def main(config_path):
                     intermediate_ctc_config=intermediate_ctc_config,
                     self_conditioned_ctc_config=self_conditioned_ctc_config,
                     entropy_regularization_config=entropy_regularization_config,
-                    steps_per_epoch=steps_per_epoch
+                    steps_per_epoch=steps_per_epoch,
+                    mixed_precision_config=cfg_get_nested(config, 'training.mixed_precision', {})
                     )
 
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )
