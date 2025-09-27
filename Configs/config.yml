@@ -64,6 +64,10 @@ multi_task:
   pronunciation_error:
     enabled: false
     num_classes: 2  # set to the number of pronunciation error categories your dataset annotates
+  head_sharing:
+    ctc_seq2seq:
+      enabled: false
+      detach_for_seq2seq: false
 
 stabilization:
   stochastic_depth:
