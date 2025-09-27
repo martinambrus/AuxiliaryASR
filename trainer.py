@@ -5,6 +5,7 @@ import os.path as osp
 import sys
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 
 import numpy as np
 import torch
@@ -51,6 +52,7 @@ class Trainer(object):
                  intermediate_ctc_config=None,
                  self_conditioned_ctc_config=None,
                  entropy_regularization_config=None,
+                 precision_config=None,
                  steps_per_epoch=None):
 
         self.steps = initial_steps
@@ -66,7 +68,10 @@ class Trainer(object):
         self.shuffled_val_dataloader = shuffled_val_dataloader
         self.val_dataloader = sorted_val_dataloader
         self.config = config
-        self.device = device
+        if isinstance(device, torch.device):
+            self.device = device
+        else:
+            self.device = torch.device(device)
         self.finish_train = False
         self.logger = logger
         self.fp16_run = False
@@ -109,6 +114,46 @@ class Trainer(object):
         self.entropy_regularization_eps = float(entropy_cfg.get('eps', 1.0e-6))
         targets_cfg = entropy_cfg.get('targets', {}) if isinstance(entropy_cfg, dict) else {}
         self.entropy_regularization_targets = self._parse_entropy_regularization_targets(targets_cfg, entropy_cfg)
+
+        precision_config = precision_config or {}
+        mixed_precision_cfg = precision_config.get('mixed_precision', {}) if isinstance(precision_config, dict) else {}
+        self.autocast_enabled = False
+        self.autocast_dtype = None
+        self.grad_scaler = None
+
+        if (
+            isinstance(mixed_precision_cfg, dict)
+            and bool(mixed_precision_cfg.get('enabled', False))
+            and self.device.type == 'cuda'
+            and torch.cuda.is_available()
+        ):
+            dtype_str = str(mixed_precision_cfg.get('dtype', 'float16')).lower()
+            if dtype_str == 'bfloat16':
+                self.autocast_dtype = torch.bfloat16
+            else:
+                self.autocast_dtype = torch.float16
+
+            scaler_cfg = mixed_precision_cfg.get('grad_scaler') or mixed_precision_cfg.get('scaler') or {}
+            scaler_kwargs = {}
+            if isinstance(scaler_cfg, dict):
+                if 'init_scale' in scaler_cfg:
+                    scaler_kwargs['init_scale'] = float(scaler_cfg['init_scale'])
+                if 'growth_factor' in scaler_cfg:
+                    scaler_kwargs['growth_factor'] = float(scaler_cfg['growth_factor'])
+                if 'backoff_factor' in scaler_cfg:
+                    scaler_kwargs['backoff_factor'] = float(scaler_cfg['backoff_factor'])
+                if 'growth_interval' in scaler_cfg:
+                    scaler_kwargs['growth_interval'] = int(scaler_cfg['growth_interval'])
+                scaler_enabled = bool(scaler_cfg.get('enabled', True))
+            else:
+                scaler_enabled = True
+
+            self.grad_scaler = torch.cuda.amp.GradScaler(
+                enabled=scaler_enabled,
+                **scaler_kwargs,
+            )
+            self.autocast_enabled = True
+            self.fp16_run = True
 
         self._resumed_from_checkpoint = bool(initial_epochs)
         self._scheduler_aligned = False
@@ -353,6 +398,8 @@ class Trainer(object):
             "epochs": self.epochs,
         }
         state_dict["model"] = self.model.state_dict()
+        if self.grad_scaler is not None:
+            state_dict["grad_scaler"] = self.grad_scaler.state_dict()
 
         if not os.path.exists(os.path.dirname(checkpoint_path)):
             os.makedirs(os.path.dirname(checkpoint_path))
@@ -379,6 +426,9 @@ class Trainer(object):
             # overwrite schedular argument parameters
             state_dict["scheduler"].update(**self.config.get("scheduler_params", {}))
             self.scheduler.load_state_dict(state_dict["scheduler"])
+
+            if self.grad_scaler is not None and "grad_scaler" in state_dict:
+                self.grad_scaler.load_state_dict(state_dict["grad_scaler"])
 
         if not load_only_params:
             self._resumed_from_checkpoint = True
@@ -552,7 +602,7 @@ class Trainer(object):
 
     def _compute_ctc_loss(self, logits, targets, input_lengths, target_lengths, mix_metadata=None):
         ctc = self.criterion['ctc']
-        log_probs = logits.log_softmax(dim=2).transpose(0, 1)
+        log_probs = logits.float().log_softmax(dim=2).transpose(0, 1)
         primary_loss = ctc(log_probs, targets, input_lengths, target_lengths)
         if primary_loss.dim() == 0:
             primary_loss = primary_loss.unsqueeze(0)
@@ -584,10 +634,15 @@ class Trainer(object):
 
         return total_loss.mean()
 
+    def _autocast_context(self):
+        if not self.autocast_enabled or self.device.type != 'cuda':
+            return nullcontext()
+        return torch.cuda.amp.autocast(device_type='cuda', dtype=self.autocast_dtype)
+
     def run(self, batch):
         # FIX: trying to fix OOM errors
         #torch.cuda.empty_cache()
-        self.optimizer.zero_grad()
+        self.optimizer.zero_grad(set_to_none=True)
         processed_batch = []
         for element in batch:
             if hasattr(element, 'to'):
@@ -612,8 +667,9 @@ class Trainer(object):
             mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
         mel_mask = self.model.length_to_mask(mel_input_length)
         text_mask = self.model.length_to_mask(text_input_length)
-        model_outputs = self.model(
-            mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+        with self._autocast_context():
+            model_outputs = self.model(
+                mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 
         losses = {}
         if mix_metadata:
@@ -766,15 +822,22 @@ class Trainer(object):
             losses['diag_attn'] = loss_diagonal.item()
         
         loss = total_loss
-        loss.backward()
-        torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
-        self.optimizer.step()
+        if self.grad_scaler is not None:
+            self.grad_scaler.scale(loss).backward()
+            self.grad_scaler.unscale_(self.optimizer)
+            torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
+            self.grad_scaler.step(self.optimizer)
+            self.grad_scaler.update()
+        else:
+            loss.backward()
+            torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
+            self.optimizer.step()
         self.scheduler.step()
-        losses['loss'] = loss.item()
+        losses['loss'] = float(loss.detach().item())
         if 'ctc' not in losses:
-            losses['ctc'] = loss_ctc.item()
+            losses['ctc'] = float(loss_ctc.detach().item())
         if 's2s' not in losses:
-            losses['s2s'] = loss_s2s.item()
+            losses['s2s'] = float(loss_s2s.detach().item())
         return losses
 
     def _train_epoch(self):
@@ -834,8 +897,9 @@ class Trainer(object):
                 mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
             mel_mask = self.model.length_to_mask(mel_input_length)
             text_mask = self.model.length_to_mask(text_input_length)
-            model_outputs = self.model(
-                mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
+            with self._autocast_context():
+                model_outputs = self.model(
+                    mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 
             ppgs = model_outputs.get('ctc_logits')
             s2s_pred = model_outputs.get('s2s_logits')
@@ -849,7 +913,7 @@ class Trainer(object):
                     text_input_length,
                     mix_metadata=None,
                 )
-                eval_losses["eval/ctc"].append(loss_ctc.item())
+                eval_losses["eval/ctc"].append(float(loss_ctc.detach().item()))
             else:
                 loss_ctc = torch.zeros(1, device=self.device)
 
@@ -858,7 +922,7 @@ class Trainer(object):
                 for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
                     loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
                 loss_s2s /= max(1, text_input.size(0))
-                eval_losses["eval/s2s"].append(loss_s2s.item())
+                eval_losses["eval/s2s"].append(float(loss_s2s.detach().item()))
             else:
                 loss_s2s = torch.zeros(1, device=self.device)
 
@@ -873,12 +937,12 @@ class Trainer(object):
                     entropy_ctc = self._compute_entropy_regularization(ppgs, lengths=mel_input_length, key='ctc')
                     if entropy_ctc is not None:
                         total_eval_loss = total_eval_loss + entropy_ctc
-                        eval_losses['eval/entropy_ctc'].append(entropy_ctc.item())
+                        eval_losses['eval/entropy_ctc'].append(float(entropy_ctc.detach().item()))
                 if s2s_pred is not None:
                     entropy_s2s = self._compute_entropy_regularization(s2s_pred, lengths=text_input_length, key='s2s')
                     if entropy_s2s is not None:
                         total_eval_loss = total_eval_loss + entropy_s2s
-                        eval_losses['eval/entropy_s2s'].append(entropy_s2s.item())
+                        eval_losses['eval/entropy_s2s'].append(float(entropy_s2s.detach().item()))
 
             intermediate_outputs = model_outputs.get('intermediate_ctc_logits') or {}
             if (
@@ -900,10 +964,10 @@ class Trainer(object):
                     )
                     weight = float(self.intermediate_ctc_layer_weights.get(str(layer_key), 1.0))
                     layer_losses = layer_losses + weight * layer_loss
-                    eval_losses[f'eval/intermediate_ctc/layer_{layer_key}'].append(layer_loss.item())
+                    eval_losses[f'eval/intermediate_ctc/layer_{layer_key}'].append(float(layer_loss.detach().item()))
 
                 total_eval_loss = total_eval_loss + self.intermediate_ctc_weight * layer_losses
-                eval_losses['eval/intermediate_ctc'].append(layer_losses.item())
+                eval_losses['eval/intermediate_ctc'].append(float(layer_losses.detach().item()))
 
             self_conditioned_outputs = model_outputs.get('self_conditioned_ctc_logits') or {}
             if (
@@ -925,10 +989,10 @@ class Trainer(object):
                     )
                     weight = float(self.self_conditioned_ctc_layer_weights.get(str(layer_key), 1.0))
                     sc_losses = sc_losses + weight * sc_loss
-                    eval_losses[f'eval/self_conditioned_ctc/layer_{layer_key}'].append(sc_loss.item())
+                    eval_losses[f'eval/self_conditioned_ctc/layer_{layer_key}'].append(float(sc_loss.detach().item()))
 
                 total_eval_loss = total_eval_loss + self.self_conditioned_ctc_weight * sc_losses
-                eval_losses['eval/self_conditioned_ctc'].append(sc_losses.item())
+                eval_losses['eval/self_conditioned_ctc'].append(float(sc_losses.detach().item()))
 
             if self.enable_frame_classifier and self.frame_weight > 0:
                 frame_logits = model_outputs.get('frame_phoneme_logits')
@@ -937,7 +1001,7 @@ class Trainer(object):
                     frame_loss = self.criterion['frame_ce'](frame_logits.reshape(-1, frame_logits.size(2)),
                                                             frame_targets.view(-1))
                     total_eval_loss = total_eval_loss + self.frame_weight * frame_loss
-                    eval_losses['eval/frame_phoneme'].append(frame_loss.item())
+                    eval_losses['eval/frame_phoneme'].append(float(frame_loss.detach().item()))
 
             if self.enable_speaker and self.speaker_weight > 0:
                 speaker_logits = model_outputs.get('speaker_logits')

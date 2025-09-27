@@ -82,6 +82,17 @@ optimizer_params:
   lr: 0.0005
   pct_start: 0.1
 
+precision:
+  mixed_precision:
+    enabled: false
+    dtype: "float16"  # options: float16, bfloat16
+    grad_scaler:
+      enabled: true
+      init_scale: 65536.0
+      growth_factor: 2.0
+      backoff_factor: 0.5
+      growth_interval: 2000
+
 # this is a very basic early stopping based off learning rate - when it falls to 0 and remains there for 3 epochs, the training stops
 enable_early_stopping: True
 

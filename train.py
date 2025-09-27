@@ -322,6 +322,7 @@ def main(config_path):
         multi_task_config['speaker'] = speaker_cfg
 
     stabilization_config = cfg_get_nested(config, 'stabilization', {}) or {}
+    precision_config = cfg_get_nested(config, 'precision', {}) or {}
 
     model_params = dict(model_params)
     model_params['multi_task_config'] = multi_task_config
@@ -406,6 +407,7 @@ def main(config_path):
                     intermediate_ctc_config=intermediate_ctc_config,
                     self_conditioned_ctc_config=self_conditioned_ctc_config,
                     entropy_regularization_config=entropy_regularization_config,
+                    precision_config=precision_config,
                     steps_per_epoch=steps_per_epoch
                     )
 
