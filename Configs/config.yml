@@ -110,6 +110,21 @@ stabilization:
 optimizer_params:
   lr: 0.0005
   pct_start: 0.1
+  weight_decay: 0.0005
+  betas: [0.9, 0.98]
+  eps: 1.0e-9
+  fused_optimizers:
+    enabled: true
+    priority:
+      - torch
+      - apex
+      - foreach
+    torch:
+      enabled: true
+    apex:
+      enabled: false
+    foreach:
+      enabled: true
 
 # this is a very basic early stopping based off learning rate - when it falls to 0 and remains there for 3 epochs, the training stops
 enable_early_stopping: True

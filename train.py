@@ -333,6 +333,7 @@ def main(config_path):
 
     model = build_model(model_params=model_params)
 
+    optimizer_config = cfg_get_nested(config, 'optimizer_params', {}) or {}
     scheduler_params = {
             'max_lr': float(cfg_get_nested( config, 'optimizer_params.lr', 5e-4)),
             'pct_start': float(cfg_get_nested( config, 'optimizer_params.pct_start', 0.1)),
@@ -344,7 +345,7 @@ def main(config_path):
 
     model.to(device)
     optimizer, scheduler = build_optimizer(
-        {"params": model.parameters(), "optimizer_params":{}, "scheduler_params": scheduler_params})
+        {"params": model.parameters(), "optimizer_params": optimizer_config, "scheduler_params": scheduler_params})
 
     blank_index = sorted_train_dataloader.dataset.text_cleaner.word_index_dictionary[" "] # get blank index
     criterion = build_criterion(critic_params={
