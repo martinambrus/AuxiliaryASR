@@ -233,9 +233,13 @@ def main(config_path):
             if override_key in dataset_additional_params:
                 dataset_params[override_key] = dataset_additional_params[override_key]
 
-        spec_augment_config = dataset_additional_params.get('spec_augment')
-        if spec_augment_config:
-            dataset_params['spec_augment_params'] = spec_augment_config
+        if 'spec_augment' in dataset_additional_params:
+            dataset_params['spec_augment_params'] = dataset_additional_params['spec_augment']
+
+        for override_key, override_value in dataset_additional_params.items():
+            if override_key in ('dict_path', 'sr', 'spect_params', 'mel_params', 'spec_augment'):
+                continue
+            dataset_params[override_key] = override_value
 
     raw_train_list, raw_val_list = get_data_path_list(train_path, val_path)
 
