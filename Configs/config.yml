@@ -15,6 +15,14 @@ memory_optimizations:
     enabled: true
     future_mask: true
     text_mask: true
+  gradient_checkpointing:
+    enabled: false
+    start_layer: 3
+    end_layer: null
+    chunk_size: 0
+    segments: 1
+    min_sequence_length: 0
+    use_checkpoint_sequential: true
 
 precision:
   mixed_precision:

@@ -1,9 +1,10 @@
 import math
-from typing import Dict, List
+from typing import Dict, List, Optional, Tuple
 
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint, checkpoint_sequential
 
 from layers import MFCC, Attention, LinearNorm, ConvNorm, ConvBlock
 
@@ -148,6 +149,7 @@ class ASRCNN(nn.Module):
                  location_kernel_size=63,
                  multi_task_config=None,
                  stabilization_config=None,
+                 memory_optimization_config=None,
     ):
         super().__init__()
         self.n_token = n_token
@@ -157,6 +159,33 @@ class ASRCNN(nn.Module):
         self.stabilization_config = stabilization_config or {}
         self._stochastic_depth_cfg = self.stabilization_config.get('stochastic_depth', {}) or {}
         self.enable_stochastic_depth = bool(self._stochastic_depth_cfg.get('enabled', False))
+        self.memory_optimization_config = memory_optimization_config or {}
+        self._gradient_checkpoint_cfg = self.memory_optimization_config.get('gradient_checkpointing', {}) or {}
+        self.enable_gradient_checkpointing = bool(self._gradient_checkpoint_cfg.get('enabled', False))
+
+        def _safe_int(value, default):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return default
+
+        self.gradient_checkpoint_start_layer = max(1, _safe_int(self._gradient_checkpoint_cfg.get('start_layer', 1), 1))
+        end_layer = self._gradient_checkpoint_cfg.get('end_layer', None)
+        parsed_end = None if end_layer in (None, '', 'none', 'null') else _safe_int(end_layer, None)
+        if isinstance(parsed_end, int) and parsed_end <= 0:
+            parsed_end = None
+        if isinstance(parsed_end, int):
+            parsed_end = max(self.gradient_checkpoint_start_layer, min(n_layers, parsed_end))
+        self.gradient_checkpoint_end_layer: Optional[int] = parsed_end
+        segments = _safe_int(self._gradient_checkpoint_cfg.get('segments', 1), 1)
+        self.gradient_checkpoint_segments = max(1, segments)
+        chunk_size = _safe_int(self._gradient_checkpoint_cfg.get('chunk_size', 0), 0)
+        self.gradient_checkpoint_chunk_size = max(0, chunk_size)
+        min_seq_len = _safe_int(self._gradient_checkpoint_cfg.get('min_sequence_length', 0), 0)
+        self.gradient_checkpoint_min_seq_len = max(0, min_seq_len)
+        self.gradient_checkpoint_use_sequential = bool(
+            self._gradient_checkpoint_cfg.get('use_checkpoint_sequential', True)
+        )
 
         self.encoder_layers = nn.ModuleList()
         for layer_idx in range(1, n_layers + 1):
@@ -196,6 +225,9 @@ class ASRCNN(nn.Module):
             })
         else:
             self.self_conditioning_blocks = nn.ModuleDict()
+
+        self._checkpoint_special_layers = set(self.intermediate_ctc_layers)
+        self._checkpoint_special_layers.update(self.self_conditioning_layers)
 
         self.projection = ConvNorm(hidden_dim, hidden_dim // 2)
         self.multi_task_config = multi_task_config or {}
@@ -314,8 +346,34 @@ class ASRCNN(nn.Module):
         intermediate_outputs: Dict[str, torch.Tensor] = {}
         self_conditioned_outputs: Dict[str, torch.Tensor] = {}
         self_conditioned_log_probs: Dict[str, torch.Tensor] = {}
-        for layer_idx, layer in enumerate(self.encoder_layers, start=1):
-            x = layer(x)
+
+        chunk: List[Tuple[int, nn.Module]] = []
+
+        def _flush_chunk() -> Optional[int]:
+            nonlocal x, chunk
+            if not chunk:
+                return None
+
+            modules = [module for _, module in chunk]
+            segments = min(len(modules), self.gradient_checkpoint_segments)
+            segments = max(1, segments)
+
+            if self.gradient_checkpoint_use_sequential or len(modules) > 1:
+                x = checkpoint_sequential(modules, segments, x)
+            else:
+                def _run_modules(inp: torch.Tensor) -> torch.Tensor:
+                    for module in modules:
+                        inp = module(inp)
+                    return inp
+
+                x = checkpoint(_run_modules, x)
+
+            last_idx = chunk[-1][0]
+            chunk = []
+            return last_idx
+
+        def _process_layer_outputs(layer_idx: int) -> None:
+            nonlocal x
             key = str(layer_idx)
             if key in self.intermediate_ctc_heads:
                 intermediate_outputs[key] = self.intermediate_ctc_heads[key](x)
@@ -324,6 +382,31 @@ class ASRCNN(nn.Module):
                 x = conditioning["features"]
                 self_conditioned_outputs[key] = conditioning["logits"]
                 self_conditioned_log_probs[key] = conditioning["log_probs"]
+
+        for layer_idx, layer in enumerate(self.encoder_layers, start=1):
+            if self._should_checkpoint_layer(layer_idx, x):
+                chunk.append((layer_idx, layer))
+                is_special = layer_idx in self._checkpoint_special_layers
+                chunk_full = (
+                    self.gradient_checkpoint_chunk_size > 0
+                    and len(chunk) >= self.gradient_checkpoint_chunk_size
+                )
+                if is_special or chunk_full:
+                    flushed = _flush_chunk()
+                    if flushed is not None:
+                        _process_layer_outputs(flushed)
+                continue
+
+            flushed = _flush_chunk()
+            if flushed is not None:
+                _process_layer_outputs(flushed)
+
+            x = layer(x)
+            _process_layer_outputs(layer_idx)
+
+        flushed = _flush_chunk()
+        if flushed is not None:
+            _process_layer_outputs(flushed)
 
         x = self.projection(x)
         x = x.transpose(1, 2)
@@ -376,6 +459,22 @@ class ASRCNN(nn.Module):
                 outputs["primary_logits"] = outputs["s2s_logits"]
 
         return outputs
+
+    def _should_checkpoint_layer(self, layer_idx: int, tensor: torch.Tensor) -> bool:
+        if not self.enable_gradient_checkpointing:
+            return False
+        if not self.training:
+            return False
+        if not isinstance(tensor, torch.Tensor) or not tensor.requires_grad:
+            return False
+        if self.gradient_checkpoint_min_seq_len > 0 and tensor.size(-1) < self.gradient_checkpoint_min_seq_len:
+            return False
+        if layer_idx < self.gradient_checkpoint_start_layer:
+            return False
+        end_layer = self.gradient_checkpoint_end_layer or len(self.encoder_layers)
+        if layer_idx > end_layer:
+            return False
+        return True
 
     def _optional_state_prefixes(self):
         prefixes = []

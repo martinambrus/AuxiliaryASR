@@ -327,6 +327,7 @@ def main(config_path):
     model_params = dict(model_params)
     model_params['multi_task_config'] = multi_task_config
     model_params['stabilization_config'] = stabilization_config
+    model_params['memory_optimization_config'] = memory_optimization_config
 
     print("Using model parameters:", model_params)
 
