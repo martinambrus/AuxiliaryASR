@@ -178,9 +178,9 @@ loss_weights:
 
 regularization:
   entropy:
-    enabled: false
+    enabled: true
     # Choose whether to minimise (sharpen) or maximise (smooth) the model's output distributions.
-    mode: minimize  # options: minimize, maximize
+    mode: maximize  # options: minimize, maximize
     # Numerical stability constant added inside the log operation.
     eps: 1.0e-6
     targets:
