@@ -16,7 +16,7 @@ memory_optimizations:
     future_mask: true
     text_mask: true
   gradient_checkpointing:
-    enabled: false
+    enabled: true
     start_layer: 3
     end_layer: null
     chunk_size: 0
@@ -26,7 +26,7 @@ memory_optimizations:
 
 precision:
   mixed_precision:
-    enabled: false
+    enabled: true
     dtype: float16
     grad_scaler:
       enabled: true
