@@ -110,6 +110,23 @@ stabilization:
 optimizer_params:
   lr: 0.0005
   pct_start: 0.1
+  weight_decay: 0.0005
+  betas: [0.9, 0.98]
+  eps: 1.0e-9
+  implementation_priority:
+    - torch_fused_adamw
+    - apex_fused_adam
+    - adamw_foreach
+  fallback_to_unfused: true
+  fused_optimizers:
+    torch_fused_adamw:
+      enabled: false
+      use_foreach: false  # when true, also enables foreach path on fused AdamW if supported
+    apex_fused_adam:
+      enabled: false
+      adamw_mode: true
+    adamw_foreach:
+      enabled: true
 
 # this is a very basic early stopping based off learning rate - when it falls to 0 and remains there for 3 epochs, the training stops
 enable_early_stopping: True
