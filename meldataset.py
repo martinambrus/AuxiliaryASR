@@ -41,19 +41,41 @@ DEFAULT_DICT_PATH = osp.join(osp.dirname(__file__), 'word_index_dict.txt')
 
 
 class SpecAugment:
-    """Simple SpecAugment implementation for log-mel spectrograms."""
+    """Simple SpecAugment implementation for log-mel spectrograms with optional frame dropping."""
 
     def __init__(self,
                  freq_mask_param=27,
                  time_mask_param=40,
                  num_freq_masks=2,
                  num_time_masks=2,
-                 apply_prob=1.0):
+                 apply_prob=1.0,
+                 random_frame_drop_params=None):
         self.freq_mask_param = int(freq_mask_param)
         self.time_mask_param = int(time_mask_param)
         self.num_freq_masks = int(num_freq_masks)
         self.num_time_masks = int(num_time_masks)
         self.apply_prob = float(apply_prob)
+
+        if random_frame_drop_params is None:
+            random_frame_drop_params = {}
+        self.frame_drop_enabled = bool(random_frame_drop_params.get('enabled', False))
+        self.frame_drop_prob = float(random_frame_drop_params.get('drop_prob', 0.0))
+        min_rate = float(random_frame_drop_params.get('min_drop_rate', 0.0))
+        max_rate = float(random_frame_drop_params.get('max_drop_rate', min_rate))
+        min_rate = min(max(min_rate, 0.0), 1.0)
+        max_rate = min(max(max_rate, 0.0), 1.0)
+        if max_rate < min_rate:
+            max_rate = min_rate
+        self.frame_drop_min_rate = min_rate
+        self.frame_drop_max_rate = max_rate
+        replacement = str(random_frame_drop_params.get('replacement', 'zero')).lower()
+        if replacement not in {'zero', 'mean'}:
+            logger.warning(
+                "Unsupported random frame drop replacement '%s'. Falling back to 'zero'.",
+                replacement
+            )
+            replacement = 'zero'
+        self.frame_drop_replacement = replacement
 
         self._freq_mask = T.FrequencyMasking(freq_mask_param=self.freq_mask_param)
         self._time_mask = T.TimeMasking(time_mask_param=self.time_mask_param)
@@ -75,10 +97,48 @@ class SpecAugment:
         for _ in range(max(0, self.num_time_masks)):
             augmented = self._time_mask(augmented)
 
+        if self.frame_drop_enabled:
+            augmented = self._apply_random_frame_drop(augmented)
+
         if squeeze:
             augmented = augmented.squeeze(0)
 
         return augmented
+
+    def _apply_random_frame_drop(self, tensor: torch.Tensor) -> torch.Tensor:
+        if self.frame_drop_prob <= 0.0 or self.frame_drop_max_rate <= 0.0:
+            return tensor
+
+        if self.frame_drop_prob < 1.0 and random.random() > self.frame_drop_prob:
+            return tensor
+
+        time_dim = tensor.size(-1)
+        if time_dim <= 0:
+            return tensor
+
+        drop_rate = random.uniform(self.frame_drop_min_rate, self.frame_drop_max_rate)
+        if drop_rate <= 0.0:
+            return tensor
+
+        num_frames = max(1, int(round(drop_rate * time_dim)))
+        num_frames = min(num_frames, time_dim)
+
+        if num_frames == time_dim:
+            drop_indices = torch.arange(time_dim, device=tensor.device)
+        else:
+            drop_indices = torch.randperm(time_dim, device=tensor.device)[:num_frames]
+
+        drop_indices, _ = torch.sort(drop_indices)
+
+        tensor = tensor.clone()
+
+        if self.frame_drop_replacement == 'mean':
+            fill = tensor.mean(dim=-1, keepdim=True)
+            tensor[:, :, drop_indices] = fill.expand(-1, -1, num_frames)
+            return tensor
+
+        tensor.index_fill_(-1, drop_indices, 0.0)
+        return tensor
 
 
 class LengthAwareBatchSampler(Sampler):
@@ -173,7 +233,12 @@ class MelDataset(torch.utils.data.Dataset):
         self.spec_augment = None
         if spec_augment_params and not validation:
             try:
-                self.spec_augment = SpecAugment(**spec_augment_params)
+                spec_params = dict(spec_augment_params)
+                random_frame_drop_cfg = spec_params.pop('random_frame_drop', None)
+                self.spec_augment = SpecAugment(
+                    **spec_params,
+                    random_frame_drop_params=random_frame_drop_cfg
+                )
             except TypeError:
                 logger.warning(f"Invalid SpecAugment configuration: {spec_augment_params}. Skipping augmentation.")
                 self.spec_augment = None

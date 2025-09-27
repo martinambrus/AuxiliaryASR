@@ -47,6 +47,12 @@ dataset_params:
     time_mask_param: 50
     num_freq_masks: 2
     num_time_masks: 2
+    random_frame_drop:
+      enabled: false   # toggle the random frame dropping extension
+      drop_prob: 0.25  # probability of applying the frame drop on a sample
+      min_drop_rate: 0.05
+      max_drop_rate: 0.1
+      replacement: zero  # or "mean" to fill with per-bin mean energy
 
 loss_weights:
   ctc: 0.8             # reduce to 0.5-0.7 for extremely small datasets
