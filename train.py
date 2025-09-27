@@ -378,6 +378,7 @@ def main(config_path):
     if isinstance(self_conditioned_ctc_config, dict) and 'loss_weight' not in self_conditioned_ctc_config:
         self_conditioned_ctc_config = dict(self_conditioned_ctc_config)
         self_conditioned_ctc_config['loss_weight'] = float(loss_weight_config.get('self_conditioned_ctc', 0.0))
+    training_config = cfg_get_nested(config, 'training', {}) or {}
 
     steps_per_epoch = len(sorted_train_dataloader) if sorted_train_dataloader is not None else len(shuffled_train_dataloader)
 
@@ -407,6 +408,7 @@ def main(config_path):
                     intermediate_ctc_config=intermediate_ctc_config,
                     self_conditioned_ctc_config=self_conditioned_ctc_config,
                     entropy_regularization_config=entropy_regularization_config,
+                    mixed_precision_config=training_config.get('mixed_precision', {}),
                     memory_optimization_config=memory_optimization_config,
                     steps_per_epoch=steps_per_epoch
                     )

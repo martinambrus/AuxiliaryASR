@@ -10,6 +10,17 @@ val_data: "Data/val_list.txt"
 ood_data: "Data/OOD_texts.txt"
 phoneme_maps_path: "Data/word_index_dict.txt"
 
+training:
+  mixed_precision:
+    enabled: false
+    dtype: float16
+    grad_scaler:
+      enabled: true
+      init_scale: 65536.0
+      growth_factor: 2.0
+      backoff_factor: 0.5
+      growth_interval: 2000
+
 memory_optimizations:
   lazy_masks:
     enabled: true
