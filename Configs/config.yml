@@ -109,10 +109,10 @@ dataset_params:
     num_freq_masks: 2
     num_time_masks: 2
     time_warp:
-      enabled: true
+      enabled: false
       window: 5
     adaptive_masking:
-      enabled: true
+      enabled: false
       max_time_ratio: 0.15
       max_freq_ratio: 0.2
     random_frame_dropout:
