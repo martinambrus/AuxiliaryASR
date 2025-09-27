@@ -51,6 +51,7 @@ class Trainer(object):
                  intermediate_ctc_config=None,
                  self_conditioned_ctc_config=None,
                  entropy_regularization_config=None,
+                 memory_optimization_config=None,
                  steps_per_epoch=None):
 
         self.steps = initial_steps
@@ -109,6 +110,16 @@ class Trainer(object):
         self.entropy_regularization_eps = float(entropy_cfg.get('eps', 1.0e-6))
         targets_cfg = entropy_cfg.get('targets', {}) if isinstance(entropy_cfg, dict) else {}
         self.entropy_regularization_targets = self._parse_entropy_regularization_targets(targets_cfg, entropy_cfg)
+
+        memopt_cfg = memory_optimization_config or {}
+        if not isinstance(memopt_cfg, dict):
+            memopt_cfg = {}
+        lazy_masks_cfg = memopt_cfg.get('lazy_masks', {}) or {}
+        if not isinstance(lazy_masks_cfg, dict):
+            lazy_masks_cfg = {}
+        lazy_enabled = bool(lazy_masks_cfg.get('enabled', True))
+        self.skip_future_mask_allocation = lazy_enabled and bool(lazy_masks_cfg.get('future_mask', True))
+        self.skip_text_mask_allocation = lazy_enabled and bool(lazy_masks_cfg.get('text_mask', True))
 
         self._resumed_from_checkpoint = bool(initial_epochs)
         self._scheduler_aligned = False
@@ -191,6 +202,23 @@ class Trainer(object):
         if weight == 0.0:
             return None
         return cfg
+
+    def _maybe_create_future_mask(self, length: int):
+        if self.skip_future_mask_allocation:
+            return None
+        if length is None or length <= 0:
+            return None
+        mask = self.model.get_future_mask(length, unmask_future_steps=0)
+        if mask is None:
+            return None
+        return mask.to(self.device) if hasattr(mask, 'to') else mask
+
+    def _maybe_create_text_mask(self, lengths):
+        if self.skip_text_mask_allocation:
+            return None
+        if lengths is None:
+            return None
+        return self.model.length_to_mask(lengths)
 
     def _compute_entropy_regularization(self, logits, lengths=None, key='ctc'):
         cfg = self._entropy_target_config(key)
@@ -608,10 +636,11 @@ class Trainer(object):
             mel_input, mix_metadata = self._apply_mixspeech(mel_input)
 
         mel_input_length = mel_input_length // (2 ** self.model.n_down)
-        future_mask = self.model.get_future_mask(
-            mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
+        future_mask = self._maybe_create_future_mask(
+            mel_input.size(2) // (2 ** self.model.n_down)
+        )
         mel_mask = self.model.length_to_mask(mel_input_length)
-        text_mask = self.model.length_to_mask(text_input_length)
+        text_mask = self._maybe_create_text_mask(text_input_length)
         model_outputs = self.model(
             mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 
@@ -830,10 +859,11 @@ class Trainer(object):
             else:
                 speaker_ids = torch.zeros(text_input.size(0), device=self.device, dtype=torch.long)
             mel_input_length = mel_input_length // (2 ** self.model.n_down)
-            future_mask = self.model.get_future_mask(
-                mel_input.size(2)//(2**self.model.n_down), unmask_future_steps=0).to(self.device)
+            future_mask = self._maybe_create_future_mask(
+                mel_input.size(2) // (2 ** self.model.n_down)
+            )
             mel_mask = self.model.length_to_mask(mel_input_length)
-            text_mask = self.model.length_to_mask(text_input_length)
+            text_mask = self._maybe_create_text_mask(text_input_length)
             model_outputs = self.model(
                 mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 
