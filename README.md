@@ -42,16 +42,54 @@ Fine-tuning on very small corpora (a few hours of speech or less) tends to overf
 ```yaml
 dataset_params:
   spec_augment:
-    apply_prob: 0.5    # probability of applying SpecAugment on a batch
+    enabled: true
+    apply_prob: 0.5        # probability of applying SpecAugment on a batch
+    policy: null           # set to LD or LF to use the large-delete / large-frequency presets
     freq_mask_param: 13
     time_mask_param: 50
     num_freq_masks: 2
     num_time_masks: 2
+    time_warp:
+      enabled: true
+      window: 5
+    adaptive_masking:
+      enabled: true
+      max_time_ratio: 0.15
+      max_freq_ratio: 0.2
+    random_frame_dropout:
+      enabled: false
+      drop_prob: 0.05
+    vtlp:
+      enabled: false
+  waveform_augmentations:
+    enabled: false
+    noise:
+      enabled: true
+      gaussian: true
+      snr_db: [10, 30]
+    musan:
+      enabled: false
+      paths: []            # point this to the MUSAN noise folders to enable mixing
+    reverberation:
+      enabled: false
+      rir_paths: []        # impulse responses to convolve with the waveform
+    impulse_response:
+      enabled: false
+      paths: []
+  mixup:
+    enabled: false
+    alpha: 0.4
+    apply_prob: 0.2
+  phoneme_dropout:
+    enabled: false
+    drop_prob: 0.1
 
 loss_weights:
-  ctc: 0.8             # reduce to 0.5-0.7 for extremely small datasets
+  ctc: 0.8                 # reduce to 0.5-0.7 for extremely small datasets
   s2s: 1.0
 ```
+
+Each augmentation block can be toggled on or off independently through `Configs/config.yml`, allowing you to combine time warping, adaptive masking, frame dropping, VTLP, noise/reverberation mixing (including MUSAN and room impulse responses), and phoneme-level dropout as needed.
 
 Increasing the warm-up ratio (`optimizer_params.pct_start`) or reducing the batch size can also help when the number of training utterances is limited.
 

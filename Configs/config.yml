@@ -101,11 +101,61 @@ entropy_params:
 dataset_params:
   # SpecAugment parameters applied only on the training split.
   spec_augment:
+    enabled: true
     apply_prob: 0.5
+    policy: null  # Options: null, LD, LF
     freq_mask_param: 13
     time_mask_param: 50
     num_freq_masks: 2
     num_time_masks: 2
+    time_warp:
+      enabled: true
+      window: 5
+    adaptive_masking:
+      enabled: true
+      max_time_ratio: 0.15
+      max_freq_ratio: 0.2
+    random_frame_dropout:
+      enabled: false
+      drop_prob: 0.05
+      mode: mean  # options: zero, mean, noise
+    vtlp:
+      enabled: false
+      alpha_low: 0.9
+      alpha_high: 1.1
+  waveform_augmentations:
+    enabled: false
+    noise:
+      enabled: true
+      gaussian: true
+      snr_db: [10, 30]
+      probability: 0.3
+      paths: []
+    musan:
+      enabled: false
+      paths: []
+      snr_db: [0, 15]
+      probability: 0.3
+    reverberation:
+      enabled: false
+      rir_paths: []
+      probability: 0.3
+    impulse_response:
+      enabled: false
+      paths: []
+      probability: 0.3
+  mixup:
+    enabled: false
+    alpha: 0.4
+    apply_prob: 0.2
+    dominant_label: true
+    augment_secondary: true
+  phoneme_dropout:
+    enabled: false
+    drop_prob: 0.1
+    min_tokens: 2
+    preserve_tokens:
+      - " "
 
 dataloader_params:
   train_num_workers: 8
