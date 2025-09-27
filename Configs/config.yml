@@ -16,6 +16,17 @@ memory_optimizations:
     future_mask: true
     text_mask: true
 
+precision:
+  mixed_precision:
+    enabled: false
+    dtype: float16
+    grad_scaler:
+      enabled: true
+      init_scale: 65536.0
+      growth_factor: 2.0
+      backoff_factor: 0.5
+      growth_interval: 2000
+
 preprocess_params:
   sr: 24000
   spect_params:
