@@ -181,6 +181,7 @@ class Trainer(object):
 
         self._resumed_from_checkpoint = bool(initial_epochs)
         self._scheduler_aligned = False
+        self._optimizer_step_count = self._get_optimizer_step_count()
         self._sortagrad_active = bool(
             self.sorted_train_dataloader
             and self.shuffled_train_dataloader
@@ -193,6 +194,14 @@ class Trainer(object):
                 self.train_dataloader = self.shuffled_train_dataloader
             if self.shuffled_val_dataloader is not None:
                 self.val_dataloader = self.shuffled_val_dataloader
+
+    def _get_optimizer_step_count(self):
+        if self.optimizer is None:
+            return 0
+        try:
+            return max(int(getattr(self.optimizer, "_step_count", 0)), 0)
+        except (TypeError, ValueError):
+            return 0
 
     def update_dataloaders(
         self,
@@ -434,6 +443,7 @@ class Trainer(object):
 
         if hasattr(self.optimizer, '_step_count'):
             self.optimizer._step_count = max(getattr(self.optimizer, '_step_count', 0), target_step + 1)
+        self._optimizer_step_count = max(self._optimizer_step_count, target_step + 1)
 
         try:
             self.scheduler.step(target_step)
@@ -503,6 +513,8 @@ class Trainer(object):
             # overwrite schedular argument parameters
             state_dict["scheduler"].update(**self.config.get("scheduler_params", {}))
             self.scheduler.load_state_dict(state_dict["scheduler"])
+
+        self._optimizer_step_count = self._get_optimizer_step_count()
 
         if not load_only_params:
             self._resumed_from_checkpoint = True
@@ -928,10 +940,14 @@ class Trainer(object):
             self.optimizer.step()
             optimizer_step_ran = True
 
+        if optimizer_step_ran:
+            self._optimizer_step_count += 1
+            if hasattr(self.optimizer, "_step_count"):
+                self.optimizer._step_count = max(getattr(self.optimizer, "_step_count", 0), self._optimizer_step_count)
+
         if (
             self.scheduler is not None
             and optimizer_step_ran
-            and getattr(self.optimizer, "_step_count", 0) > 0
         ):
             self.scheduler.step()
         losses['loss'] = loss.item()
