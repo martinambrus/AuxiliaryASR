@@ -186,6 +186,9 @@ class ASRCNN(nn.Module):
         self.gradient_checkpoint_use_sequential = bool(
             self._gradient_checkpoint_cfg.get('use_checkpoint_sequential', True)
         )
+        self.gradient_checkpoint_use_reentrant = bool(
+            self._gradient_checkpoint_cfg.get('use_reentrant', False)
+        )
 
         self.encoder_layers = nn.ModuleList()
         for layer_idx in range(1, n_layers + 1):
@@ -380,14 +383,29 @@ class ASRCNN(nn.Module):
             segments = max(1, segments)
 
             if self.gradient_checkpoint_use_sequential or len(modules) > 1:
-                x = checkpoint_sequential(modules, segments, x)
+                try:
+                    x = checkpoint_sequential(
+                        modules,
+                        segments,
+                        x,
+                        use_reentrant=self.gradient_checkpoint_use_reentrant,
+                    )
+                except TypeError:
+                    x = checkpoint_sequential(modules, segments, x)
             else:
                 def _run_modules(inp: torch.Tensor) -> torch.Tensor:
                     for module in modules:
                         inp = module(inp)
                     return inp
 
-                x = checkpoint(_run_modules, x)
+                try:
+                    x = checkpoint(
+                        _run_modules,
+                        x,
+                        use_reentrant=self.gradient_checkpoint_use_reentrant,
+                    )
+                except TypeError:
+                    x = checkpoint(_run_modules, x)
 
             last_idx = chunk[-1][0]
             chunk = []

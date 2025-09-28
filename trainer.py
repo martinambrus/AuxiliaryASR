@@ -5,11 +5,12 @@ import os.path as osp
 import sys
 import time
 from collections import defaultdict
+from contextlib import nullcontext
+import inspect
 
 import numpy as np
 import torch
-from torch import nn
-from torch.cuda.amp import autocast, GradScaler
+from torch import amp, nn
 from PIL import Image
 from tqdm import tqdm
 
@@ -147,6 +148,7 @@ class Trainer(object):
             and isinstance(device_type, str)
             and device_type.startswith('cuda')
         )
+        self.autocast_device_type = 'cuda'
 
         grad_scaler_cfg = mp_cfg.get('grad_scaler', {}) if isinstance(mp_cfg, dict) else {}
         if not isinstance(grad_scaler_cfg, dict):
@@ -157,18 +159,29 @@ class Trainer(object):
             growth_factor = float(grad_scaler_cfg.get('growth_factor', 2.0))
             backoff_factor = float(grad_scaler_cfg.get('backoff_factor', 0.5))
             growth_interval = int(grad_scaler_cfg.get('growth_interval', 2000))
-            self.grad_scaler = GradScaler(
+            scaler_kwargs = dict(
                 enabled=True,
                 init_scale=init_scale,
                 growth_factor=growth_factor,
                 backoff_factor=backoff_factor,
                 growth_interval=growth_interval,
             )
+
+            try:
+                scaler_params = inspect.signature(amp.GradScaler.__init__).parameters
+            except (ValueError, TypeError):
+                scaler_params = {}
+
+            if 'device_type' in scaler_params:
+                scaler_kwargs['device_type'] = self.autocast_device_type
+
+            self.grad_scaler = amp.GradScaler(**scaler_kwargs)
         else:
             self.grad_scaler = None
 
         self._resumed_from_checkpoint = bool(initial_epochs)
         self._scheduler_aligned = False
+        self._optimizer_step_count = self._get_optimizer_step_count()
         self._sortagrad_active = bool(
             self.sorted_train_dataloader
             and self.shuffled_train_dataloader
@@ -181,6 +194,14 @@ class Trainer(object):
                 self.train_dataloader = self.shuffled_train_dataloader
             if self.shuffled_val_dataloader is not None:
                 self.val_dataloader = self.shuffled_val_dataloader
+
+    def _get_optimizer_step_count(self):
+        if self.optimizer is None:
+            return 0
+        try:
+            return max(int(getattr(self.optimizer, "_step_count", 0)), 0)
+        except (TypeError, ValueError):
+            return 0
 
     def update_dataloaders(
         self,
@@ -420,8 +441,10 @@ class Trainer(object):
         if hasattr(self.scheduler, '_step_count'):
             self.scheduler._step_count = max(target_step, 1)
 
-        if hasattr(self.optimizer, '_step_count'):
-            self.optimizer._step_count = max(getattr(self.optimizer, '_step_count', 0), target_step + 1)
+        recorded_steps = getattr(self.optimizer, '_step_count', 0)
+        if recorded_steps < target_step + 1:
+            setattr(self.optimizer, '_step_count', target_step + 1)
+        self._optimizer_step_count = max(self._optimizer_step_count, target_step + 1)
 
         try:
             self.scheduler.step(target_step)
@@ -491,6 +514,8 @@ class Trainer(object):
             # overwrite schedular argument parameters
             state_dict["scheduler"].update(**self.config.get("scheduler_params", {}))
             self.scheduler.load_state_dict(state_dict["scheduler"])
+
+        self._optimizer_step_count = self._get_optimizer_step_count()
 
         if not load_only_params:
             self._resumed_from_checkpoint = True
@@ -727,7 +752,16 @@ class Trainer(object):
         autocast_dtype = self.mixed_precision_dtype if self.autocast_enabled else None
         grad_scaler = self.grad_scaler if self.grad_scaler is not None else None
 
-        with autocast(enabled=self.autocast_enabled, dtype=autocast_dtype):
+        if self.autocast_enabled:
+            autocast_cm = amp.autocast(
+                device_type=self.autocast_device_type,
+                dtype=autocast_dtype,
+                enabled=True,
+            )
+        else:
+            autocast_cm = nullcontext()
+
+        with autocast_cm:
             model_outputs = self.model(
                 mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 
@@ -883,18 +917,41 @@ class Trainer(object):
 
             loss = total_loss
 
+        optimizer_step_ran = False
         if grad_scaler is not None:
             grad_scaler.scale(loss).backward()
             grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
             grad_scaler.step(self.optimizer)
+
+            found_inf_tensors = getattr(grad_scaler, '_found_inf_per_device', None)
+            if isinstance(found_inf_tensors, dict):
+                overflow_detected = any(
+                    hasattr(found_inf, 'item') and found_inf.item() != 0
+                    for found_inf in found_inf_tensors.values()
+                )
+                optimizer_step_ran = not overflow_detected
+            else:
+                optimizer_step_ran = True
+
             grad_scaler.update()
         else:
             loss.backward()
             torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
             self.optimizer.step()
+            optimizer_step_ran = True
 
-        self.scheduler.step()
+        if optimizer_step_ran:
+            self._optimizer_step_count += 1
+            recorded_steps = getattr(self.optimizer, "_step_count", 0)
+            if recorded_steps < self._optimizer_step_count:
+                setattr(self.optimizer, "_step_count", self._optimizer_step_count)
+
+        if (
+            self.scheduler is not None
+            and optimizer_step_ran
+        ):
+            self.scheduler.step()
         losses['loss'] = loss.item()
         if 'ctc' not in losses:
             losses['ctc'] = loss_ctc.item()
