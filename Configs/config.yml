@@ -109,7 +109,7 @@ stabilization:
     dominant_mix: true
   self_conditioned_ctc:
     # Enables the self-conditioned CTC feedback block inside the encoder.
-    enabled: false
+    enabled: true
     # Weight applied to the auxiliary self-conditioned CTC loss term.
     loss_weight: 0.0
     # List encoder layer indices that should consume the CTC feedback signal.
