@@ -441,8 +441,9 @@ class Trainer(object):
         if hasattr(self.scheduler, '_step_count'):
             self.scheduler._step_count = max(target_step, 1)
 
-        if hasattr(self.optimizer, '_step_count'):
-            self.optimizer._step_count = max(getattr(self.optimizer, '_step_count', 0), target_step + 1)
+        recorded_steps = getattr(self.optimizer, '_step_count', 0)
+        if recorded_steps < target_step + 1:
+            setattr(self.optimizer, '_step_count', target_step + 1)
         self._optimizer_step_count = max(self._optimizer_step_count, target_step + 1)
 
         try:
@@ -942,8 +943,9 @@ class Trainer(object):
 
         if optimizer_step_ran:
             self._optimizer_step_count += 1
-            if hasattr(self.optimizer, "_step_count"):
-                self.optimizer._step_count = max(getattr(self.optimizer, "_step_count", 0), self._optimizer_step_count)
+            recorded_steps = getattr(self.optimizer, "_step_count", 0)
+            if recorded_steps < self._optimizer_step_count:
+                setattr(self.optimizer, "_step_count", self._optimizer_step_count)
 
         if (
             self.scheduler is not None
