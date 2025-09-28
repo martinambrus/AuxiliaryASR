@@ -10,6 +10,19 @@ val_data: "Data/val_list.txt"
 ood_data: "Data/OOD_texts.txt"
 phoneme_maps_path: "Data/word_index_dict.txt"
 
+# Controls caching of parsed metadata entries and audio durations.  Enabling this
+# significantly reduces start-up time by avoiding repeated WAV header scans.
+metadata_cache:
+  enabled: true  # Master switch for metadata caching.
+  directory: "Data/cache"  # Directory used to store cached metadata snapshots.
+  validate_audio: true  # Re-validate cached entries using audio file mtimes and sizes.
+  # The cache automatically refreshes when the cached sample rate or frame count of
+  # the first audio file no longer matches the dataset on disk.
+  datasets:
+    train: true  # Cache the training metadata file.
+    val: true    # Cache the validation metadata file.
+    ood: false   # Cache out-of-domain metadata when available.
+
 memory_optimizations:
   lazy_masks:
     enabled: true
