@@ -65,13 +65,27 @@ def _define_optimizer(params):
 
 def _define_scheduler(optimizer, params):
     print(params)
-    scheduler = torch.optim.lr_scheduler.OneCycleLR(
-        optimizer,
-        max_lr=params.get('max_lr', 5e-4),
-        epochs=params.get('epochs', 200),
-        steps_per_epoch=params.get('steps_per_epoch', 1000),
-        pct_start=params.get('pct_start', 0.0),
-        final_div_factor=5)
+    max_lr = params.get('max_lr', 5e-4)
+    pct_start = params.get('pct_start', 0.0)
+    final_div_factor = params.get('final_div_factor', 5)
+
+    total_steps = params.get('total_steps')
+    if total_steps is not None:
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lr,
+            total_steps=int(total_steps),
+            pct_start=pct_start,
+            final_div_factor=final_div_factor,
+        )
+    else:
+        scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=max_lr,
+            epochs=params.get('epochs', 200),
+            steps_per_epoch=params.get('steps_per_epoch', 1000),
+            pct_start=pct_start,
+            final_div_factor=final_div_factor)
 
     return scheduler
 

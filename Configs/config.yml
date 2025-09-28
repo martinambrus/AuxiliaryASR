@@ -195,6 +195,39 @@ dataloader_params:
     shuffle_within_bucket: true
     shuffle_batches: true
 
+training_curriculum:
+  batch_size_schedule:
+    enabled: true
+    base_batch_size: 64
+    initial_batch_size: 24
+    apply_to_validation: false
+    evaluation_epoch: null
+    # With a 20-epoch learning-rate warm-up we keep the early batches smaller and
+    # progressively grow them so that the optimiser sees steadier gradient noise
+    # as the LR ramps.  The linear strategy interpolates between the anchors so
+    # the batch size increases smoothly every epoch until the warm-up finishes.
+    strategies:
+      milestones:
+        enabled: true
+        schedule:
+          - epoch: 1
+            batch_size: 24
+          - epoch: 5
+            batch_size: 32
+          - epoch: 10
+            batch_size: 40
+          - epoch: 15
+            batch_size: 52
+          - epoch: 20
+            batch_size: 64
+      linear:
+        enabled: true
+        update_interval: 1
+        start_epoch: 1
+        end_epoch: 20
+        start_batch_size: 24
+        end_batch_size: 64
+
 loss_weights:
   ctc: 0.8
   s2s: 1.0

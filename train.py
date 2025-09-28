@@ -245,6 +245,7 @@ def main(config_path):
 
     train_entries, train_durations = prepare_data_list(raw_train_list, root_path="")
     val_entries, val_durations = prepare_data_list(raw_val_list, root_path="")
+    num_train_items = len(train_entries)
 
     # sort data list by duration for consistent bucketing and batching
     # to reduce padding, improving both training stability and alignment accuracy
@@ -256,37 +257,74 @@ def main(config_path):
     val_num_workers = int(dataloader_params.get('val_num_workers', 2))
     train_bucket_sampler_config = dataloader_params.get('train_bucket_sampler', {})
 
+    base_eval_batch_size = int(cfg_get_nested(config, 'eval_params.batch_size', batch_size))
+    curriculum_batch_cfg = cfg_get_nested(config, 'training_curriculum.batch_size_schedule', {}) or {}
+    batch_scheduler = BatchSizeScheduler(curriculum_batch_cfg, default_batch_size=batch_size, total_epochs=epochs)
+
+    if batch_scheduler.enabled:
+        print(f"[Curriculum] Batch size schedule enabled: {batch_scheduler.summary()}")
+    else:
+        print(f"[Curriculum] Static batch size configured: {batch_size}")
+
     collate_config = {'return_speaker_ids': True}
 
-    sorted_train_dataloader = build_dataloader(train_list_sorted,
-                                        batch_size=batch_size,
-                                        num_workers=train_num_workers,
-                                        dataset_config=dataset_params,
-                                        device=device,
-                                        collate_config=collate_config)
-    shuffled_train_dataloader = build_dataloader(train_entries,
-                                            batch_size=batch_size,
-                                            num_workers=train_num_workers,
-                                            dataset_config=dataset_params,
-                                            device=device,
-                                            lengths=train_durations,
-                                            bucket_sampler_config=train_bucket_sampler_config,
-                                            collate_config=collate_config)
+    def _build_dataloaders_for_batch(current_batch_size):
+        current_batch_size = int(current_batch_size)
+        validation_batch_size = int(current_batch_size if batch_scheduler.apply_to_validation else base_eval_batch_size)
 
-    sorted_val_dataloader = build_dataloader(val_list_sorted,
-                                      batch_size=batch_size,
-                                      validation=True,
-                                      num_workers=val_num_workers,
-                                      device=device,
-                                      dataset_config=dataset_params,
-                                      collate_config=collate_config)
-    shuffled_val_dataloader = build_dataloader(val_entries,
-                                          batch_size=batch_size,
-                                          validation=True,
-                                          num_workers=val_num_workers,
-                                          device=device,
-                                          dataset_config=dataset_params,
-                                          collate_config=collate_config)
+        sorted_train_loader = build_dataloader(
+            train_list_sorted,
+            batch_size=current_batch_size,
+            num_workers=train_num_workers,
+            dataset_config=dataset_params,
+            device=device,
+            collate_config=collate_config)
+
+        shuffled_train_loader = build_dataloader(
+            train_entries,
+            batch_size=current_batch_size,
+            num_workers=train_num_workers,
+            dataset_config=dataset_params,
+            device=device,
+            lengths=train_durations,
+            bucket_sampler_config=train_bucket_sampler_config,
+            collate_config=collate_config)
+
+        sorted_val_loader = build_dataloader(
+            val_list_sorted,
+            batch_size=validation_batch_size,
+            validation=True,
+            num_workers=val_num_workers,
+            device=device,
+            dataset_config=dataset_params,
+            collate_config=collate_config)
+
+        shuffled_val_loader = build_dataloader(
+            val_entries,
+            batch_size=validation_batch_size,
+            validation=True,
+            num_workers=val_num_workers,
+            device=device,
+            dataset_config=dataset_params,
+            collate_config=collate_config)
+
+        steps = len(sorted_train_loader) if sorted_train_loader is not None else len(shuffled_train_loader)
+        steps = int(steps)
+        if steps <= 0:
+            raise ValueError(
+                f"Curriculum batch size {current_batch_size} is too large for the training set and would produce no steps."
+            )
+
+        return (
+            sorted_train_loader,
+            shuffled_train_loader,
+            sorted_val_loader,
+            shuffled_val_loader,
+            steps,
+        )
+
+    initial_batch_size = batch_scheduler.batch_size_for_epoch(1)
+    sorted_train_dataloader, shuffled_train_dataloader, sorted_val_dataloader, shuffled_val_dataloader, steps_per_epoch = _build_dataloaders_for_batch(initial_batch_size)
 
     word_indexes = set(
         line.strip() for line in open(cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'))
@@ -333,12 +371,15 @@ def main(config_path):
 
     model = build_model(model_params=model_params)
 
+    total_training_steps = batch_scheduler.expected_total_steps(num_train_items)
     scheduler_params = {
             'max_lr': float(cfg_get_nested( config, 'optimizer_params.lr', 5e-4)),
             'pct_start': float(cfg_get_nested( config, 'optimizer_params.pct_start', 0.1)),
             'epochs': epochs,
-            'steps_per_epoch': len(sorted_train_dataloader),
+            'steps_per_epoch': steps_per_epoch,
+            'total_steps': total_training_steps,
         }
+    config['scheduler_params'] = scheduler_params
 
     entropy_params = cfg_get_nested( config, 'entropy_params', { "label_smoothing": 0.1 })
 
@@ -412,6 +453,46 @@ def main(config_path):
                     steps_per_epoch=steps_per_epoch
                     )
 
+    current_train_batch_size = int(initial_batch_size)
+
+    def _ensure_curriculum_for_epoch(epoch):
+        nonlocal sorted_train_dataloader
+        nonlocal shuffled_train_dataloader
+        nonlocal sorted_val_dataloader
+        nonlocal shuffled_val_dataloader
+        nonlocal steps_per_epoch
+        nonlocal current_train_batch_size
+
+        desired_batch_size = int(batch_scheduler.batch_size_for_epoch(epoch))
+        if desired_batch_size != current_train_batch_size:
+            (
+                sorted_train_dataloader,
+                shuffled_train_dataloader,
+                sorted_val_dataloader,
+                shuffled_val_dataloader,
+                steps_per_epoch,
+            ) = _build_dataloaders_for_batch(desired_batch_size)
+
+            trainer.update_dataloaders(
+                sorted_train=sorted_train_dataloader,
+                shuffled_train=shuffled_train_dataloader,
+                sorted_val=sorted_val_dataloader,
+                shuffled_val=shuffled_val_dataloader,
+                steps_per_epoch=steps_per_epoch,
+            )
+            current_train_batch_size = desired_batch_size
+            print(f"[Curriculum] Epoch {epoch}: updated batch size to {desired_batch_size}")
+        else:
+            trainer.update_dataloaders(steps_per_epoch=steps_per_epoch)
+
+    def _curriculum_completed_steps(num_epochs_completed):
+        completed = 0
+        total_epochs_completed = max(0, int(num_epochs_completed))
+        for epoch_idx in range(1, total_epochs_completed + 1):
+            batch_sz = max(1, batch_scheduler.batch_size_for_epoch(epoch_idx))
+            completed += max(1, num_train_items // batch_sz)
+        return completed
+
     pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )
     load_only_params = cfg_get_nested( config, 'load_only_params', False )
     if isinstance(pretrained_model, bool) and pretrained_model == True:
@@ -445,7 +526,14 @@ def main(config_path):
         print(f"Unrecognized value for load_checkpoint config option, starting training from epoch 1 - {pretrained_model}")
         start_epoch = 1
 
+    _ensure_curriculum_for_epoch(start_epoch)
+    if trainer._resumed_from_checkpoint:
+        trainer.handle_sortagrad_after_resume()
+        completed_steps = _curriculum_completed_steps(trainer.epochs)
+        trainer.sync_scheduler_to_progress(completed_steps=completed_steps)
+
     for epoch in range(start_epoch, epochs+1):
+        _ensure_curriculum_for_epoch(epoch)
         train_results = trainer._train_epoch()
         eval_results = trainer._eval_epoch()
 

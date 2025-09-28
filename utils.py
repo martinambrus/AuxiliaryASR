@@ -1,3 +1,4 @@
+import math
 import os
 import os.path as osp
 import sys
@@ -14,6 +15,7 @@ import jiwer
 
 import matplotlib.pylab as plt
 from pathlib import Path
+from typing import Dict, Iterable, List, Optional, Tuple
 
 from decoding import build_decoder_from_config
 
@@ -165,3 +167,233 @@ def diagonal_attention_prior(attn, text_lengths, mel_lengths, sigma=0.5):
     expected = expected.unsqueeze(0).expand(B, -1, -1)  # [B, T_text, T_mel]
     loss = torch.mean(attn * (1.0 - expected))  # Encourage attention mass to lie on the diagonal
     return loss
+
+
+class BatchSizeScheduler:
+    """Utility to manage curriculum batch-size schedules.
+
+    The scheduler consumes the ``training_curriculum.batch_size_schedule``
+    section from the configuration dictionary and produces the batch size that
+    should be used for each epoch.  Two complementary strategies are supported:
+
+    * ``milestones`` – Specify explicit ``epoch`` → ``batch_size`` pairs.  The
+      batch size is held constant between milestones.
+    * ``linear`` – Optionally enable linear interpolation between the milestone
+      anchors.  The interpolation frequency can be controlled with
+      ``update_interval`` so that the batch size only changes every ``n``
+      epochs.
+
+    Both strategies can be enabled at the same time.  In that case milestones
+    provide the anchor points and the linear strategy interpolates between
+    them.  When no milestones are supplied the linear configuration is used to
+    derive the start and end anchors, falling back to ``initial_batch_size`` and
+    ``base_batch_size`` respectively.
+
+    The scheduler is deterministic and pre-computes the curriculum for all
+    epochs, making it safe to query in notebooks or in the training loop.
+    """
+
+    def __init__(
+        self,
+        schedule_config: Optional[Dict] = None,
+        default_batch_size: int = 1,
+        total_epochs: int = 1,
+    ) -> None:
+        schedule_config = schedule_config or {}
+        if not isinstance(schedule_config, dict):
+            schedule_config = {}
+
+        self.config = schedule_config
+        self.enabled = bool(schedule_config.get("enabled", False))
+        self.total_epochs = max(1, int(total_epochs))
+        self.default_batch_size = max(1, int(default_batch_size))
+        self.base_batch_size = max(
+            1,
+            int(schedule_config.get("base_batch_size", self.default_batch_size)),
+        )
+        self.initial_batch_size = max(
+            1,
+            int(schedule_config.get("initial_batch_size", self.default_batch_size)),
+        )
+        self.apply_to_validation = bool(schedule_config.get("apply_to_validation", False))
+
+        eval_epoch = schedule_config.get("evaluation_epoch")
+        try:
+            self.evaluation_epoch = int(eval_epoch) if eval_epoch is not None else None
+        except (TypeError, ValueError):
+            self.evaluation_epoch = None
+
+        strategies = schedule_config.get("strategies", {})
+        if not isinstance(strategies, dict):
+            strategies = {}
+        self._milestone_cfg = strategies.get("milestones", {}) or {}
+        if not isinstance(self._milestone_cfg, dict):
+            self._milestone_cfg = {}
+        self._linear_cfg = strategies.get("linear", {}) or {}
+        if not isinstance(self._linear_cfg, dict):
+            self._linear_cfg = {}
+
+        self.linear_enabled = bool(self._linear_cfg.get("enabled", False))
+        self.linear_update_interval = max(
+            1,
+            int(self._linear_cfg.get("update_interval", 1)),
+        )
+
+        self._anchors = self._build_anchors()
+        self._epoch_schedule = self._build_epoch_schedule()
+
+    def _build_anchors(self) -> List[Tuple[int, int]]:
+        if not self.enabled:
+            return [(1, self.default_batch_size), (self.total_epochs, self.default_batch_size)]
+
+        anchors: Dict[int, int] = {}
+        schedule_entries: Iterable = []
+        if isinstance(self._milestone_cfg, dict):
+            entries = self._milestone_cfg.get("schedule", [])
+            if isinstance(entries, dict):
+                schedule_entries = entries.items()
+            else:
+                schedule_entries = entries
+
+        for entry in schedule_entries:
+            if isinstance(entry, dict):
+                epoch = entry.get("epoch", entry.get("start_epoch"))
+                batch_size = entry.get("batch_size", entry.get("value"))
+            elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                epoch, batch_size = entry[0], entry[1]
+            else:
+                continue
+
+            try:
+                epoch = int(epoch)
+                batch_size = int(batch_size)
+            except (TypeError, ValueError):
+                continue
+
+            if epoch < 1:
+                epoch = 1
+
+            anchors[epoch] = max(1, batch_size)
+
+        if not anchors and self.linear_enabled:
+            start_epoch = max(1, int(self._linear_cfg.get("start_epoch", 1)))
+            end_epoch = max(start_epoch, int(self._linear_cfg.get("end_epoch", self.total_epochs)))
+            start_bs = max(1, int(self._linear_cfg.get("start_batch_size", self.initial_batch_size)))
+            end_bs = max(1, int(self._linear_cfg.get("end_batch_size", self.base_batch_size)))
+            anchors[start_epoch] = start_bs
+            anchors[end_epoch] = end_bs
+
+        if 1 not in anchors:
+            anchors[1] = self.initial_batch_size
+
+        final_epoch = self.total_epochs
+        final_value = anchors.get(final_epoch, self.base_batch_size)
+        if self.linear_enabled:
+            final_value = int(self._linear_cfg.get("end_batch_size", final_value))
+        anchors[final_epoch] = max(1, final_value)
+
+        filtered: Dict[int, int] = {}
+        for epoch, batch_size in anchors.items():
+            epoch = int(epoch)
+            if epoch < 1:
+                continue
+            if epoch > self.total_epochs:
+                epoch = self.total_epochs
+            filtered[epoch] = max(1, int(batch_size))
+
+        return sorted(filtered.items(), key=lambda item: item[0])
+
+    def _build_epoch_schedule(self) -> List[int]:
+        schedule = [self.default_batch_size] * (self.total_epochs + 1)
+        if not self.enabled:
+            for epoch in range(1, self.total_epochs + 1):
+                schedule[epoch] = self.default_batch_size
+            return schedule
+
+        anchors = self._anchors
+        if len(anchors) == 1:
+            value = max(1, anchors[0][1])
+            for epoch in range(1, self.total_epochs + 1):
+                schedule[epoch] = value
+            return schedule
+
+        last_value = self.initial_batch_size
+        for epoch in range(1, self.total_epochs + 1):
+            prev_anchor = anchors[0]
+            next_anchor = anchors[-1]
+            for anchor in anchors:
+                if anchor[0] <= epoch:
+                    prev_anchor = anchor
+                if anchor[0] >= epoch:
+                    next_anchor = anchor
+                    break
+
+            if self.linear_enabled and next_anchor[0] > prev_anchor[0]:
+                span = max(1, next_anchor[0] - prev_anchor[0])
+                progress = (epoch - prev_anchor[0]) / span
+                progress = min(max(progress, 0.0), 1.0)
+                interpolated = prev_anchor[1] + progress * (next_anchor[1] - prev_anchor[1])
+                value = int(round(interpolated))
+                if (
+                    self.linear_update_interval > 1
+                    and epoch != prev_anchor[0]
+                    and (epoch - prev_anchor[0]) % self.linear_update_interval != 0
+                ):
+                    value = last_value
+            else:
+                value = prev_anchor[1]
+
+            value = max(1, int(value))
+            schedule[epoch] = value
+            last_value = value
+
+        return schedule
+
+    def batch_size_for_epoch(self, epoch: int) -> int:
+        epoch = int(epoch)
+        if epoch < 1:
+            epoch = 1
+        if epoch > self.total_epochs:
+            epoch = self.total_epochs
+        return self._epoch_schedule[epoch]
+
+    def epoch_schedule(self) -> Dict[int, int]:
+        return {epoch: self._epoch_schedule[epoch] for epoch in range(1, self.total_epochs + 1)}
+
+    def summary(self, max_entries: int = 10) -> str:
+        """Return a readable summary of schedule transitions."""
+
+        transitions: List[Tuple[int, int]] = []
+        last_value = None
+        for epoch in range(1, self.total_epochs + 1):
+            value = self._epoch_schedule[epoch]
+            if value != last_value:
+                transitions.append((epoch, value))
+                last_value = value
+
+        if len(transitions) > max_entries:
+            head = transitions[: max_entries - 1]
+            tail = transitions[-1:]
+            summary_parts = ["%i→%i" % (e, v) for e, v in head]
+            summary_parts.append("…")
+            summary_parts.extend("%i→%i" % (e, v) for e, v in tail)
+        else:
+            summary_parts = ["%i→%i" % (e, v) for e, v in transitions]
+
+        return ", ".join(summary_parts)
+
+    def final_batch_size(self) -> int:
+        return self.batch_size_for_epoch(self.total_epochs)
+
+    def expected_total_steps(self, dataset_size: int) -> int:
+        dataset_size = max(1, int(dataset_size))
+        total_steps = 0
+        for epoch in range(1, self.total_epochs + 1):
+            batch_size = max(1, self.batch_size_for_epoch(epoch))
+            # ``len(dataloader)`` effectively performs a ``math.ceil`` over the
+            # batch size, so mirror that behaviour here to keep the
+            # OneCycle/linear warm-up schedulers in sync with the true number of
+            # optimisation steps executed per epoch.
+            steps = max(1, math.ceil(dataset_size / float(batch_size)))
+            total_steps += steps
+        return total_steps
