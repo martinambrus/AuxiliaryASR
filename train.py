@@ -51,12 +51,158 @@ _OPTIONAL_TQDM = _load_optional_tqdm()
 _METADATA_CACHE_VERSION = 2
 
 
+try:
+    import torchaudio  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    torchaudio = None
+
+try:
+    import soundfile  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    soundfile = None
+
+
+def _safe_int(value, default=-1):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _metadata_backend_torchaudio(path):
+    info = torchaudio.info(path)
+    bits_per_sample = getattr(info, "bits_per_sample", None)
+    sample_width = None
+    if bits_per_sample:
+        try:
+            sample_width = int(bits_per_sample) // 8
+        except (TypeError, ValueError):
+            sample_width = None
+    metadata = {
+        "sample_rate": _safe_int(getattr(info, "sample_rate", None)),
+        "frames": _safe_int(getattr(info, "num_frames", None)),
+        "channels": _safe_int(getattr(info, "num_channels", None)),
+        "sample_width": _safe_int(sample_width),
+    }
+    return metadata
+
+
+def _metadata_backend_soundfile(path):
+    info = soundfile.info(path)
+    subtype = getattr(info, "subtype", "") or ""
+    subtype_info = getattr(info, "subtype_info", "") or ""
+    match = re.search(r"(\d+)", subtype) or re.search(r"(\d+)", subtype_info)
+    bits_per_sample = int(match.group(1)) if match else None
+    sample_width = None
+    if bits_per_sample:
+        try:
+            sample_width = bits_per_sample // 8
+        except Exception:
+            sample_width = None
+    metadata = {
+        "sample_rate": _safe_int(getattr(info, "samplerate", None)),
+        "frames": _safe_int(getattr(info, "frames", None)),
+        "channels": _safe_int(getattr(info, "channels", None)),
+        "sample_width": _safe_int(sample_width),
+    }
+    return metadata
+
+
+def _metadata_backend_wave(path):
+    with wave.open(path, "rb") as wf:
+        metadata = {
+            "sample_rate": _safe_int(wf.getframerate()),
+            "frames": _safe_int(wf.getnframes()),
+            "channels": _safe_int(wf.getnchannels()),
+            "sample_width": _safe_int(wf.getsampwidth()),
+        }
+    return metadata
+
+
+_METADATA_BACKENDS = {
+    "torchaudio_info": {
+        "available": torchaudio is not None,
+        "probe": _metadata_backend_torchaudio if torchaudio is not None else None,
+    },
+    "soundfile_info": {
+        "available": soundfile is not None,
+        "probe": _metadata_backend_soundfile if soundfile is not None else None,
+    },
+    "wave": {
+        "available": True,
+        "probe": _metadata_backend_wave,
+    },
+}
+
+
+def _normalise_metadata_backend_config(config):
+    if not isinstance(config, dict):
+        return {}
+    return config
+
+
+def _iter_enabled_metadata_backends(config):
+    config = _normalise_metadata_backend_config(config)
+    default_order = ["torchaudio_info", "soundfile_info", "wave"]
+    order = config.get("order")
+    if isinstance(order, (list, tuple)):
+        normalised = []
+        for item in order:
+            key = str(item).strip()
+            if not key:
+                continue
+            if key not in normalised:
+                normalised.append(key)
+        order = normalised
+    else:
+        order = []
+    for key in default_order:
+        if key not in order:
+            order.append(key)
+
+    for key in order:
+        backend = _METADATA_BACKENDS.get(key)
+        if backend is None:
+            continue
+        entry_cfg = config.get(key, {})
+        if isinstance(entry_cfg, dict):
+            enabled = entry_cfg.get("enabled", True)
+            required = bool(entry_cfg.get("required", False))
+        else:
+            enabled = entry_cfg if key in config else True
+            required = False
+        if not enabled:
+            if required:
+                raise ValueError(f"Metadata backend '{key}' is marked as required but disabled")
+            continue
+        if not backend.get("available", False):
+            if required:
+                raise RuntimeError(
+                    f"Requested metadata backend '{key}' is not available. "
+                    "Install the corresponding dependency or disable it in the configuration."
+                )
+            continue
+        probe = backend.get("probe")
+        if probe is None:
+            continue
+        yield key, probe
+
+
+def _build_metadata_probe_sequence(config):
+    backends = list(_iter_enabled_metadata_backends(config))
+    if not backends:
+        # Ensure that we always have at least the built-in wave backend
+        backends = [("wave", _metadata_backend_wave)]
+    return backends
+
+
 def prepare_data_list(
     raw_data_list,
     root_path="",
     cache_config=None,
     metadata_path=None,
     dataset_name=None,
+    metadata_readers=None,
 ):
     """Parse metadata lines and compute WAV durations with optional caching.
 
@@ -76,6 +222,12 @@ def prepare_data_list(
             to track file modification times for invalidation.
         dataset_name: Identifier of the dataset split (e.g. ``"train"`` or
             ``"val"``).  Used when applying per-dataset cache toggles.
+        metadata_readers: Optional dictionary configuring the audio metadata
+            reader backends.  The supported keys are ``torchaudio_info``,
+            ``soundfile_info`` and ``wave``.  Each entry accepts ``enabled`` and
+            ``required`` booleans, and an optional ``order`` list specifies the
+            probing priority.  When omitted the default order is
+            torchaudio → soundfile → wave.
 
     Returns:
         Tuple ``(prepared_list, durations)`` where ``prepared_list`` contains
@@ -120,6 +272,33 @@ def prepare_data_list(
         toggles = {str(k).strip().lower(): bool(v) for k, v in dataset_toggles.items()}
         if dataset_key in toggles:
             cache_enabled = cache_enabled and toggles.get(dataset_key, True)
+
+    metadata_reader_cfg = metadata_readers if isinstance(metadata_readers, dict) else {}
+    metadata_backends = _build_metadata_probe_sequence(metadata_reader_cfg)
+    metadata_backend_names = [name for name, _ in metadata_backends]
+
+    def _probe_audio_metadata(audio_path):
+        last_error = None
+        for backend_name, backend_fn in metadata_backends:
+            try:
+                metadata = backend_fn(audio_path)
+            except Exception as exc:  # pragma: no cover - depends on runtime files
+                last_error = exc
+                logger.debug(
+                    "Metadata backend '%s' failed for %s: %s",
+                    backend_name,
+                    audio_path,
+                    exc,
+                )
+                continue
+            return metadata, backend_name
+        raise last_error or RuntimeError(f"Could not read audio metadata for {audio_path}")
+
+    logger.debug(
+        "Using audio metadata backends for '%s': %s",
+        dataset_key,
+        ", ".join(metadata_backend_names),
+    )
 
     metadata_path_obj = Path(metadata_path).expanduser() if metadata_path else None
     metadata_stat = None
@@ -209,16 +388,16 @@ def prepare_data_list(
                     if first_path:
                         first_wav_path = os.path.join(root_path_str, first_path)
                         try:
-                            with wave.open(first_wav_path, "rb") as wf:
-                                current_signature = {
-                                    "sample_rate": wf.getframerate(),
-                                    "frames": wf.getnframes(),
-                                    "channels": wf.getnchannels(),
-                                    "sample_width": wf.getsampwidth(),
-                                }
+                            current_format, _ = _probe_audio_metadata(first_wav_path)
                         except Exception:
                             cache_valid = False
                         else:
+                            current_signature = {
+                                "sample_rate": _safe_int(current_format.get("sample_rate")),
+                                "frames": _safe_int(current_format.get("frames")),
+                                "channels": _safe_int(current_format.get("channels")),
+                                "sample_width": _safe_int(current_format.get("sample_width")),
+                            }
                             for key in ("sample_rate", "frames", "channels", "sample_width"):
                                 cached_value = int(first_signature.get(key, -1))
                                 current_value = int(current_signature.get(key, -2))
@@ -305,12 +484,12 @@ def prepare_data_list(
 
         try:
             audio_stat = _stat_file(wav_path)
-            with wave.open(wav_path, "rb") as wf:
-                frames = wf.getnframes()
-                rate = wf.getframerate()
-                channels = wf.getnchannels()
-                sample_width = wf.getsampwidth()
-                duration = frames / float(rate) if rate else 0.0
+            audio_format, backend_used = _probe_audio_metadata(wav_path)
+            frames = _safe_int(audio_format.get("frames"), 0)
+            rate = _safe_int(audio_format.get("sample_rate"), 0)
+            channels = _safe_int(audio_format.get("channels"), 0)
+            sample_width = _safe_int(audio_format.get("sample_width"), -1)
+            duration = frames / float(rate) if rate else 0.0
         except Exception as e:
             print(f"Error for wave path: {wav_path}, {e}")
             continue
@@ -320,10 +499,11 @@ def prepare_data_list(
         cached_audio_stats.append(audio_stat)
         cached_audio_formats.append(
             {
-                "sample_rate": int(rate),
-                "frames": int(frames),
-                "channels": int(channels),
-                "sample_width": int(sample_width),
+                "sample_rate": _safe_int(rate),
+                "frames": _safe_int(frames),
+                "channels": _safe_int(channels),
+                "sample_width": _safe_int(sample_width),
+                "backend": backend_used,
             }
         )
 
@@ -520,6 +700,7 @@ def main(config_path):
             dataset_params[override_key] = override_value
 
     metadata_cache_config = cfg_get_nested(config, 'metadata_cache', {}) or {}
+    metadata_reader_config = cfg_get_nested(config, 'metadata_readers', {}) or {}
     (
         raw_train_list,
         raw_val_list,
@@ -533,6 +714,7 @@ def main(config_path):
         cache_config=metadata_cache_config,
         metadata_path=train_metadata_path,
         dataset_name="train",
+        metadata_readers=metadata_reader_config,
     )
     val_entries, val_durations = prepare_data_list(
         raw_val_list,
@@ -540,6 +722,7 @@ def main(config_path):
         cache_config=metadata_cache_config,
         metadata_path=val_metadata_path,
         dataset_name="val",
+        metadata_readers=metadata_reader_config,
     )
     num_train_items = len(train_entries)
 

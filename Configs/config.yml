@@ -23,6 +23,25 @@ metadata_cache:
     val: true    # Cache the validation metadata file.
     ood: false   # Cache out-of-domain metadata when available.
 
+# Configure the preferred audio metadata readers used when computing durations.
+# All enabled backends are probed in order until one successfully returns the
+# sample rate and frame count.  Disable a backend by setting ``enabled: false``
+# or mark it as ``required: true`` to raise an error when the dependency is
+# missing.  When this section is omitted the default probing order is
+# torchaudio.info -> soundfile.info -> wave.
+metadata_readers:
+  order:
+    - torchaudio_info  # Try torchaudio.info first for the fastest metadata lookup.
+    - soundfile_info   # Fallback to soundfile.info when torchaudio is unavailable.
+    - wave             # Always keep the built-in wave module as a safe fallback.
+  torchaudio_info:
+    enabled: true   # Requires torchaudio; disable if the package is not installed.
+    required: false  # Set to true to abort if torchaudio is missing.
+  soundfile_info:
+    enabled: true   # Requires the soundfile package. Leave enabled when available.
+  wave:
+    enabled: true   # Built-in Python wave module acts as the last-resort backend.
+
 memory_optimizations:
   lazy_masks:
     enabled: true
