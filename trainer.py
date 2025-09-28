@@ -9,7 +9,7 @@ from collections import defaultdict
 import numpy as np
 import torch
 from torch import nn
-from torch.cuda.amp import autocast, GradScaler
+from torch.cuda.amp import GradScaler
 from PIL import Image
 from tqdm import tqdm
 
@@ -727,7 +727,9 @@ class Trainer(object):
         autocast_dtype = self.mixed_precision_dtype if self.autocast_enabled else None
         grad_scaler = self.grad_scaler if self.grad_scaler is not None else None
 
-        with autocast(enabled=self.autocast_enabled, dtype=autocast_dtype):
+        with torch.amp.autocast(
+            "cuda", enabled=self.autocast_enabled, dtype=autocast_dtype
+        ):
             model_outputs = self.model(
                 mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 

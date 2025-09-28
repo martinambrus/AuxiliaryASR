@@ -23,6 +23,7 @@ memory_optimizations:
     segments: 1
     min_sequence_length: 0
     use_checkpoint_sequential: true
+    use_reentrant: false
 
 precision:
   mixed_precision:
