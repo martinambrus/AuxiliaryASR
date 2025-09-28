@@ -372,20 +372,86 @@ def main(config_path):
     model = build_model(model_params=model_params)
 
     total_training_steps = batch_scheduler.expected_total_steps(num_train_items)
-    scheduler_params = {
-            'max_lr': float(cfg_get_nested( config, 'optimizer_params.lr', 5e-4)),
-            'pct_start': float(cfg_get_nested( config, 'optimizer_params.pct_start', 0.1)),
-            'epochs': epochs,
-            'steps_per_epoch': steps_per_epoch,
-            'total_steps': total_training_steps,
+
+    optimizer_config = dict(cfg_get_nested(config, 'optimizer_params', {}) or {})
+    scheduler_config = optimizer_config.get('scheduler')
+    if scheduler_config is None and 'pct_start' in optimizer_config:
+        scheduler_config = {
+            'enabled': True,
+            'type': 'one_cycle',
+            'one_cycle': {
+                'pct_start': optimizer_config.get('pct_start'),
+                'final_div_factor': optimizer_config.get('final_div_factor', 5.0),
+            },
         }
-    config['scheduler_params'] = scheduler_params
+        optimizer_config['scheduler'] = scheduler_config
+    scheduler_config = scheduler_config or {}
+    scheduler_enabled = bool(scheduler_config.get('enabled', True))
+    scheduler_type = scheduler_config.get('type', 'one_cycle')
+
+    scheduler_runtime_params = {
+        'epochs': epochs,
+        'steps_per_epoch': steps_per_epoch,
+        'total_steps': total_training_steps,
+    }
+
+    max_lr = float(optimizer_config.get('max_lr', optimizer_config.get('lr', 5e-4)))
+    scheduler_metadata = {
+        'enabled': scheduler_enabled,
+        'type': scheduler_type,
+        'max_lr': max_lr,
+    }
+
+    if scheduler_enabled:
+        if scheduler_type == 'one_cycle':
+            one_cycle_cfg = scheduler_config.get('one_cycle', {}) or {}
+            pct_start = float(one_cycle_cfg.get('pct_start', optimizer_config.get('pct_start', 0.1)))
+            final_div_factor = float(one_cycle_cfg.get('final_div_factor', optimizer_config.get('final_div_factor', 5.0)))
+            total_steps_override = one_cycle_cfg.get('total_steps')
+            steps_override = one_cycle_cfg.get('steps_per_epoch')
+            epochs_override = one_cycle_cfg.get('epochs')
+            scheduler_metadata.update({
+                'pct_start': pct_start,
+                'final_div_factor': final_div_factor,
+                'total_steps': int(total_steps_override if total_steps_override is not None else total_training_steps),
+                'steps_per_epoch': int(steps_override if steps_override is not None else steps_per_epoch),
+                'epochs': int(epochs_override if epochs_override is not None else epochs),
+            })
+        elif scheduler_type == 'cosine_warm_restarts':
+            cosine_cfg = scheduler_config.get('cosine_warm_restarts', {}) or {}
+            T_0_steps = cosine_cfg.get('T_0_steps')
+            if T_0_steps is None:
+                T_0_epochs = cosine_cfg.get('T_0_epochs', 1)
+                T_0_steps = max(1, int(round(float(T_0_epochs) * steps_per_epoch)))
+            else:
+                T_0_steps = max(1, int(T_0_steps))
+            T_mult = int(cosine_cfg.get('T_mult', 1))
+            eta_min = float(cosine_cfg.get('eta_min', 0.0))
+            warmup_pct = float(cosine_cfg.get('warmup_pct', cosine_cfg.get('pct_start', optimizer_config.get('pct_start', 0.0))))
+            warmup_steps = cosine_cfg.get('warmup_steps')
+            if warmup_steps is None:
+                warmup_steps = int(round(T_0_steps * warmup_pct))
+            else:
+                warmup_steps = int(warmup_steps)
+            warmup_start_lr = float(cosine_cfg.get('warmup_start_lr', eta_min))
+            scheduler_metadata.update({
+                'T_0': T_0_steps,
+                'T_mult': T_mult,
+                'eta_min': eta_min,
+                'warmup_steps': warmup_steps,
+                'warmup_start_lr': warmup_start_lr,
+                'pct_start': warmup_pct,
+            })
+
+    config['scheduler_params'] = scheduler_metadata
 
     entropy_params = cfg_get_nested( config, 'entropy_params', { "label_smoothing": 0.1 })
 
     model.to(device)
     optimizer, scheduler = build_optimizer(
-        {"params": model.parameters(), "optimizer_params":{}, "scheduler_params": scheduler_params})
+        {"params": model.parameters(), "optimizer_params": optimizer_config},
+        runtime_params=scheduler_runtime_params,
+    )
 
     blank_index = sorted_train_dataloader.dataset.text_cleaner.word_index_dictionary[" "] # get blank index
     criterion = build_criterion(critic_params={

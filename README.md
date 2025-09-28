@@ -91,7 +91,7 @@ loss_weights:
 
 Each augmentation block can be toggled on or off independently through `Configs/config.yml`, allowing you to combine time warping, adaptive masking, frame dropping, VTLP, noise/reverberation mixing (including MUSAN and room impulse responses), and phoneme-level dropout as needed.
 
-Increasing the warm-up ratio (`optimizer_params.pct_start`) or reducing the batch size can also help when the number of training utterances is limited.
+Increasing the warm-up ratio (`optimizer_params.scheduler.one_cycle.pct_start`) or switching to the cosine warm-restart schedule (`optimizer_params.scheduler.type: cosine_warm_restarts`) can also help when the number of training utterances is limited. Adjust the corresponding scheduler block in `Configs/config.yml` to toggle each strategy independently.
 
 ### Languages
 This repo is set up for English with the [phonemizer](https://github.com/bootphon/phonemizer) package and espeak-ng backend. You can train it with other languages. If you would like to train for datasets in different languages, you will need to change the vocabulary file ([word_index_dict.txt](https://github.com/martinambrus/AuxiliaryASR/blob/main/word_index_dict.txt)) to contain the phonemes in your dataset. There is a utility script ([words_index_extractor.py](https://github.com/martinambrus/AuxiliaryASR/blob/main/words_index_extractor.py)) which will generate (and **_rewrite_**!) the file words_index_dict.txt when ran. Here's the syntax to use to generate this file:

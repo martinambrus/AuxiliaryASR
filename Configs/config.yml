@@ -110,7 +110,22 @@ stabilization:
 
 optimizer_params:
   lr: 0.0005
-  pct_start: 0.1
+  weight_decay: 0.0005
+  scheduler:
+    enabled: true
+    type: one_cycle  # options: one_cycle, cosine_warm_restarts
+    one_cycle:
+      pct_start: 0.1
+      final_div_factor: 5.0
+      total_steps: null
+    cosine_warm_restarts:
+      T_0_epochs: 10
+      T_0_steps: null
+      T_mult: 1
+      eta_min: 1.0e-06
+      warmup_pct: 0.1
+      warmup_steps: null
+      warmup_start_lr: 0.0
 
 # this is a very basic early stopping based off learning rate - when it falls to 0 and remains there for 3 epochs, the training stops
 enable_early_stopping: True

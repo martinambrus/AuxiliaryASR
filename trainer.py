@@ -483,7 +483,7 @@ class Trainer(object):
         """
         state_dict = {
             "optimizer": self.optimizer.state_dict(),
-            "scheduler": self.scheduler.state_dict(),
+            "scheduler": self.scheduler.state_dict() if self.scheduler is not None else {},
             "steps": self.steps,
             "epochs": self.epochs,
         }
@@ -512,8 +512,10 @@ class Trainer(object):
             self.logger.info("Starting training from epoch %i" % state_dict["epochs"])
 
             # overwrite schedular argument parameters
-            state_dict["scheduler"].update(**self.config.get("scheduler_params", {}))
-            self.scheduler.load_state_dict(state_dict["scheduler"])
+            scheduler_state = state_dict.get("scheduler", {})
+            scheduler_state.update(**self.config.get("scheduler_params", {}))
+            if self.scheduler is not None:
+                self.scheduler.load_state_dict(scheduler_state)
 
         self._optimizer_step_count = self._get_optimizer_step_count()
 
