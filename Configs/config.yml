@@ -37,13 +37,21 @@ precision:
 
 runtime:
   torch_compile:
+    # Master switch for wrapping the model with torch.compile.
     enabled: false
+    # When true, the training graph is compiled so optimizer steps use the compiled kernels.
     compile_train: true
+    # When true, evaluation/validation runs also reuse a compiled graph.
     compile_eval: false
+    # Backend passed to torch.compile. "inductor" is the default backend in PyTorch 2.x.
     backend: inductor
+    # Optimization mode to use (e.g., default, reduce-overhead, max-autotune).
     mode: default
+    # Request full-graph capture instead of allowing graph breaks when possible.
     fullgraph: false
+    # Enable support for dynamic shapes when models require variable dimensions.
     dynamic: false
+    # Extra keyword arguments forwarded to torch.compile backend specific tunables.
     options: {}
 
 preprocess_params:
