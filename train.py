@@ -10,14 +10,17 @@ import math
 import wave
 import re
 import sys
-import yaml
+import json
 import shutil
+import hashlib
+import yaml
 import numpy as np
 import torch
 from torch.utils.tensorboard import SummaryWriter
 import click
 import importlib
 import importlib.util
+from pathlib import Path
 
 # enable better memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -45,19 +48,61 @@ def _load_optional_tqdm():
 _OPTIONAL_TQDM = _load_optional_tqdm()
 
 
-def prepare_data_list(raw_data_list, root_path=""):
-    """Parse metadata lines and compute WAV durations.
+_METADATA_CACHE_VERSION = 2
+
+
+def prepare_data_list(
+    raw_data_list,
+    root_path="",
+    cache_config=None,
+    metadata_path=None,
+    dataset_name=None,
+):
+    """Parse metadata lines and compute WAV durations with optional caching.
+
+    The caching layer stores per-file audio format information (sample rate,
+    frame count, number of channels and sample width) to detect dataset
+    re-encodes even when file timestamps remain unchanged.
 
     Args:
         raw_data_list: Iterable with entries in the format
             ``path|phoneme sequence|speaker_id``.
         root_path: Base directory of the audio files.
+        cache_config: Optional dictionary describing metadata caching
+            behaviour.  When enabled the parsed metadata and durations are
+            persisted to disk and reused on subsequent runs.
+        metadata_path: Optional filesystem path to the metadata file the
+            ``raw_data_list`` originated from.  Providing this allows the cache
+            to track file modification times for invalidation.
+        dataset_name: Identifier of the dataset split (e.g. ``"train"`` or
+            ``"val"``).  Used when applying per-dataset cache toggles.
 
     Returns:
         Tuple ``(prepared_list, durations)`` where ``prepared_list`` contains
         ``[path, text, speaker_id]`` entries and ``durations`` is a list with
         their corresponding durations (in seconds).
     """
+
+    def _stat_file(path):
+        try:
+            stat_result = os.stat(path)
+        except OSError:
+            return None
+        return {"mtime": stat_result.st_mtime, "size": stat_result.st_size}
+
+    def _audio_stats_match(expected, current):
+        if expected is None or current is None:
+            return expected is None and current is None
+        return (
+            abs(expected.get("mtime", 0.0) - current.get("mtime", 0.0)) < 1e-3
+            and int(expected.get("size", -1)) == int(current.get("size", -1))
+        )
+
+    def _normalise_dataset_key(name):
+        if name is None:
+            return "dataset"
+        return str(name).strip().lower() or "dataset"
+
     raw_data_sequence = list(raw_data_list)
     total_items = len(raw_data_sequence)
     prepared_list = []
@@ -66,25 +111,184 @@ def prepare_data_list(raw_data_list, root_path=""):
     if total_items == 0:
         return prepared_list, durations
 
+    dataset_key = _normalise_dataset_key(dataset_name)
+    root_path_str = str(root_path or "")
+    cache_cfg = cache_config if isinstance(cache_config, dict) else {}
+    cache_enabled = bool(cache_cfg.get("enabled", False))
+    dataset_toggles = cache_cfg.get("datasets") if isinstance(cache_cfg, dict) else None
+    if isinstance(dataset_toggles, dict) and dataset_toggles:
+        toggles = {str(k).strip().lower(): bool(v) for k, v in dataset_toggles.items()}
+        if dataset_key in toggles:
+            cache_enabled = cache_enabled and toggles.get(dataset_key, True)
+
+    metadata_path_obj = Path(metadata_path).expanduser() if metadata_path else None
+    metadata_stat = None
+    raw_hash = None
+    cache_file = None
+
+    if cache_enabled:
+        cache_dir = cache_cfg.get("directory", "Data/cache") or "Data/cache"
+        cache_dir = Path(cache_dir).expanduser()
+        try:
+            cache_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            logger.warning(f"Failed to create metadata cache directory {cache_dir!s}: {exc}")
+            cache_enabled = False
+        else:
+            identifier_parts = [dataset_key, root_path_str]
+            if metadata_path_obj is not None:
+                identifier_parts.append(str(metadata_path_obj.resolve()))
+                try:
+                    metadata_stat = metadata_path_obj.stat()
+                except OSError:
+                    metadata_stat = None
+            if metadata_path_obj is None:
+                hasher = hashlib.sha1()
+                for line in raw_data_sequence:
+                    hasher.update(line.encode("utf-8"))
+                raw_hash = hasher.hexdigest()
+                identifier_parts.append(raw_hash)
+
+            digest = hashlib.sha1("|".join(identifier_parts).encode("utf-8")).hexdigest()
+            safe_base = re.sub(r"[^a-zA-Z0-9_.-]+", "_", dataset_key or "metadata")
+            cache_file = cache_dir / f"{safe_base}-{digest}.json"
+
+    cache_payload = None
+    if cache_enabled and cache_file and cache_file.is_file():
+        try:
+            with cache_file.open("r", encoding="utf-8") as f:
+                cache_payload = json.load(f)
+        except (json.JSONDecodeError, OSError) as exc:
+            logger.warning(f"Failed to read metadata cache {cache_file}: {exc}")
+            cache_payload = None
+
+    validate_audio = bool(cache_cfg.get("validate_audio", True))
+    if cache_payload and cache_payload.get("version") == _METADATA_CACHE_VERSION:
+        if cache_payload.get("dataset") != dataset_key:
+            cache_payload = None
+        elif cache_payload.get("root_path", "") != root_path_str:
+            cache_payload = None
+        else:
+            cached_metadata_path = cache_payload.get("metadata_path")
+            metadata_info = cache_payload.get("metadata_info", {}) or {}
+            cache_valid = True
+
+            if metadata_path_obj is not None:
+                if metadata_stat is None:
+                    try:
+                        metadata_stat = metadata_path_obj.stat()
+                    except OSError:
+                        metadata_stat = None
+                if metadata_stat is None:
+                    cache_valid = False
+                else:
+                    cached_mtime = metadata_info.get("mtime")
+                    cached_size = metadata_info.get("size")
+                    if (
+                        cached_metadata_path is None
+                        or str(cached_metadata_path) != str(metadata_path_obj)
+                        or abs(float(cached_mtime or 0.0) - float(metadata_stat.st_mtime)) >= 1e-3
+                        or int(cached_size or -1) != int(metadata_stat.st_size)
+                    ):
+                        cache_valid = False
+            else:
+                if raw_hash is None:
+                    hasher = hashlib.sha1()
+                    for line in raw_data_sequence:
+                        hasher.update(line.encode("utf-8"))
+                    raw_hash = hasher.hexdigest()
+                if metadata_info.get("hash") != raw_hash:
+                    cache_valid = False
+
+            if cache_valid and validate_audio:
+                entries = cache_payload.get("entries", [])
+
+                first_signature = cache_payload.get("first_audio_signature")
+                if entries and first_signature:
+                    first_path = first_signature.get("path")
+                    if first_path:
+                        first_wav_path = os.path.join(root_path_str, first_path)
+                        try:
+                            with wave.open(first_wav_path, "rb") as wf:
+                                current_signature = {
+                                    "sample_rate": wf.getframerate(),
+                                    "frames": wf.getnframes(),
+                                    "channels": wf.getnchannels(),
+                                    "sample_width": wf.getsampwidth(),
+                                }
+                        except Exception:
+                            cache_valid = False
+                        else:
+                            for key in ("sample_rate", "frames", "channels", "sample_width"):
+                                cached_value = int(first_signature.get(key, -1))
+                                current_value = int(current_signature.get(key, -2))
+                                if cached_value != current_value:
+                                    cache_valid = False
+                                    break
+                    else:
+                        cache_valid = False
+
+                if cache_valid:
+                    for item in entries:
+                        wave_rel_path = item.get("path")
+                        if not wave_rel_path:
+                            cache_valid = False
+                            break
+                        wave_path = os.path.join(root_path_str, wave_rel_path)
+                        audio_stat = item.get("audio")
+                        if audio_stat is None:
+                            cache_valid = False
+                            break
+                        current_stat = _stat_file(wave_path)
+                        if not _audio_stats_match(audio_stat, current_stat):
+                            cache_valid = False
+                            break
+
+            if cache_valid:
+                cached_entries = cache_payload.get("entries", [])
+                prepared_list = []
+                durations = []
+                for item in cached_entries:
+                    path = item.get("path")
+                    text = item.get("text", "")
+                    speaker_id = item.get("speaker_id", "")
+                    duration = float(item.get("duration", 0.0))
+                    if path is None:
+                        cache_valid = False
+                        break
+                    prepared_list.append([path, text, speaker_id])
+                    durations.append(duration)
+
+                if cache_valid:
+                    logger.info(
+                        "Loaded %d metadata entries for '%s' from cache %s",
+                        len(prepared_list),
+                        dataset_key,
+                        cache_file,
+                    )
+                    return prepared_list, durations
+
     progress_desc = "Computing audio durations"
     iterator = raw_data_sequence
     use_tqdm = _OPTIONAL_TQDM is not None
 
     if use_tqdm:
-        iterator = _OPTIONAL_TQDM(raw_data_sequence,
-                                  desc=progress_desc,
-                                  total=total_items,
-                                  unit="files")
+        iterator = _OPTIONAL_TQDM(
+            raw_data_sequence, desc=progress_desc, total=total_items, unit="files"
+        )
     else:
         print(f"{progress_desc} for {total_items} files...")
         update_interval = max(1, total_items // 20)
 
+    cached_audio_stats = []
+    cached_audio_formats = []
+
     for index, line in enumerate(iterator):
-        cleaned_line = line.rstrip('\n')
+        cleaned_line = line.rstrip("\n")
         if not cleaned_line.strip():
             continue
 
-        parts = cleaned_line.split('|')
+        parts = cleaned_line.split("|")
         if len(parts) < 2:
             print(f"Parse error for line: {cleaned_line}")
             continue
@@ -94,15 +298,18 @@ def prepare_data_list(raw_data_list, root_path=""):
             text = parts[1]
             speaker_id = ""
         else:
-            text = '|'.join(parts[1:-1])
+            text = "|".join(parts[1:-1])
             speaker_id = parts[-1].strip()
 
-        wav_path = os.path.join(root_path, path)
+        wav_path = os.path.join(root_path_str, path)
 
         try:
-            with wave.open(wav_path, 'rb') as wf:
+            audio_stat = _stat_file(wav_path)
+            with wave.open(wav_path, "rb") as wf:
                 frames = wf.getnframes()
                 rate = wf.getframerate()
+                channels = wf.getnchannels()
+                sample_width = wf.getsampwidth()
                 duration = frames / float(rate) if rate else 0.0
         except Exception as e:
             print(f"Error for wave path: {wav_path}, {e}")
@@ -110,11 +317,82 @@ def prepare_data_list(raw_data_list, root_path=""):
 
         prepared_list.append([path, text, speaker_id])
         durations.append(duration)
+        cached_audio_stats.append(audio_stat)
+        cached_audio_formats.append(
+            {
+                "sample_rate": int(rate),
+                "frames": int(frames),
+                "channels": int(channels),
+                "sample_width": int(sample_width),
+            }
+        )
 
         if not use_tqdm:
             should_update = ((index + 1) % update_interval == 0) or ((index + 1) == total_items)
             if should_update:
                 print(f"Computed durations for {index + 1}/{total_items} files", flush=True)
+
+    if cache_enabled and cache_file:
+        metadata_info = {}
+        if metadata_stat is not None:
+            metadata_info = {"mtime": metadata_stat.st_mtime, "size": metadata_stat.st_size}
+        else:
+            if raw_hash is None:
+                hasher = hashlib.sha1()
+                for line in raw_data_sequence:
+                    hasher.update(line.encode("utf-8"))
+                raw_hash = hasher.hexdigest()
+            metadata_info = {"hash": raw_hash}
+
+        cache_entries = []
+        for entry, duration, audio_stat, audio_format in zip(
+            prepared_list, durations, cached_audio_stats, cached_audio_formats
+        ):
+            cache_entries.append(
+                {
+                    "path": entry[0],
+                    "text": entry[1],
+                    "speaker_id": entry[2],
+                    "duration": float(duration),
+                    "audio": audio_stat,
+                    "audio_format": audio_format,
+                }
+            )
+
+        first_audio_signature = None
+        if cache_entries:
+            first_entry = cache_entries[0]
+            audio_format = first_entry.get("audio_format", {}) or {}
+            first_audio_signature = {
+                "path": first_entry.get("path"),
+                "sample_rate": audio_format.get("sample_rate"),
+                "frames": audio_format.get("frames"),
+                "channels": audio_format.get("channels"),
+                "sample_width": audio_format.get("sample_width"),
+            }
+
+        payload = {
+            "version": _METADATA_CACHE_VERSION,
+            "dataset": dataset_key,
+            "root_path": root_path_str,
+            "metadata_path": str(metadata_path_obj) if metadata_path_obj else None,
+            "metadata_info": metadata_info,
+            "entries": cache_entries,
+            "first_audio_signature": first_audio_signature,
+        }
+
+        try:
+            with cache_file.open("w", encoding="utf-8") as f:
+                json.dump(payload, f)
+        except OSError as exc:
+            logger.warning(f"Failed to write metadata cache {cache_file}: {exc}")
+        else:
+            logger.info(
+                "Stored %d metadata entries for '%s' in cache %s",
+                len(prepared_list),
+                dataset_key,
+                cache_file,
+            )
 
     return prepared_list, durations
 
@@ -241,10 +519,28 @@ def main(config_path):
                 continue
             dataset_params[override_key] = override_value
 
-    raw_train_list, raw_val_list = get_data_path_list(train_path, val_path)
+    metadata_cache_config = cfg_get_nested(config, 'metadata_cache', {}) or {}
+    (
+        raw_train_list,
+        raw_val_list,
+        train_metadata_path,
+        val_metadata_path,
+    ) = get_data_path_list(train_path, val_path, return_paths=True)
 
-    train_entries, train_durations = prepare_data_list(raw_train_list, root_path="")
-    val_entries, val_durations = prepare_data_list(raw_val_list, root_path="")
+    train_entries, train_durations = prepare_data_list(
+        raw_train_list,
+        root_path="",
+        cache_config=metadata_cache_config,
+        metadata_path=train_metadata_path,
+        dataset_name="train",
+    )
+    val_entries, val_durations = prepare_data_list(
+        raw_val_list,
+        root_path="",
+        cache_config=metadata_cache_config,
+        metadata_path=val_metadata_path,
+        dataset_name="val",
+    )
     num_train_items = len(train_entries)
 
     # sort data list by duration for consistent bucketing and batching

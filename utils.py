@@ -107,15 +107,34 @@ def build_criterion(critic_params={}, entropy_params={}, multi_task_config=None)
 
     return criterion
 
-def get_data_path_list(train_path=None, val_path=None):
+def get_data_path_list(train_path=None, val_path=None, return_paths=False):
+    """Return the metadata entries for the train/validation splits.
+
+    Args:
+        train_path: Optional path to the training metadata file.  When ``None``
+            the default ``Data/train_list.txt`` is used.
+        val_path: Optional path to the validation metadata file.  When ``None``
+            the default ``Data/val_list.txt`` is used.
+        return_paths: If ``True`` the resolved metadata file paths are returned
+            alongside the contents.  This is useful for caching layers that
+            need to reason about file modification times.
+
+    Returns:
+        Tuple containing the training and validation metadata lines.  When
+        ``return_paths`` is enabled, the resolved file system paths are appended
+        to the tuple.
+    """
+
     train_path = Path(train_path) if train_path is not None else Path("Data") / "train_list.txt"
     val_path = Path(val_path) if val_path is not None else Path("Data") / "val_list.txt"
 
-    with train_path.open('r') as f:
+    with train_path.open('r', encoding='utf-8') as f:
         train_list = f.readlines()
-    with val_path.open('r') as f:
+    with val_path.open('r', encoding='utf-8') as f:
         val_list = f.readlines()
 
+    if return_paths:
+        return train_list, val_list, str(train_path), str(val_path)
     return train_list, val_list
 
 
