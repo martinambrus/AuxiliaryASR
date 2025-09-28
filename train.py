@@ -505,6 +505,9 @@ def main(config_path):
         'mel_params': cfg_get_nested( config, 'preprocess_params.mel_params', { 'n_mels': 80 })
     }
 
+    mel_cache_config = cfg_get_nested(config, 'mel_cache', {}) or {}
+    dataset_params['mel_cache'] = mel_cache_config
+
     dataset_additional_params = cfg_get_nested(config, 'dataset_params', {})
     if isinstance(dataset_additional_params, dict):
         for override_key in ('dict_path', 'sr', 'spect_params', 'mel_params'):
@@ -574,7 +577,8 @@ def main(config_path):
             num_workers=train_num_workers,
             dataset_config=dataset_params,
             device=device,
-            collate_config=collate_config)
+            collate_config=collate_config,
+            dataset_name="train")
 
         shuffled_train_loader = build_dataloader(
             train_entries,
@@ -584,7 +588,8 @@ def main(config_path):
             device=device,
             lengths=train_durations,
             bucket_sampler_config=train_bucket_sampler_config,
-            collate_config=collate_config)
+            collate_config=collate_config,
+            dataset_name="train")
 
         sorted_val_loader = build_dataloader(
             val_list_sorted,
@@ -593,7 +598,8 @@ def main(config_path):
             num_workers=val_num_workers,
             device=device,
             dataset_config=dataset_params,
-            collate_config=collate_config)
+            collate_config=collate_config,
+            dataset_name="val")
 
         shuffled_val_loader = build_dataloader(
             val_entries,
@@ -602,7 +608,8 @@ def main(config_path):
             num_workers=val_num_workers,
             device=device,
             dataset_config=dataset_params,
-            collate_config=collate_config)
+            collate_config=collate_config,
+            dataset_name="val")
 
         steps = len(sorted_train_loader) if sorted_train_loader is not None else len(shuffled_train_loader)
         steps = int(steps)

@@ -23,6 +23,19 @@ metadata_cache:
     val: true    # Cache the validation metadata file.
     ood: false   # Cache out-of-domain metadata when available.
 
+# Persist pre-computed log-mel features to memory-mapped ``.npy`` files.  When
+# enabled the dataset will lazily reuse stored log-mels as long as the mel
+# options (sample rate, FFT parameters, number of mels, etc.) remain unchanged.
+# Any change to those parameters triggers an automatic cache invalidation.
+mel_cache:
+  enabled: true  # Toggle for log-mel feature caching.
+  directory: "Data/mel_cache"  # Directory where memory-mapped mel files are stored.
+  dtype: float32  # Floating point precision used for the cached tensors.
+  datasets:
+    train: true  # Enable caching for training dataloaders (skipped when mixup or waveform augmentation is active).
+    val: true    # Enable caching for validation/evaluation dataloaders.
+    ood: true    # Enable caching for any auxiliary/ood evaluation loaders.
+
 memory_optimizations:
   lazy_masks:
     enabled: true
