@@ -5,11 +5,11 @@ import os.path as osp
 import sys
 import time
 from collections import defaultdict
+from contextlib import nullcontext
 
 import numpy as np
 import torch
-from torch import nn
-from torch.cuda.amp import autocast, GradScaler
+from torch import amp, nn
 from PIL import Image
 from tqdm import tqdm
 
@@ -147,6 +147,7 @@ class Trainer(object):
             and isinstance(device_type, str)
             and device_type.startswith('cuda')
         )
+        self.autocast_device_type = 'cuda'
 
         grad_scaler_cfg = mp_cfg.get('grad_scaler', {}) if isinstance(mp_cfg, dict) else {}
         if not isinstance(grad_scaler_cfg, dict):
@@ -157,7 +158,8 @@ class Trainer(object):
             growth_factor = float(grad_scaler_cfg.get('growth_factor', 2.0))
             backoff_factor = float(grad_scaler_cfg.get('backoff_factor', 0.5))
             growth_interval = int(grad_scaler_cfg.get('growth_interval', 2000))
-            self.grad_scaler = GradScaler(
+            self.grad_scaler = amp.GradScaler(
+                device_type=self.autocast_device_type,
                 enabled=True,
                 init_scale=init_scale,
                 growth_factor=growth_factor,
@@ -727,7 +729,16 @@ class Trainer(object):
         autocast_dtype = self.mixed_precision_dtype if self.autocast_enabled else None
         grad_scaler = self.grad_scaler if self.grad_scaler is not None else None
 
-        with autocast(enabled=self.autocast_enabled, dtype=autocast_dtype):
+        if self.autocast_enabled:
+            autocast_cm = amp.autocast(
+                device_type=self.autocast_device_type,
+                dtype=autocast_dtype,
+                enabled=True,
+            )
+        else:
+            autocast_cm = nullcontext()
+
+        with autocast_cm:
             model_outputs = self.model(
                 mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 
@@ -883,18 +894,32 @@ class Trainer(object):
 
             loss = total_loss
 
+        optimizer_step_ran = False
         if grad_scaler is not None:
             grad_scaler.scale(loss).backward()
             grad_scaler.unscale_(self.optimizer)
             torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
             grad_scaler.step(self.optimizer)
+
+            found_inf_tensors = getattr(grad_scaler, '_found_inf_per_device', None)
+            if isinstance(found_inf_tensors, dict):
+                overflow_detected = any(
+                    hasattr(found_inf, 'item') and found_inf.item() != 0
+                    for found_inf in found_inf_tensors.values()
+                )
+                optimizer_step_ran = not overflow_detected
+            else:
+                optimizer_step_ran = True
+
             grad_scaler.update()
         else:
             loss.backward()
             torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
             self.optimizer.step()
+            optimizer_step_ran = True
 
-        self.scheduler.step()
+        if self.scheduler is not None and optimizer_step_ran:
+            self.scheduler.step()
         losses['loss'] = loss.item()
         if 'ctc' not in losses:
             losses['ctc'] = loss_ctc.item()
