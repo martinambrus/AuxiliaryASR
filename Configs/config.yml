@@ -35,6 +35,17 @@ precision:
       backoff_factor: 0.5
       growth_interval: 2000
 
+runtime:
+  torch_compile:
+    enabled: false
+    compile_train: true
+    compile_eval: false
+    backend: inductor
+    mode: default
+    fullgraph: false
+    dynamic: false
+    options: {}
+
 preprocess_params:
   sr: 24000
   spect_params:

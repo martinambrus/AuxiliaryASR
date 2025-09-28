@@ -18,6 +18,7 @@ from torch.utils.tensorboard import SummaryWriter
 import click
 import importlib
 import importlib.util
+from typing import Any, Dict, Tuple
 
 # enable better memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -43,6 +44,102 @@ def _load_optional_tqdm():
 
 
 _OPTIONAL_TQDM = _load_optional_tqdm()
+
+
+def _normalize_torch_compile_config(raw_config: Any) -> Dict[str, Any]:
+    """Validate and prepare ``torch.compile`` options from the YAML config."""
+
+    if not isinstance(raw_config, dict):
+        raw_config = {}
+
+    normalized: Dict[str, Any] = {}
+    normalized['enabled'] = bool(raw_config.get('enabled', False))
+    normalized['compile_train'] = bool(raw_config.get('compile_train', True))
+    normalized['compile_eval'] = bool(raw_config.get('compile_eval', False))
+
+    backend = raw_config.get('backend', 'inductor')
+    if isinstance(backend, str):
+        backend = backend.strip()
+    else:
+        backend = None
+    backend = backend or None
+    normalized['backend'] = backend
+
+    mode = raw_config.get('mode', 'default')
+    if isinstance(mode, str):
+        mode = mode.strip()
+    else:
+        mode = None
+    mode = mode or None
+    normalized['mode'] = mode
+
+    normalized['fullgraph'] = bool(raw_config.get('fullgraph', False))
+    normalized['dynamic'] = bool(raw_config.get('dynamic', False))
+
+    options = raw_config.get('options', {})
+    if not isinstance(options, dict):
+        options = {}
+    normalized['options'] = options
+
+    compile_kwargs: Dict[str, Any] = {}
+    if backend is not None:
+        compile_kwargs['backend'] = backend
+    if mode is not None:
+        compile_kwargs['mode'] = mode
+    compile_kwargs['fullgraph'] = normalized['fullgraph']
+    compile_kwargs['dynamic'] = normalized['dynamic']
+    for key, value in options.items():
+        compile_kwargs.setdefault(key, value)
+
+    normalized['torch_compile_kwargs'] = compile_kwargs
+    normalized['available'] = hasattr(torch, 'compile')
+    normalized['compiled_train'] = False
+    normalized['compile_error'] = None
+    return normalized
+
+
+def _maybe_compile_model(model: torch.nn.Module,
+                         compile_config: Dict[str, Any],
+                         logger: logging.Logger) -> Tuple[torch.nn.Module, Dict[str, Any]]:
+    """Wrap the model with ``torch.compile`` if requested and available."""
+
+    updated_config = dict(compile_config) if isinstance(compile_config, dict) else {}
+
+    should_compile = (
+        updated_config.get('enabled', False)
+        and updated_config.get('compile_train', True)
+        and updated_config.get('available', hasattr(torch, 'compile'))
+    )
+
+    if not should_compile:
+        if updated_config.get('enabled', False) and not updated_config.get('available', True):
+            logger.warning("torch.compile requested but this PyTorch build does not expose it. Falling back to eager mode.")
+        updated_config['compiled_train'] = False
+        return model, updated_config
+
+    compile_kwargs = dict(updated_config.get('torch_compile_kwargs', {}))
+    try:
+        compiled_model = torch.compile(model, **compile_kwargs)
+    except Exception as exc:  # pragma: no cover - compile failure paths
+        logger.warning(
+            "torch.compile failed for the training graph (backend=%s, mode=%s). Using eager execution instead. Error: %s",
+            compile_kwargs.get('backend', 'inductor'),
+            compile_kwargs.get('mode', 'default'),
+            exc,
+        )
+        updated_config['compiled_train'] = False
+        updated_config['compile_error'] = str(exc)
+        return model, updated_config
+
+    logger.info(
+        "Enabled torch.compile for training (backend=%s, mode=%s, fullgraph=%s, dynamic=%s)",
+        compile_kwargs.get('backend', 'inductor'),
+        compile_kwargs.get('mode', 'default'),
+        compile_kwargs.get('fullgraph', False),
+        compile_kwargs.get('dynamic', False),
+    )
+    updated_config['compiled_train'] = True
+    return compiled_model, updated_config
 
 
 def prepare_data_list(raw_data_list, root_path=""):
@@ -371,6 +468,12 @@ def main(config_path):
 
     model = build_model(model_params=model_params)
 
+    runtime_config = cfg_get_nested(config, 'runtime', {}) or {}
+    torch_compile_raw = runtime_config.get('torch_compile', {}) if isinstance(runtime_config, dict) else {}
+    torch_compile_config = _normalize_torch_compile_config(torch_compile_raw)
+
+    model, torch_compile_config = _maybe_compile_model(model, torch_compile_config, logger)
+
     total_training_steps = batch_scheduler.expected_total_steps(num_train_items)
     scheduler_params = {
             'max_lr': float(cfg_get_nested( config, 'optimizer_params.lr', 5e-4)),
@@ -423,35 +526,43 @@ def main(config_path):
 
     steps_per_epoch = len(sorted_train_dataloader) if sorted_train_dataloader is not None else len(shuffled_train_dataloader)
 
-    trainer = Trainer(model=model,
-                    criterion=criterion,
-                    optimizer=optimizer,
-                    scheduler=scheduler,
-                    config=config,
-                    device=device,
-                    sorted_train_dataloader=sorted_train_dataloader,
-                    shuffled_train_dataloader=shuffled_train_dataloader,
-                    sorted_val_dataloader=sorted_val_dataloader,
-                    shuffled_val_dataloader=shuffled_val_dataloader,
-                    logger=logger,
-                    switch_sortagrad_dataset_epoch=cfg_get_nested( config, 'sortagrad_switch_to_shuffled_dataset_epoch', 10),
-                    use_diagonal_attention_prior=(cfg_get_nested( config, 'use_diagonal_attention_prior', True) and use_s2s),
-                    diagonal_attention_prior_weight=cfg_get_nested( config, 'diagonal_attention_prior_weight', 0.1),
-                    ctc_weight=ctc_weight,
-                    s2s_weight=s2s_weight,
-                    frame_weight=frame_weight,
-                    speaker_weight=speaker_weight,
-                    pron_error_weight=pron_weight,
-                    enable_frame_classifier=frame_cfg.get('enabled', False),
-                    enable_speaker=speaker_cfg.get('enabled', False),
-                    enable_pronunciation_error=pron_cfg.get('enabled', False),
-                    mixspeech_config=mixspeech_config,
-                    intermediate_ctc_config=intermediate_ctc_config,
-                    self_conditioned_ctc_config=self_conditioned_ctc_config,
-                    entropy_regularization_config=entropy_regularization_config,
-                    memory_optimization_config=memory_optimization_config,
-                    steps_per_epoch=steps_per_epoch
-                    )
+    trainer = Trainer(
+        model=model,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        config=config,
+        device=device,
+        sorted_train_dataloader=sorted_train_dataloader,
+        shuffled_train_dataloader=shuffled_train_dataloader,
+        sorted_val_dataloader=sorted_val_dataloader,
+        shuffled_val_dataloader=shuffled_val_dataloader,
+        logger=logger,
+        switch_sortagrad_dataset_epoch=cfg_get_nested(
+            config, 'sortagrad_switch_to_shuffled_dataset_epoch', 10
+        ),
+        use_diagonal_attention_prior=(
+            cfg_get_nested(config, 'use_diagonal_attention_prior', True) and use_s2s
+        ),
+        diagonal_attention_prior_weight=cfg_get_nested(
+            config, 'diagonal_attention_prior_weight', 0.1
+        ),
+        ctc_weight=ctc_weight,
+        s2s_weight=s2s_weight,
+        frame_weight=frame_weight,
+        speaker_weight=speaker_weight,
+        pron_error_weight=pron_weight,
+        enable_frame_classifier=frame_cfg.get('enabled', False),
+        enable_speaker=speaker_cfg.get('enabled', False),
+        enable_pronunciation_error=pron_cfg.get('enabled', False),
+        mixspeech_config=mixspeech_config,
+        intermediate_ctc_config=intermediate_ctc_config,
+        self_conditioned_ctc_config=self_conditioned_ctc_config,
+        entropy_regularization_config=entropy_regularization_config,
+        memory_optimization_config=memory_optimization_config,
+        torch_compile_config=torch_compile_config,
+        steps_per_epoch=steps_per_epoch,
+    )
 
     current_train_batch_size = int(initial_batch_size)
 
@@ -565,5 +676,5 @@ def main(config_path):
 
     return 0
 
-if __name__=="__main__":
+if __name__ == "__main__":
     main()

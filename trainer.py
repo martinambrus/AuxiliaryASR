@@ -53,6 +53,7 @@ class Trainer(object):
                  self_conditioned_ctc_config=None,
                  entropy_regularization_config=None,
                  memory_optimization_config=None,
+                 torch_compile_config=None,
                  steps_per_epoch=None):
 
         self.steps = initial_steps
@@ -166,6 +167,20 @@ class Trainer(object):
             )
         else:
             self.grad_scaler = None
+
+        compile_cfg = torch_compile_config or {}
+        if not isinstance(compile_cfg, dict):
+            compile_cfg = {}
+        self._torch_compile_config = dict(compile_cfg)
+        self._torch_compile_train_compiled = bool(self._torch_compile_config.get('compiled_train', False))
+        self._torch_compile_eval_requested = bool(
+            self._torch_compile_config.get('enabled', False)
+            and self._torch_compile_config.get('compile_eval', False)
+        )
+        self._torch_compile_kwargs = self._torch_compile_config.get('torch_compile_kwargs', {})
+        if not isinstance(self._torch_compile_kwargs, dict):
+            self._torch_compile_kwargs = {}
+        self._torch_compile_eval_model = None
 
         self._resumed_from_checkpoint = bool(initial_epochs)
         self._scheduler_aligned = False
@@ -282,22 +297,51 @@ class Trainer(object):
             return None
         return cfg
 
-    def _maybe_create_future_mask(self, length: int):
+    def _maybe_create_future_mask(self, length: int, model: nn.Module = None):
         if self.skip_future_mask_allocation:
             return None
         if length is None or length <= 0:
             return None
-        mask = self.model.get_future_mask(length, unmask_future_steps=0)
+        target_model = model if model is not None else self.model
+        mask = target_model.get_future_mask(length, unmask_future_steps=0)
         if mask is None:
             return None
         return mask.to(self.device) if hasattr(mask, 'to') else mask
 
-    def _maybe_create_text_mask(self, lengths):
+    def _maybe_create_text_mask(self, lengths, model: nn.Module = None):
         if self.skip_text_mask_allocation:
             return None
         if lengths is None:
             return None
-        return self.model.length_to_mask(lengths)
+        target_model = model if model is not None else self.model
+        return target_model.length_to_mask(lengths)
+
+    def _select_eval_model(self) -> nn.Module:
+        if self._torch_compile_train_compiled:
+            return self.model
+        if not self._torch_compile_eval_requested:
+            return self.model
+        if not hasattr(torch, 'compile'):
+            self._torch_compile_eval_requested = False
+            return self.model
+        if self._torch_compile_eval_model is None:
+            try:
+                self._torch_compile_eval_model = torch.compile(self.model, **self._torch_compile_kwargs)
+                self.logger.info(
+                    "Enabled torch.compile for evaluation (backend=%s, mode=%s, fullgraph=%s, dynamic=%s)",
+                    self._torch_compile_kwargs.get('backend', 'inductor'),
+                    self._torch_compile_kwargs.get('mode', 'default'),
+                    self._torch_compile_kwargs.get('fullgraph', False),
+                    self._torch_compile_kwargs.get('dynamic', False),
+                )
+            except Exception as exc:  # pragma: no cover - compile failure paths
+                self.logger.warning(
+                    "torch.compile failed for evaluation. Falling back to eager mode. Error: %s", exc
+                )
+                self._torch_compile_eval_requested = False
+                self._torch_compile_eval_model = None
+                return self.model
+        return self._torch_compile_eval_model
 
     def _compute_entropy_regularization(self, logits, lengths=None, key='ctc'):
         cfg = self._entropy_target_config(key)
@@ -937,7 +981,8 @@ class Trainer(object):
 
     @torch.no_grad()
     def _eval_epoch(self):
-        self.model.eval()
+        eval_model = self._select_eval_model()
+        eval_model.eval()
         eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
         for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
@@ -954,13 +999,14 @@ class Trainer(object):
                 speaker_ids = batch[4].long()
             else:
                 speaker_ids = torch.zeros(text_input.size(0), device=self.device, dtype=torch.long)
-            mel_input_length = mel_input_length // (2 ** self.model.n_down)
+            mel_input_length = mel_input_length // (2 ** eval_model.n_down)
             future_mask = self._maybe_create_future_mask(
-                mel_input.size(2) // (2 ** self.model.n_down)
+                mel_input.size(2) // (2 ** eval_model.n_down),
+                model=eval_model,
             )
-            mel_mask = self.model.length_to_mask(mel_input_length)
-            text_mask = self._maybe_create_text_mask(text_input_length)
-            model_outputs = self.model(
+            mel_mask = eval_model.length_to_mask(mel_input_length)
+            text_mask = self._maybe_create_text_mask(text_input_length, model=eval_model)
+            model_outputs = eval_model(
                 mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
 
             ppgs = model_outputs.get('ctc_logits')
