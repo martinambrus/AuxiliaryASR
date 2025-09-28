@@ -6,6 +6,7 @@ import sys
 import time
 from collections import defaultdict
 from contextlib import nullcontext
+import inspect
 
 import numpy as np
 import torch
@@ -158,14 +159,23 @@ class Trainer(object):
             growth_factor = float(grad_scaler_cfg.get('growth_factor', 2.0))
             backoff_factor = float(grad_scaler_cfg.get('backoff_factor', 0.5))
             growth_interval = int(grad_scaler_cfg.get('growth_interval', 2000))
-            self.grad_scaler = amp.GradScaler(
-                device_type=self.autocast_device_type,
+            scaler_kwargs = dict(
                 enabled=True,
                 init_scale=init_scale,
                 growth_factor=growth_factor,
                 backoff_factor=backoff_factor,
                 growth_interval=growth_interval,
             )
+
+            try:
+                scaler_params = inspect.signature(amp.GradScaler.__init__).parameters
+            except (ValueError, TypeError):
+                scaler_params = {}
+
+            if 'device_type' in scaler_params:
+                scaler_kwargs['device_type'] = self.autocast_device_type
+
+            self.grad_scaler = amp.GradScaler(**scaler_kwargs)
         else:
             self.grad_scaler = None
 
