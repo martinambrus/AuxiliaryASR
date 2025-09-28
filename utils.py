@@ -1,3 +1,4 @@
+import math
 import os
 import os.path as osp
 import sys
@@ -389,6 +390,10 @@ class BatchSizeScheduler:
         total_steps = 0
         for epoch in range(1, self.total_epochs + 1):
             batch_size = max(1, self.batch_size_for_epoch(epoch))
-            steps = max(1, dataset_size // batch_size)
+            # ``len(dataloader)`` effectively performs a ``math.ceil`` over the
+            # batch size, so mirror that behaviour here to keep the
+            # OneCycle/linear warm-up schedulers in sync with the true number of
+            # optimisation steps executed per epoch.
+            steps = max(1, math.ceil(dataset_size / float(batch_size)))
             total_steps += steps
         return total_steps
