@@ -928,7 +928,11 @@ class Trainer(object):
             self.optimizer.step()
             optimizer_step_ran = True
 
-        if self.scheduler is not None and optimizer_step_ran:
+        if (
+            self.scheduler is not None
+            and optimizer_step_ran
+            and getattr(self.optimizer, "_step_count", 0) > 0
+        ):
             self.scheduler.step()
         losses['loss'] = loss.item()
         if 'ctc' not in losses:
