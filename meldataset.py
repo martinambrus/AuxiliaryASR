@@ -5,6 +5,9 @@ import os.path as osp
 import time
 import math
 import random
+import json
+import hashlib
+from pathlib import Path
 import numpy as np
 import random
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -91,6 +94,253 @@ def _match_length(signal: torch.Tensor, target_length: int) -> torch.Tensor:
     repeat_times = math.ceil(target_length / signal.size(0))
     expanded = signal.repeat(repeat_times)[:target_length]
     return expanded
+
+
+class MelFeatureCache:
+    """Stores log-mel tensors inside memory-mapped ``.npy`` files.
+
+    The cache mirrors the behaviour of :func:`prepare_data_list` metadata caching by
+    persisting pre-computed features to disk and validating them against the
+    current dataset settings.  When the mel computation options change, or the
+    underlying audio files are modified, cached entries are invalidated
+    automatically.
+    """
+
+    _META_FILENAME = "meta.json"
+    _CACHE_VERSION = 1
+
+    def __init__(
+        self,
+        config: Optional[Dict],
+        mel_options: Dict,
+        dataset_name: Optional[str] = None,
+    ) -> None:
+        cfg = config or {}
+        self.enabled = bool(cfg.get("enabled", False))
+        self.dataset_name = dataset_name or "default"
+        self.directory = None
+        self.dtype = np.float32
+        self._options_digest = None
+
+        if not self.enabled:
+            return
+
+        dataset_toggles = cfg.get("datasets") or {}
+        if dataset_toggles and not dataset_toggles.get(self.dataset_name, True):
+            self.enabled = False
+            return
+
+        directory = cfg.get("directory", "Data/mel_cache") or "Data/mel_cache"
+        try:
+            dtype = cfg.get("dtype", "float32")
+            self.dtype = np.dtype(dtype)
+        except (TypeError, ValueError):
+            logger.warning(
+                "Invalid mel cache dtype %r. Falling back to float32.", cfg.get("dtype")
+            )
+            self.dtype = np.float32
+
+        self.directory = Path(directory).expanduser() / self.dataset_name
+        try:
+            self.directory.mkdir(parents=True, exist_ok=True)
+        except Exception as exc:
+            logger.warning("Failed to create mel cache directory %s: %s", self.directory, exc)
+            self.enabled = False
+            return
+
+        self._meta_path = self.directory / self._META_FILENAME
+        self._options_digest = self._ensure_metadata(mel_options)
+
+    # ------------------------------------------------------------------
+    # Metadata helpers
+    def _normalise_options(self, mel_options: Dict) -> Dict:
+        normalised = {}
+        for key, value in sorted(mel_options.items()):
+            if isinstance(value, (str, int, float, bool)) or value is None:
+                normalised[key] = value
+            elif isinstance(value, (list, tuple)):
+                normalised[key] = list(value)
+            else:
+                normalised[key] = repr(value)
+        return normalised
+
+    def _ensure_metadata(self, mel_options: Dict) -> Optional[str]:
+        if not self.enabled or self.directory is None:
+            return None
+
+        current = self._normalise_options(mel_options)
+        current_payload = {
+            "version": self._CACHE_VERSION,
+            "options": current,
+        }
+        payload_bytes = json.dumps(current_payload, sort_keys=True).encode("utf-8")
+        digest = hashlib.sha1(payload_bytes).hexdigest()
+
+        existing: Optional[Dict] = None
+        if self._meta_path.is_file():
+            try:
+                with self._meta_path.open("r", encoding="utf-8") as handle:
+                    existing = json.load(handle)
+            except Exception:
+                existing = None
+
+        if not existing or existing.get("options_digest") != digest:
+            self._clear_cache()
+            meta_payload = {
+                "version": self._CACHE_VERSION,
+                "options": current,
+                "options_digest": digest,
+                "created": time.time(),
+            }
+            try:
+                with self._meta_path.open("w", encoding="utf-8") as handle:
+                    json.dump(meta_payload, handle, indent=2, sort_keys=True)
+            except Exception as exc:
+                logger.warning("Failed to write mel cache metadata: %s", exc)
+                self.enabled = False
+                return None
+
+        return digest
+
+    def _clear_cache(self) -> None:
+        if not self.directory or not self.directory.exists():
+            return
+        for entry in self.directory.iterdir():
+            if entry.is_file() and entry.name != self._META_FILENAME:
+                try:
+                    entry.unlink()
+                except FileNotFoundError:
+                    continue
+                except Exception as exc:
+                    logger.warning("Failed to remove mel cache file %s: %s", entry, exc)
+
+    # ------------------------------------------------------------------
+    # Per-entry helpers
+    def _entry_key(self, wave_path: str) -> str:
+        normalised = os.path.abspath(wave_path)
+        return hashlib.sha1(normalised.encode("utf-8")).hexdigest()
+
+    def _entry_paths(self, key: str) -> Tuple[Path, Path]:
+        data_path = self.directory / f"{key}.npy"
+        meta_path = self.directory / f"{key}.json"
+        return data_path, meta_path
+
+    def _stat_signature(self, wave_path: str) -> Optional[Dict]:
+        try:
+            stat = os.stat(wave_path)
+        except OSError:
+            return None
+        return {
+            "mtime": float(stat.st_mtime),
+            "size": int(stat.st_size),
+        }
+
+    def _purge_entry(self, data_path: Path, meta_path: Path) -> None:
+        for path in (data_path, meta_path):
+            try:
+                if path.exists():
+                    path.unlink()
+            except Exception as exc:
+                logger.warning("Failed to remove stale mel cache file %s: %s", path, exc)
+
+    # ------------------------------------------------------------------
+    def try_load(self, wave_path: str) -> Optional[torch.Tensor]:
+        if not self.enabled or self.directory is None:
+            return None
+
+        key = self._entry_key(wave_path)
+        data_path, meta_path = self._entry_paths(key)
+
+        if not data_path.is_file() or not meta_path.is_file():
+            return None
+
+        try:
+            with meta_path.open("r", encoding="utf-8") as handle:
+                meta = json.load(handle)
+        except Exception:
+            self._purge_entry(data_path, meta_path)
+            return None
+
+        digest = meta.get("options_digest")
+        if self._options_digest and digest and digest != self._options_digest:
+            self._purge_entry(data_path, meta_path)
+            return None
+
+        stat_signature = self._stat_signature(wave_path)
+        if stat_signature is None:
+            self._purge_entry(data_path, meta_path)
+            return None
+
+        cached_sig_raw = meta.get("audio_signature")
+        cached_sig = cached_sig_raw if isinstance(cached_sig_raw, dict) else {}
+        if (
+            abs(float(cached_sig.get("mtime", 0.0)) - stat_signature["mtime"]) >= 1e-3
+            or int(cached_sig.get("size", -1)) != stat_signature["size"]
+        ):
+            self._purge_entry(data_path, meta_path)
+            return None
+
+        try:
+            memmap = np.load(data_path, mmap_mode="r")
+        except Exception:
+            self._purge_entry(data_path, meta_path)
+            return None
+
+        cached_shape = tuple(meta.get("shape", ()))
+        if cached_shape and tuple(memmap.shape) != cached_shape:
+            self._purge_entry(data_path, meta_path)
+            return None
+
+        tensor = torch.tensor(np.array(memmap), dtype=torch.float32)
+        del memmap
+        return tensor
+
+    def store(self, wave_path: str, log_mel: torch.Tensor) -> None:
+        if not self.enabled or self.directory is None:
+            return
+
+        key = self._entry_key(wave_path)
+        data_path, meta_path = self._entry_paths(key)
+
+        signature = self._stat_signature(wave_path)
+        if signature is None:
+            logger.warning("Skipping mel cache storage for missing audio file %s", wave_path)
+            return
+
+        try:
+            array = log_mel.detach().cpu().numpy().astype(self.dtype, copy=False)
+            memmap = np.lib.format.open_memmap(
+                data_path,
+                mode="w+",
+                dtype=self.dtype,
+                shape=array.shape,
+            )
+            memmap[...] = array
+            del memmap
+        except Exception as exc:
+            logger.warning("Failed to persist mel cache for %s: %s", wave_path, exc)
+            try:
+                if data_path.exists():
+                    data_path.unlink()
+            except Exception:
+                pass
+            return
+
+        meta_payload = {
+            "shape": list(array.shape),
+            "dtype": str(self.dtype),
+            "audio_signature": signature,
+            "options_digest": self._options_digest,
+            "version": self._CACHE_VERSION,
+            "stored": time.time(),
+        }
+
+        try:
+            with meta_path.open("w", encoding="utf-8") as handle:
+                json.dump(meta_payload, handle, indent=2, sort_keys=True)
+        except Exception as exc:
+            logger.warning("Failed to write mel cache metadata for %s: %s", wave_path, exc)
+            self._purge_entry(data_path, meta_path)
 
 
 class WaveformAugmenter:
@@ -525,6 +775,8 @@ class MelDataset(torch.utils.data.Dataset):
                  waveform_augmentations=None,
                  mixup=None,
                  phoneme_dropout=None,
+                 mel_cache=None,
+                 dataset_name=None,
                  validation=False
                 ):
 
@@ -532,12 +784,16 @@ class MelDataset(torch.utils.data.Dataset):
         self.text_cleaner = TextCleaner(dict_path)
         self.sr = sr
         self.validation = bool(validation)
+        if dataset_name is None:
+            dataset_name = "val" if self.validation else "train"
+        self.cache_dataset_name = dataset_name
 
         self.blank_index = self.text_cleaner.word_index_dictionary.get(" ", 0)
 
         mel_opts = {**{'sample_rate': sr}, **mel_params, **spect_params}
         print("Options for MEL spectrogram calculations:", mel_opts)
         self.to_melspec = torchaudio.transforms.MelSpectrogram(**mel_opts)
+        self._mel_cache = MelFeatureCache(mel_cache, mel_opts, dataset_name=self.cache_dataset_name)
 
         self.spec_augment = None
         if spec_augment_params and not self.validation:
@@ -592,6 +848,20 @@ class MelDataset(torch.utils.data.Dataset):
     def __getitem__(self, idx):
         try:
             data = self.data_list[idx]
+            wave_path = data[0]
+
+            cache_allowed = (
+                hasattr(self, "_mel_cache")
+                and self._mel_cache is not None
+                and self._mel_cache.enabled
+                and not self.mixup_enabled
+                and (self.waveform_augmenter is None or not getattr(self.waveform_augmenter, "enabled", False))
+            )
+
+            cached_log_mel = None
+            if cache_allowed:
+                cached_log_mel = self._mel_cache.try_load(wave_path)
+
             waveform, text_tensor, speaker_id = self._load_tensor(data)
 
             waveform = waveform.float()
@@ -602,14 +872,20 @@ class MelDataset(torch.utils.data.Dataset):
             if self.mixup_enabled:
                 waveform = self._maybe_mix_waveform(waveform, idx)
 
-            mel_tensor = self.to_melspec(waveform)
+            if cached_log_mel is not None:
+                log_mel_tensor = cached_log_mel
+            else:
+                mel_tensor = self.to_melspec(waveform)
 
-            if (text_tensor.size(0)+1) >= (mel_tensor.size(1) // 3):
-                mel_tensor = F.interpolate(
-                    mel_tensor.unsqueeze(0), size=(text_tensor.size(0)+1)*3, align_corners=False,
-                    mode='linear').squeeze(0)
+                if (text_tensor.size(0)+1) >= (mel_tensor.size(1) // 3):
+                    mel_tensor = F.interpolate(
+                        mel_tensor.unsqueeze(0), size=(text_tensor.size(0)+1)*3, align_corners=False,
+                        mode='linear').squeeze(0)
 
-            log_mel_tensor = torch.log(1e-5 + mel_tensor)
+                log_mel_tensor = torch.log(1e-5 + mel_tensor)
+
+                if cache_allowed:
+                    self._mel_cache.store(wave_path, log_mel_tensor)
 
             if self.spec_augment is not None:
                 log_mel_tensor = self.spec_augment(log_mel_tensor)
@@ -793,9 +1069,18 @@ def build_dataloader(path_list,
                      collate_config={},
                      dataset_config={},
                      lengths=None,
-                     bucket_sampler_config=None):
+                     bucket_sampler_config=None,
+                     dataset_name=None):
 
-    dataset = MelDataset(path_list, validation=validation, **dataset_config)
+    dataset_cfg = dict(dataset_config or {})
+    mel_cache_cfg = dataset_cfg.pop('mel_cache', None)
+    dataset = MelDataset(
+        path_list,
+        validation=validation,
+        mel_cache=mel_cache_cfg,
+        dataset_name=dataset_name,
+        **dataset_cfg,
+    )
     collate_fn = Collater(**collate_config)
 
     use_bucket_sampler = False
