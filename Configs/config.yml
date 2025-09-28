@@ -197,7 +197,7 @@ dataloader_params:
 
 training_curriculum:
   batch_size_schedule:
-    enabled: true
+    enabled: false
     base_batch_size: 64
     initial_batch_size: 24
     apply_to_validation: false
