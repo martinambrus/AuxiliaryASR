@@ -22,6 +22,11 @@ import importlib
 import importlib.util
 from pathlib import Path
 
+try:
+    from accelerate import Accelerator, DistributedDataParallelKwargs
+except ImportError as exc:
+    raise ImportError("The 'accelerate' package is required for multi-GPU training. Please install it before running this script.") from exc
+
 # enable better memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 
@@ -470,25 +475,40 @@ class EarlyStoppingWithNoLearningRate:
 @click.command()
 @click.option('-p', '--config_path', default='./Configs/config.yml', type=str)
 def main(config_path):
-    print(f"Loading config data from: {config_path}")
-    config = yaml.safe_load(open(config_path))
+    with open(config_path, 'r', encoding='utf-8') as cfg_file:
+        config = yaml.safe_load(cfg_file)
 
-    log_dir = cfg_get_nested( config, 'log_dir', 'Checkpoint' )
-    print(f"Using logs and models folder: {log_dir}")
+    device_request = cfg_get_nested(config, 'device', None)
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=False)
+    accelerator_kwargs = {}
+    if isinstance(device_request, str) and device_request.lower() == 'cpu':
+        accelerator_kwargs['cpu'] = True
+    accelerator = Accelerator(kwargs_handlers=[ddp_kwargs], **accelerator_kwargs)
+    acc_print = accelerator.print
 
-    if not osp.exists(log_dir): os.mkdir(log_dir)
-    shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
+    acc_print(f"Loading config data from: {config_path}")
 
-    writer = SummaryWriter(log_dir + "/tensorboard")
+    log_dir = cfg_get_nested(config, 'log_dir', 'Checkpoint')
+    acc_print(f"Using logs and models folder: {log_dir}")
 
-    # write logs
-    file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
-    logger.addHandler(file_handler)
+    if accelerator.is_main_process:
+        os.makedirs(log_dir, exist_ok=True)
+        shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
+        writer = SummaryWriter(log_dir + "/tensorboard")
 
-    batch_size = cfg_get_nested( config, 'batch_size', 10)
-    device = cfg_get_nested( config, 'device', 'cpu')
+        file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
+        logger.addHandler(file_handler)
+    else:
+        writer = None
+
+    accelerator.wait_for_everyone()
+    if not accelerator.is_local_main_process:
+        logger.setLevel(logging.WARNING)
+
+    batch_size = cfg_get_nested(config, 'batch_size', 10)
+    device = accelerator.device
     epochs = cfg_get_nested( config, 'epochs', 200)
     save_freq = cfg_get_nested( config, 'save_freq', 10)
     train_path = cfg_get_nested( config, 'train_data', None)
@@ -564,11 +584,30 @@ def main(config_path):
     batch_scheduler = BatchSizeScheduler(curriculum_batch_cfg, default_batch_size=batch_size, total_epochs=epochs)
 
     if batch_scheduler.enabled:
-        print(f"[Curriculum] Batch size schedule enabled: {batch_scheduler.summary()}")
+        acc_print(f"[Curriculum] Batch size schedule enabled: {batch_scheduler.summary()}")
     else:
-        print(f"[Curriculum] Static batch size configured: {batch_size}")
+        acc_print(f"[Curriculum] Static batch size configured: {batch_size}")
 
     collate_config = {'return_speaker_ids': True}
+    if isinstance(device, torch.device):
+        dataloader_device = device.type
+    else:
+        dataloader_device = str(device)
+    if not isinstance(dataloader_device, str):
+        dataloader_device = 'cpu'
+    dataloader_device = 'cuda' if dataloader_device.startswith('cuda') else 'cpu'
+
+    def _prepare_dataloader(dataloader):
+        if dataloader is None:
+            return None
+        if accelerator is None:
+            return dataloader
+        if hasattr(accelerator, 'prepare_data_loader'):
+            return accelerator.prepare_data_loader(dataloader)
+        prepared = accelerator.prepare(dataloader)
+        if isinstance(prepared, (list, tuple)):
+            return prepared[0]
+        return prepared
 
     def _build_dataloaders_for_batch(current_batch_size):
         current_batch_size = int(current_batch_size)
@@ -579,7 +618,7 @@ def main(config_path):
             batch_size=current_batch_size,
             num_workers=train_num_workers,
             dataset_config=dataset_params,
-            device=device,
+            device=dataloader_device,
             collate_config=collate_config,
             dataset_name="train")
 
@@ -588,7 +627,7 @@ def main(config_path):
             batch_size=current_batch_size,
             num_workers=train_num_workers,
             dataset_config=dataset_params,
-            device=device,
+            device=dataloader_device,
             lengths=train_durations,
             bucket_sampler_config=train_bucket_sampler_config,
             collate_config=collate_config,
@@ -599,7 +638,7 @@ def main(config_path):
             batch_size=validation_batch_size,
             validation=True,
             num_workers=val_num_workers,
-            device=device,
+            device=dataloader_device,
             dataset_config=dataset_params,
             collate_config=collate_config,
             dataset_name="val")
@@ -609,7 +648,7 @@ def main(config_path):
             batch_size=validation_batch_size,
             validation=True,
             num_workers=val_num_workers,
-            device=device,
+            device=dataloader_device,
             dataset_config=dataset_params,
             collate_config=collate_config,
             dataset_name="val")
@@ -620,6 +659,11 @@ def main(config_path):
             raise ValueError(
                 f"Curriculum batch size {current_batch_size} is too large for the training set and would produce no steps."
             )
+
+        sorted_train_loader = _prepare_dataloader(sorted_train_loader)
+        shuffled_train_loader = _prepare_dataloader(shuffled_train_loader)
+        sorted_val_loader = _prepare_dataloader(sorted_val_loader)
+        shuffled_val_loader = _prepare_dataloader(shuffled_val_loader)
 
         return (
             sorted_train_loader,
@@ -660,7 +704,7 @@ def main(config_path):
                 if speaker_id:
                     speaker_ids.add(speaker_id)
         inferred = max(1, len(speaker_ids))
-        print(f"Inferred {inferred} unique speaker id(s) from metadata")
+        acc_print(f"Inferred {inferred} unique speaker id(s) from metadata")
         speaker_cfg = dict(speaker_cfg)
         speaker_cfg['num_speakers'] = inferred
         multi_task_config['speaker'] = speaker_cfg
@@ -673,7 +717,7 @@ def main(config_path):
     model_params['stabilization_config'] = stabilization_config
     model_params['memory_optimization_config'] = memory_optimization_config
 
-    print("Using model parameters:", model_params)
+    acc_print("Using model parameters:", model_params)
 
     model = build_model(model_params=model_params)
 
@@ -692,6 +736,11 @@ def main(config_path):
     model.to(device)
     optimizer, scheduler = build_optimizer(
         {"params": model.parameters(), "optimizer_params":{}, "scheduler_params": scheduler_params})
+
+    if scheduler is not None:
+        model, optimizer, scheduler = accelerator.prepare(model, optimizer, scheduler)
+    else:
+        model, optimizer = accelerator.prepare(model, optimizer)
 
     blank_index = sorted_train_dataloader.dataset.text_cleaner.word_index_dictionary[" "] # get blank index
     criterion = build_criterion(critic_params={
@@ -735,6 +784,7 @@ def main(config_path):
                     scheduler=scheduler,
                     config=config,
                     device=device,
+                    accelerator=accelerator,
                     sorted_train_dataloader=sorted_train_dataloader,
                     shuffled_train_dataloader=shuffled_train_dataloader,
                     sorted_val_dataloader=sorted_val_dataloader,
@@ -787,7 +837,7 @@ def main(config_path):
                 steps_per_epoch=steps_per_epoch,
             )
             current_train_batch_size = desired_batch_size
-            print(f"[Curriculum] Epoch {epoch}: updated batch size to {desired_batch_size}")
+            acc_print(f"[Curriculum] Epoch {epoch}: updated batch size to {desired_batch_size}")
         else:
             trainer.update_dataloaders(steps_per_epoch=steps_per_epoch)
 
@@ -813,23 +863,23 @@ def main(config_path):
                 iters = sorted(iters)[-1]
 
                 checkpoint_file = log_dir + f"/epoch_{iters:05}.pth"
-                print(f"Starting to train from checkpoint {checkpoint_file}")
+                acc_print(f"Starting to train from checkpoint {checkpoint_file}")
                 start_epoch = trainer.load_checkpoint(checkpoint_file, load_only_params=load_only_params)
             else:
-                print(f"No previous checkpoints found, starting training from epoch 1.")
+                acc_print(f"No previous checkpoints found, starting training from epoch 1.")
                 start_epoch = 1
         except Exception as e:
-            print(f"Failed to load latest checkpoint, starting training from epoch 1 - {e}")
+            acc_print(f"Failed to load latest checkpoint, starting training from epoch 1 - {e}")
             start_epoch = 1
     elif isinstance(pretrained_model, str) and pretrained_model != "":
         start_epoch = trainer.load_checkpoint(pretrained_model, load_only_params=load_only_params)
         start_epoch += 1
-        print(f"Checkpoint {pretrained_model} loaded, starting training from epoch {start_epoch}.")
+        acc_print(f"Checkpoint {pretrained_model} loaded, starting training from epoch {start_epoch}.")
     elif ( isinstance(pretrained_model, str) and pretrained_model == "" ) or ( isinstance(pretrained_model, bool) and pretrained_model == False ):
-        print(f"Starting training from epoch 1.")
+        acc_print(f"Starting training from epoch 1.")
         start_epoch = 1
     else:
-        print(f"Unrecognized value for load_checkpoint config option, starting training from epoch 1 - {pretrained_model}")
+        acc_print(f"Unrecognized value for load_checkpoint config option, starting training from epoch 1 - {pretrained_model}")
         start_epoch = 1
 
     _ensure_curriculum_for_epoch(start_epoch)
@@ -852,21 +902,25 @@ def main(config_path):
 
         results = train_results.copy()
         results.update(eval_results)
-        logger.info('--- epoch %d ---' % epoch)
-        for key, value in results.items():
-            if isinstance(value, float):
-                logger.info('%-15s: %.5f' % (key, value))
-                writer.add_scalar(key, value, epoch)
-            else:
-                for v in value:
-                    writer.add_figure('eval_attn', plot_image(v), epoch)
+        if accelerator.is_main_process:
+            logger.info('--- epoch %d ---' % epoch)
+            for key, value in results.items():
+                if isinstance(value, float):
+                    logger.info('%-15s: %.5f' % (key, value))
+                    if writer is not None:
+                        writer.add_scalar(key, value, epoch)
+                else:
+                    if writer is not None:
+                        for v in value:
+                            writer.add_figure('eval_attn', plot_image(v), epoch)
 
         if (epoch % save_freq) == 0 or ( early_stopping != None and early_stopping(learning_rate) ):
             trainer.save_checkpoint(osp.join(log_dir, 'epoch_%05d.pth' % epoch))
 
         # Check if early stopping condition is met
         if early_stopping != None and early_stopping(learning_rate):
-            logger.info(f"Early stopping triggered at epoch {epoch}, learning_rate: {learning_rate:.5f}")
+            if accelerator.is_main_process:
+                logger.info(f"Early stopping triggered at epoch {epoch}, learning_rate: {learning_rate:.5f}")
             break
 
     return 0

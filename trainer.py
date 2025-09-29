@@ -31,6 +31,7 @@ class Trainer(object):
                  scheduler=None,
                  config={},
                  device=torch.device("cpu"),
+                 accelerator=None,
                  logger=logger,
                  sorted_train_dataloader=None,
                  shuffled_train_dataloader=None,
@@ -56,6 +57,7 @@ class Trainer(object):
                  memory_optimization_config=None,
                  steps_per_epoch=None):
 
+        self.accelerator = accelerator
         self.steps = initial_steps
         self.epochs = initial_epochs
         self.model = model
@@ -69,7 +71,10 @@ class Trainer(object):
         self.shuffled_val_dataloader = shuffled_val_dataloader
         self.val_dataloader = sorted_val_dataloader
         self.config = config
-        self.device = device
+        if self.accelerator is not None:
+            self.device = self.accelerator.device
+        else:
+            self.device = device
         self.finish_train = False
         self.logger = logger
         self.fp16_run = False
@@ -141,14 +146,18 @@ class Trainer(object):
         dtype_key = str(mp_cfg.get('dtype', 'float16')).lower()
         self.mixed_precision_dtype = dtype_map.get(dtype_key, torch.float16)
         autocast_enabled = bool(mp_cfg.get('enabled', False))
-        device_type = self.device.type if isinstance(self.device, torch.device) else str(self.device)
+        if isinstance(self.device, torch.device):
+            device_type = self.device.type
+        else:
+            device_type = str(self.device)
+        if not isinstance(device_type, str):
+            device_type = 'cpu'
         self.autocast_enabled = (
             autocast_enabled
             and torch.cuda.is_available()
-            and isinstance(device_type, str)
             and device_type.startswith('cuda')
         )
-        self.autocast_device_type = 'cuda'
+        self.autocast_device_type = 'cuda' if device_type.startswith('cuda') else device_type
 
         grad_scaler_cfg = mp_cfg.get('grad_scaler', {}) if isinstance(mp_cfg, dict) else {}
         if not isinstance(grad_scaler_cfg, dict):
@@ -481,13 +490,21 @@ class Trainer(object):
         Args:
             checkpoint_path (str): Checkpoint path to be saved.
         """
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
+            if not self.accelerator.is_main_process:
+                return
+            model_state = self.accelerator.get_state_dict(self.model)
+        else:
+            model_state = self.model.state_dict()
+
         state_dict = {
             "optimizer": self.optimizer.state_dict(),
             "scheduler": self.scheduler.state_dict(),
             "steps": self.steps,
             "epochs": self.epochs,
         }
-        state_dict["model"] = self.model.state_dict()
+        state_dict["model"] = model_state
 
         if not os.path.exists(os.path.dirname(checkpoint_path)):
             os.makedirs(os.path.dirname(checkpoint_path))
@@ -501,9 +518,12 @@ class Trainer(object):
             load_only_params (bool): Whether to load only model parameters.
 
         """
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
         self.logger.info("Loading checkpoint from: %s" % checkpoint_path)
         state_dict = torch.load(checkpoint_path, map_location="cpu")
-        self._load(state_dict["model"], self.model)
+        target_model = self.accelerator.unwrap_model(self.model) if self.accelerator is not None else self.model
+        self._load(state_dict["model"], target_model)
 
         if not load_only_params:
             self.steps = state_dict["steps"]
@@ -514,6 +534,9 @@ class Trainer(object):
             # overwrite schedular argument parameters
             state_dict["scheduler"].update(**self.config.get("scheduler_params", {}))
             self.scheduler.load_state_dict(state_dict["scheduler"])
+
+        if self.accelerator is not None:
+            self.accelerator.wait_for_everyone()
 
         self._optimizer_step_count = self._get_optimizer_step_count()
 
@@ -732,6 +755,7 @@ class Trainer(object):
         batch = processed_batch
 
         text_input, text_input_length, mel_input, mel_input_length = batch[:4]
+        batch_size = int(text_input.size(0)) if hasattr(text_input, 'size') else len(text_input)
         if len(batch) > 4:
             speaker_ids = batch[4]
         else:
@@ -957,6 +981,7 @@ class Trainer(object):
             losses['ctc'] = loss_ctc.item()
         if 's2s' not in losses:
             losses['s2s'] = loss_s2s.item()
+        losses['_batch_weight'] = float(batch_size)
         return losses
 
     def _train_epoch(self):
@@ -972,32 +997,94 @@ class Trainer(object):
             if should_switch_now:
                 self._switch_to_shuffled(None)
 
-        train_losses = defaultdict(list)
+        metric_sums = defaultdict(float)
+        metric_weights = defaultdict(float)
         self.model.train()
-        for train_steps_per_epoch, batch in enumerate(tqdm(self.train_dataloader, desc="[train]"), 1):
+        dataloader = self.train_dataloader
+        if isinstance(self.device, torch.device):
+            tensor_device = self.device
+        else:
+            try:
+                tensor_device = torch.device(str(self.device))
+            except (TypeError, ValueError):
+                tensor_device = torch.device('cpu')
+        disable_tqdm = False
+        if self.accelerator is not None:
+            disable_tqdm = not getattr(self.accelerator, "is_local_main_process", True)
+        for train_steps_per_epoch, batch in enumerate(tqdm(dataloader, desc="[train]", disable=disable_tqdm), 1):
             losses = self.run(batch)
+            batch_weight = float(losses.pop('_batch_weight', 1.0))
             for key, value in losses.items():
-                train_losses["train/%s" % key].append(value)
+                metric_key = f"train/{key}"
+                metric_sums[metric_key] += float(value) * batch_weight
+                metric_weights[metric_key] += batch_weight
 
-        train_losses = {key: np.mean(value) for key, value in train_losses.items()}
+        if self.accelerator is not None:
+            for key in list(metric_sums.keys()):
+                sum_tensor = torch.tensor([metric_sums[key]], device=tensor_device)
+                weight_tensor = torch.tensor([metric_weights[key]], device=tensor_device)
+                gathered_sum = self.accelerator.gather_for_metrics(sum_tensor).sum().item()
+                gathered_weight = self.accelerator.gather_for_metrics(weight_tensor).sum().item()
+                metric_sums[key] = gathered_sum
+                metric_weights[key] = gathered_weight
+
+        train_losses = {}
+        for key, total in metric_sums.items():
+            weight = metric_weights.get(key, 0.0)
+            train_losses[key] = total / max(weight, 1e-12) if weight > 0 else 0.0
+
         train_losses['train/learning_rate'] = self._get_lr()
         self.epochs += 1
 
-        gpu_id = 0
-        allocated = torch.cuda.memory_allocated(gpu_id) / 1024**2
-        if allocated > self.maxm_mem_usage:
-            self.maxm_mem_usage = allocated
+        allocated = 0.0
+        device_index = None
+        is_cuda_device = False
+        if isinstance(self.device, torch.device):
+            is_cuda_device = self.device.type == 'cuda'
+            device_index = self.device.index
+        else:
+            device_str = str(self.device)
+            if isinstance(device_str, str) and device_str.startswith('cuda'):
+                is_cuda_device = True
+                parts = device_str.split(':')
+                if len(parts) > 1 and parts[1].isdigit():
+                    device_index = int(parts[1])
+        if torch.cuda.is_available() and is_cuda_device:
+            if device_index is None:
+                device_index = torch.cuda.current_device()
+            allocated = torch.cuda.memory_allocated(device_index) / 1024**2
+        self.maxm_mem_usage = max(self.maxm_mem_usage, allocated)
 
-        train_losses['gpu/max_allocation_recorded'] = self.maxm_mem_usage
-        train_losses['gpu/current_allocation'] = allocated
+        current_allocation = allocated
+        max_allocation = self.maxm_mem_usage
+        if self.accelerator is not None:
+            alloc_tensor = torch.tensor([allocated], device=tensor_device)
+            max_tensor = torch.tensor([self.maxm_mem_usage], device=tensor_device)
+            current_allocation = self.accelerator.gather_for_metrics(alloc_tensor).max().item()
+            max_allocation = self.accelerator.gather_for_metrics(max_tensor).max().item()
+
+        train_losses['gpu/max_allocation_recorded'] = max_allocation
+        train_losses['gpu/current_allocation'] = current_allocation
         return train_losses
 
     @torch.no_grad()
     def _eval_epoch(self):
         self.model.eval()
-        eval_losses = defaultdict(list)
+        metric_sums = defaultdict(float)
+        metric_weights = defaultdict(float)
         eval_images = defaultdict(list)
-        for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
+        dataloader = self.val_dataloader
+        if isinstance(self.device, torch.device):
+            tensor_device = self.device
+        else:
+            try:
+                tensor_device = torch.device(str(self.device))
+            except (TypeError, ValueError):
+                tensor_device = torch.device('cpu')
+        disable_tqdm = False
+        if self.accelerator is not None:
+            disable_tqdm = not getattr(self.accelerator, "is_local_main_process", True)
+        for eval_steps_per_epoch, batch in enumerate(tqdm(dataloader, desc="[eval]", disable=disable_tqdm), 1):
             processed_batch = []
             for element in batch:
                 if hasattr(element, 'to'):
@@ -1011,6 +1098,7 @@ class Trainer(object):
                 speaker_ids = batch[4].long()
             else:
                 speaker_ids = torch.zeros(text_input.size(0), device=self.device, dtype=torch.long)
+            batch_weight = float(text_input.size(0))
             mel_input_length = mel_input_length // (2 ** self.model.n_down)
             future_mask = self._maybe_create_future_mask(
                 mel_input.size(2) // (2 ** self.model.n_down)
@@ -1032,7 +1120,8 @@ class Trainer(object):
                     text_input_length,
                     mix_metadata=None,
                 )
-                eval_losses["eval/ctc"].append(loss_ctc.item())
+                metric_sums["eval/ctc"] += float(loss_ctc.item()) * batch_weight
+                metric_weights["eval/ctc"] += batch_weight
             else:
                 loss_ctc = torch.zeros(1, device=self.device)
 
@@ -1041,7 +1130,8 @@ class Trainer(object):
                 for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
                     loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
                 loss_s2s /= max(1, text_input.size(0))
-                eval_losses["eval/s2s"].append(loss_s2s.item())
+                metric_sums["eval/s2s"] += float(loss_s2s.item()) * batch_weight
+                metric_weights["eval/s2s"] += batch_weight
             else:
                 loss_s2s = torch.zeros(1, device=self.device)
 
@@ -1056,12 +1146,14 @@ class Trainer(object):
                     entropy_ctc = self._compute_entropy_regularization(ppgs, lengths=mel_input_length, key='ctc')
                     if entropy_ctc is not None:
                         total_eval_loss = total_eval_loss + entropy_ctc
-                        eval_losses['eval/entropy_ctc'].append(entropy_ctc.item())
+                        metric_sums['eval/entropy_ctc'] += float(entropy_ctc.item()) * batch_weight
+                        metric_weights['eval/entropy_ctc'] += batch_weight
                 if s2s_pred is not None:
                     entropy_s2s = self._compute_entropy_regularization(s2s_pred, lengths=text_input_length, key='s2s')
                     if entropy_s2s is not None:
                         total_eval_loss = total_eval_loss + entropy_s2s
-                        eval_losses['eval/entropy_s2s'].append(entropy_s2s.item())
+                        metric_sums['eval/entropy_s2s'] += float(entropy_s2s.item()) * batch_weight
+                        metric_weights['eval/entropy_s2s'] += batch_weight
 
             intermediate_outputs = model_outputs.get('intermediate_ctc_logits') or {}
             if (
@@ -1083,10 +1175,13 @@ class Trainer(object):
                     )
                     weight = float(self.intermediate_ctc_layer_weights.get(str(layer_key), 1.0))
                     layer_losses = layer_losses + weight * layer_loss
-                    eval_losses[f'eval/intermediate_ctc/layer_{layer_key}'].append(layer_loss.item())
+                    key = f'eval/intermediate_ctc/layer_{layer_key}'
+                    metric_sums[key] += float(layer_loss.item()) * batch_weight
+                    metric_weights[key] += batch_weight
 
                 total_eval_loss = total_eval_loss + self.intermediate_ctc_weight * layer_losses
-                eval_losses['eval/intermediate_ctc'].append(layer_losses.item())
+                metric_sums['eval/intermediate_ctc'] += float(layer_losses.item()) * batch_weight
+                metric_weights['eval/intermediate_ctc'] += batch_weight
 
             self_conditioned_outputs = model_outputs.get('self_conditioned_ctc_logits') or {}
             if (
@@ -1108,10 +1203,13 @@ class Trainer(object):
                     )
                     weight = float(self.self_conditioned_ctc_layer_weights.get(str(layer_key), 1.0))
                     sc_losses = sc_losses + weight * sc_loss
-                    eval_losses[f'eval/self_conditioned_ctc/layer_{layer_key}'].append(sc_loss.item())
+                    key = f'eval/self_conditioned_ctc/layer_{layer_key}'
+                    metric_sums[key] += float(sc_loss.item()) * batch_weight
+                    metric_weights[key] += batch_weight
 
                 total_eval_loss = total_eval_loss + self.self_conditioned_ctc_weight * sc_losses
-                eval_losses['eval/self_conditioned_ctc'].append(sc_losses.item())
+                metric_sums['eval/self_conditioned_ctc'] += float(sc_losses.item()) * batch_weight
+                metric_weights['eval/self_conditioned_ctc'] += batch_weight
 
             if self.enable_frame_classifier and self.frame_weight > 0:
                 frame_logits = model_outputs.get('frame_phoneme_logits')
@@ -1120,17 +1218,20 @@ class Trainer(object):
                     frame_loss = self.criterion['frame_ce'](frame_logits.reshape(-1, frame_logits.size(2)),
                                                             frame_targets.view(-1))
                     total_eval_loss = total_eval_loss + self.frame_weight * frame_loss
-                    eval_losses['eval/frame_phoneme'].append(frame_loss.item())
+                    metric_sums['eval/frame_phoneme'] += float(frame_loss.item()) * batch_weight
+                    metric_weights['eval/frame_phoneme'] += batch_weight
 
             if self.enable_speaker and self.speaker_weight > 0:
                 speaker_logits = model_outputs.get('speaker_logits')
                 if speaker_logits is not None:
                     loss_speaker = self.criterion['speaker_ce'](speaker_logits, speaker_ids)
                     total_eval_loss = total_eval_loss + self.speaker_weight * loss_speaker
-                    eval_losses['eval/speaker'].append(loss_speaker.item())
+                    metric_sums['eval/speaker'] += float(loss_speaker.item()) * batch_weight
+                    metric_weights['eval/speaker'] += batch_weight
                     speaker_pred = torch.argmax(speaker_logits, dim=1)
                     speaker_acc = torch.eq(speaker_pred, speaker_ids).float().mean().item()
-                    eval_losses['eval/speaker_acc'].append(speaker_acc)
+                    metric_sums['eval/speaker_acc'] += float(speaker_acc) * batch_weight
+                    metric_weights['eval/speaker_acc'] += batch_weight
 
             if self.enable_pronunciation_error and self.pron_error_weight > 0:
                 pron_logits = model_outputs.get('pron_error_logits')
@@ -1139,32 +1240,68 @@ class Trainer(object):
                     pron_loss = self.criterion['pron_error_ce'](pron_logits.reshape(-1, pron_logits.size(2)),
                                                                 pron_targets.view(-1))
                     total_eval_loss = total_eval_loss + self.pron_error_weight * pron_loss
-                    eval_losses['eval/pronunciation_error'].append(pron_loss.item())
+                    metric_sums['eval/pronunciation_error'] += float(pron_loss.item()) * batch_weight
+                    metric_weights['eval/pronunciation_error'] += batch_weight
                     pron_pred = torch.argmax(pron_logits, dim=2)
                     pron_acc = self._sequence_accuracy(pron_pred, pron_targets)
-                    eval_losses['eval/pronunciation_error_acc'].append(pron_acc)
+                    metric_sums['eval/pronunciation_error_acc'] += float(pron_acc) * batch_weight
+                    metric_weights['eval/pronunciation_error_acc'] += batch_weight
 
-            eval_losses["eval/loss"].append(total_eval_loss.item())
+            metric_sums["eval/loss"] += float(total_eval_loss.item()) * batch_weight
+            metric_weights["eval/loss"] += batch_weight
 
             if ppgs is not None:
                 _, amax_ppgs = torch.max(ppgs, dim=2)
-                wers = [calc_wer(target[:text_length],
-                                 pred[:mel_length],
-                                 ignore_indexes=list(range(5))) \
-                        for target, pred, text_length, mel_length in zip(
-                                text_input.cpu(), amax_ppgs.cpu(), text_input_length.cpu(), mel_input_length.cpu())]
-                eval_losses["eval/wer"].extend(wers)
+                wers = [
+                    calc_wer(
+                        target[:text_length],
+                        pred[:mel_length],
+                        ignore_indexes=list(range(5)),
+                    )
+                    for target, pred, text_length, mel_length in zip(
+                        text_input.cpu(),
+                        amax_ppgs.cpu(),
+                        text_input_length.cpu(),
+                        mel_input_length.cpu(),
+                    )
+                ]
+                if wers:
+                    metric_sums["eval/wer"] += float(np.sum(wers))
+                    metric_weights["eval/wer"] += len(wers)
 
             if s2s_pred is not None:
                 _, amax_s2s = torch.max(s2s_pred, dim=2)
-                acc = [torch.eq(target[:length], pred[:length]).float().mean().item() \
-                       for target, pred, length in zip(text_input.cpu(), amax_s2s.cpu(), text_input_length.cpu())]
-                eval_losses["eval/acc"].extend(acc)
+                acc = [
+                    torch.eq(target[:length], pred[:length]).float().mean().item()
+                    for target, pred, length in zip(
+                        text_input.cpu(), amax_s2s.cpu(), text_input_length.cpu()
+                    )
+                ]
+                if acc:
+                    metric_sums["eval/acc"] += float(np.sum(acc))
+                    metric_weights["eval/acc"] += len(acc)
 
-            if s2s_attn is not None and eval_steps_per_epoch <= 2:
+            if (
+                s2s_attn is not None
+                and eval_steps_per_epoch <= 2
+                and (self.accelerator is None or self.accelerator.is_main_process)
+            ):
                 eval_images["eval/image"].append(
                     self.get_image([s2s_attn[0].cpu().numpy()]))
 
-        eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
+        if self.accelerator is not None:
+            for key in list(metric_sums.keys()):
+                sum_tensor = torch.tensor([metric_sums[key]], device=tensor_device)
+                weight_tensor = torch.tensor([metric_weights[key]], device=tensor_device)
+                gathered_sum = self.accelerator.gather_for_metrics(sum_tensor).sum().item()
+                gathered_weight = self.accelerator.gather_for_metrics(weight_tensor).sum().item()
+                metric_sums[key] = gathered_sum
+                metric_weights[key] = gathered_weight
+
+        eval_losses = {}
+        for key, total in metric_sums.items():
+            weight = metric_weights.get(key, 0.0)
+            if weight > 0:
+                eval_losses[key] = total / max(weight, 1e-12)
         eval_losses.update(eval_images)
         return eval_losses

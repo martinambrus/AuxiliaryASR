@@ -10,13 +10,19 @@ cd AuxiliaryASR
 ```
 3. Install python requirements: 
 ```bash
-pip install SoundFile torchaudio torch jiwer pyyaml click matplotlib librosa nltk pandas nvitop tensorboard
+pip install SoundFile torchaudio torch jiwer pyyaml click matplotlib librosa nltk pandas nvitop tensorboard accelerate
 ```
 4. Prepare your own dataset and put the `train_list.txt` and `val_list.txt` in the `Data` folder (see Training section for more details).
 
 ## Training
 ```bash
 python train.py --config_path ./Configs/config.yml
+```
+
+When training across multiple GPUs, configure Accelerate if needed (`accelerate config`) and launch training with:
+
+```bash
+accelerate launch --num_processes <num_gpus> train.py --config_path ./Configs/config.yml
 ```
 Please specify the training and validation data in `config.yml` file. The data list format needs to be `filename.wav|label-in-espeak-phonemes|speaker_number`, see [train_list.txt](https://github.com/martinambrus/AuxiliaryASR/blob/main/Data/train_list.txt) as an example (a custom sample of phonemized WAV files used for English training). Note that `speaker_number` can just be `0` for ASR, but it is useful to set a meaningful number for TTS training in StyleTTS2. 
 
