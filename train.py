@@ -565,7 +565,12 @@ def main(config_path):
     else:
         print(f"[Curriculum] Static batch size configured: {batch_size}")
 
+    dataloader_optimizations_cfg = dataloader_params.get('optimizations', {}) or {}
+
     collate_config = {'return_speaker_ids': True}
+    shared_memory_cfg = dataloader_optimizations_cfg.get('shared_memory_batches') or {}
+    if shared_memory_cfg:
+        collate_config['memory_optimizations'] = shared_memory_cfg
 
     def _build_dataloaders_for_batch(current_batch_size):
         current_batch_size = int(current_batch_size)
@@ -578,7 +583,8 @@ def main(config_path):
             dataset_config=dataset_params,
             device=device,
             collate_config=collate_config,
-            dataset_name="train")
+            dataset_name="train",
+            loader_runtime_config=dataloader_optimizations_cfg)
 
         shuffled_train_loader = build_dataloader(
             train_entries,
@@ -589,7 +595,8 @@ def main(config_path):
             lengths=train_durations,
             bucket_sampler_config=train_bucket_sampler_config,
             collate_config=collate_config,
-            dataset_name="train")
+            dataset_name="train",
+            loader_runtime_config=dataloader_optimizations_cfg)
 
         sorted_val_loader = build_dataloader(
             val_list_sorted,
@@ -599,7 +606,8 @@ def main(config_path):
             device=device,
             dataset_config=dataset_params,
             collate_config=collate_config,
-            dataset_name="val")
+            dataset_name="val",
+            loader_runtime_config=dataloader_optimizations_cfg)
 
         shuffled_val_loader = build_dataloader(
             val_entries,
@@ -609,7 +617,8 @@ def main(config_path):
             device=device,
             dataset_config=dataset_params,
             collate_config=collate_config,
-            dataset_name="val")
+            dataset_name="val",
+            loader_runtime_config=dataloader_optimizations_cfg)
 
         steps = len(sorted_train_loader) if sorted_train_loader is not None else len(shuffled_train_loader)
         steps = int(steps)

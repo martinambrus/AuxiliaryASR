@@ -221,6 +221,22 @@ dataloader_params:
     bucket_size_multiplier: 20  # bucket = batch_size * multiplier
     shuffle_within_bucket: true
     shuffle_batches: true
+  optimizations:
+    enabled: true  # Master switch controlling all DataLoader runtime optimisations.
+    persistent_workers:
+      enabled: true  # Keep worker processes alive between iterations to reduce fork overhead.
+      apply_to_validation: true  # Also reuse validation workers when ``True``.
+    prefetch_factor:
+      enabled: true  # Override the default number of prefetched batches per worker.
+      train: 4  # Prefetch depth for training workers; tune to balance latency vs. memory.
+      val: 2  # Prefetch depth for evaluation workers; typically lower than training.
+    pin_memory:
+      enabled: true  # Ask PyTorch to return batches allocated in pinned host memory for faster GPU copies.
+      device: "cuda"  # Optional CUDA device identifier forwarded to DataLoader (set to null to disable forwarding).
+    shared_memory_batches:
+      enabled: true  # Promote collated batches to shared, pinned tensors immediately after collation.
+      pin_after_collate: true  # Explicitly call ``Tensor.pin_memory()`` on collated tensors.
+      share_across_workers: true  # Call ``Tensor.share_memory_()`` so results stay in shared memory queues.
 
 training_curriculum:
   batch_size_schedule:

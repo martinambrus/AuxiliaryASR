@@ -10,7 +10,7 @@ import hashlib
 from pathlib import Path
 import numpy as np
 import random
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -1013,13 +1013,24 @@ class MelDataset(torch.utils.data.Dataset):
 class Collater(object):
     """
     Args:
-      return_wave (bool): if true, will return the wave data along with spectrogram. 
+      return_wave (bool): if true, will return the wave data along with spectrogram.
     """
 
-    def __init__(self, return_wave=False, return_speaker_ids=False):
+    def __init__(
+        self,
+        return_wave: bool = False,
+        return_speaker_ids: bool = False,
+        memory_optimizations: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.text_pad_index = 0
         self.return_wave = return_wave
         self.return_speaker_ids = return_speaker_ids
+
+        memory_cfg = dict(memory_optimizations or {})
+        enabled = bool(memory_cfg.get('enabled', False))
+        self._memory_opt_enabled = enabled
+        self._share_memory = enabled and bool(memory_cfg.get('share_across_workers', True))
+        self._pin_memory = enabled and bool(memory_cfg.get('pin_after_collate', True))
 
     def __call__(self, batch):
         batch_size = len(batch)
@@ -1057,7 +1068,29 @@ class Collater(object):
             waves = [b[0] for b in batch]
             outputs.append(waves)
 
-        return tuple(outputs)
+        processed = tuple(outputs)
+        if self._memory_opt_enabled:
+            processed = self._apply_memory_strategies(processed)
+        return processed
+
+    def _apply_memory_strategies(self, outputs: Tuple[Any, ...]) -> Tuple[Any, ...]:
+        def transform(item: Any) -> Any:
+            if isinstance(item, torch.Tensor):
+                tensor = item
+                if self._pin_memory:
+                    tensor = tensor.pin_memory()
+                if self._share_memory:
+                    tensor = tensor.share_memory_()
+                return tensor
+            if isinstance(item, list):
+                return [transform(elem) for elem in item]
+            if isinstance(item, tuple):
+                return tuple(transform(elem) for elem in item)
+            if isinstance(item, dict):
+                return {key: transform(value) for key, value in item.items()}
+            return item
+
+        return tuple(transform(out) for out in outputs)
 
 
 
@@ -1066,11 +1099,12 @@ def build_dataloader(path_list,
                      batch_size=4,
                      num_workers=1,
                      device='cpu',
-                     collate_config={},
-                     dataset_config={},
+                     collate_config=None,
+                     dataset_config=None,
                      lengths=None,
                      bucket_sampler_config=None,
-                     dataset_name=None):
+                     dataset_name=None,
+                     loader_runtime_config=None):
 
     dataset_cfg = dict(dataset_config or {})
     mel_cache_cfg = dataset_cfg.pop('mel_cache', None)
@@ -1081,10 +1115,52 @@ def build_dataloader(path_list,
         dataset_name=dataset_name,
         **dataset_cfg,
     )
-    collate_fn = Collater(**collate_config)
+    collate_cfg = dict(collate_config or {})
+    memory_opt_cfg = collate_cfg.pop('memory_optimizations', None)
+    collate_fn = Collater(memory_optimizations=memory_opt_cfg, **collate_cfg)
 
     use_bucket_sampler = False
     batch_sampler = None
+
+    loader_cfg = dict(loader_runtime_config or {})
+    loader_kwargs: Dict[str, Any] = {}
+    pin_memory = device != 'cpu'
+    if loader_cfg:
+        global_enabled = bool(loader_cfg.get('enabled', True))
+
+        def _section_enabled(section: Optional[Dict[str, Any]], default: bool = True) -> bool:
+            if not global_enabled:
+                return False
+            if not section:
+                return default
+            return bool(section.get('enabled', default))
+
+        pin_cfg = loader_cfg.get('pin_memory', {})
+        if _section_enabled(pin_cfg, default=True):
+            pin_memory = True
+            pin_device = pin_cfg.get('device') if isinstance(pin_cfg, dict) else None
+            if pin_device:
+                loader_kwargs['pin_memory_device'] = str(pin_device)
+        elif global_enabled and isinstance(pin_cfg, dict) and not pin_cfg.get('enabled', True):
+            pin_memory = False
+
+        persistent_cfg = loader_cfg.get('persistent_workers', {})
+        persistent_workers = _section_enabled(persistent_cfg, default=False)
+        if validation and isinstance(persistent_cfg, dict) and not persistent_cfg.get('apply_to_validation', True):
+            persistent_workers = False
+        if persistent_workers and num_workers > 0:
+            loader_kwargs['persistent_workers'] = True
+
+        prefetch_cfg = loader_cfg.get('prefetch_factor', {})
+        if _section_enabled(prefetch_cfg, default=False) and num_workers > 0:
+            if validation:
+                pf_value = prefetch_cfg.get('validation', prefetch_cfg.get('val'))
+            else:
+                pf_value = prefetch_cfg.get('train')
+            if pf_value is None:
+                pf_value = prefetch_cfg.get('value')
+            if pf_value is not None:
+                loader_kwargs['prefetch_factor'] = int(pf_value)
 
     if (not validation) and bucket_sampler_config and lengths is not None:
         lengths = list(lengths)
@@ -1121,7 +1197,8 @@ def build_dataloader(path_list,
                                  batch_sampler=batch_sampler,
                                  num_workers=num_workers,
                                  collate_fn=collate_fn,
-                                 pin_memory=(device != 'cpu'))
+                                 pin_memory=pin_memory,
+                                 **loader_kwargs)
     else:
         data_loader = DataLoader(dataset,
                                  batch_size=batch_size,
@@ -1129,6 +1206,7 @@ def build_dataloader(path_list,
                                  num_workers=num_workers,
                                  drop_last=(not validation),
                                  collate_fn=collate_fn,
-                                 pin_memory=(device != 'cpu'))
+                                 pin_memory=pin_memory,
+                                 **loader_kwargs)
 
     return data_loader
