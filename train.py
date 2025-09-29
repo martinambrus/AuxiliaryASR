@@ -4,6 +4,7 @@ from utils import *
 from models import build_model
 from trainer import Trainer
 
+import copy
 import os
 import os.path as osp
 import math
@@ -21,6 +22,8 @@ import click
 import importlib
 import importlib.util
 from pathlib import Path
+from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 # enable better memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -34,6 +37,14 @@ handler.setLevel(logging.DEBUG)
 logger.addHandler(handler)
 
 torch.backends.cudnn.benchmark = True
+
+
+class _DummySummaryWriter:
+    def add_scalar(self, *args, **kwargs):
+        return None
+
+    def add_figure(self, *args, **kwargs):
+        return None
 
 
 def _load_optional_tqdm():
@@ -467,42 +478,91 @@ class EarlyStoppingWithNoLearningRate:
 
         return self.stop_training
 
+
 @click.command()
 @click.option('-p', '--config_path', default='./Configs/config.yml', type=str)
 def main(config_path):
-    print(f"Loading config data from: {config_path}")
     config = yaml.safe_load(open(config_path))
 
-    log_dir = cfg_get_nested( config, 'log_dir', 'Checkpoint' )
-    print(f"Using logs and models folder: {log_dir}")
+    desired_device = str(cfg_get_nested(config, 'device', 'cpu')).lower()
+    accelerator_kwargs = {}
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator_kwargs['kwargs_handlers'] = [ddp_kwargs]
+    # ``split_batches`` defaults to ``True`` which would further subdivide each
+    # dataloader batch across data-parallel workers.  The training scripts
+    # already size batches per device, so keep them intact by disabling that
+    # behaviour explicitly.
+    accelerator_kwargs['split_batches'] = False
+    if desired_device.startswith('cpu'):
+        accelerator_kwargs['cpu'] = True
 
-    if not osp.exists(log_dir): os.mkdir(log_dir)
-    shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
+    accelerator = Accelerator(**accelerator_kwargs)
+    print_fn = accelerator.print
 
-    writer = SummaryWriter(log_dir + "/tensorboard")
+    print_fn(f"Loading config data from: {config_path}")
 
-    # write logs
-    file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
-    file_handler.setLevel(logging.DEBUG)
-    file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
-    logger.addHandler(file_handler)
+    log_dir = cfg_get_nested(config, 'log_dir', 'Checkpoint')
+    print_fn(f"Using logs and models folder: {log_dir}")
 
-    batch_size = cfg_get_nested( config, 'batch_size', 10)
-    device = cfg_get_nested( config, 'device', 'cpu')
-    epochs = cfg_get_nested( config, 'epochs', 200)
-    save_freq = cfg_get_nested( config, 'save_freq', 10)
-    train_path = cfg_get_nested( config, 'train_data', None)
-    val_path = cfg_get_nested( config, 'val_data', None)
-    enable_early_stopping = cfg_get_nested( config, 'enable_early_stopping', True)
+    if accelerator.is_main_process:
+        if not osp.exists(log_dir):
+            os.makedirs(log_dir, exist_ok=True)
+        shutil.copy(config_path, osp.join(log_dir, osp.basename(config_path)))
+
+    accelerator.wait_for_everyone()
+
+    if accelerator.is_main_process:
+        writer = SummaryWriter(log_dir + "/tensorboard")
+    else:
+        writer = _DummySummaryWriter()
+
+    if accelerator.is_main_process:
+        file_handler = logging.FileHandler(osp.join(log_dir, 'train.log'))
+        file_handler.setLevel(logging.DEBUG)
+        file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
+        logger.addHandler(file_handler)
+
+    configured_global_batch_size = int(cfg_get_nested(config, 'batch_size', 10))
+    epochs = cfg_get_nested(config, 'epochs', 200)
+    save_freq = cfg_get_nested(config, 'save_freq', 10)
+    train_path = cfg_get_nested(config, 'train_data', None)
+    val_path = cfg_get_nested(config, 'val_data', None)
+    enable_early_stopping = cfg_get_nested(config, 'enable_early_stopping', True)
+
+    device = accelerator.device
+    device_str = str(device)
+
+    data_parallel_world_size = max(1, int(accelerator.num_processes))
+    grad_accumulation_steps = max(1, int(getattr(accelerator, 'gradient_accumulation_steps', 1)))
+    effective_batch_factor = max(1, data_parallel_world_size * grad_accumulation_steps)
+    batch_size = max(1, int(math.ceil(configured_global_batch_size / float(effective_batch_factor))))
+    effective_global_batch_size = batch_size * effective_batch_factor
+
+    if accelerator.is_main_process:
+        if data_parallel_world_size > 1 or grad_accumulation_steps > 1:
+            print_fn(
+                "Using %d data parallel process(es) with %d gradient accumulation step(s)."
+                % (data_parallel_world_size, grad_accumulation_steps)
+            )
+        if effective_global_batch_size != configured_global_batch_size:
+            print_fn(
+                "Configured global batch size %d mapped to per-device batch size %d for an effective global size of %d."
+                % (
+                    configured_global_batch_size,
+                    batch_size,
+                    effective_global_batch_size,
+                )
+            )
+
     dataset_params = {
-        'dict_path': cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'),
-        'sr': cfg_get_nested( config, 'preprocess_params.sr', 24000),
-        'spect_params': cfg_get_nested( config, 'preprocess_params.spect_params', {
+        'dict_path': cfg_get_nested(config, 'phoneme_maps_path', 'Data/word_index_dict.txt'),
+        'sr': cfg_get_nested(config, 'preprocess_params.sr', 24000),
+        'spect_params': cfg_get_nested(config, 'preprocess_params.spect_params', {
             'n_fft': 1024,
             'win_length': 1024,
             'hop_length': 300
         }),
-        'mel_params': cfg_get_nested( config, 'preprocess_params.mel_params', { 'n_mels': 80 })
+        'mel_params': cfg_get_nested(config, 'preprocess_params.mel_params', {'n_mels': 80})
     }
 
     phoneme_dict_config = cfg_get_nested(config, 'phoneme_dictionary', {}) or {}
@@ -549,8 +609,6 @@ def main(config_path):
     )
     num_train_items = len(train_entries)
 
-    # sort data list by duration for consistent bucketing and batching
-    # to reduce padding, improving both training stability and alignment accuracy
     train_list_sorted, _ = sort_data_list_by_duration(precomputed=(train_entries, train_durations))
     val_list_sorted, _ = sort_data_list_by_duration(precomputed=(val_entries, val_durations))
 
@@ -559,16 +617,126 @@ def main(config_path):
     val_num_workers = int(dataloader_params.get('val_num_workers', 2))
     train_bucket_sampler_config = dataloader_params.get('train_bucket_sampler', {})
 
-    base_eval_batch_size = int(cfg_get_nested(config, 'eval_params.batch_size', batch_size))
-    curriculum_batch_cfg = cfg_get_nested(config, 'training_curriculum.batch_size_schedule', {}) or {}
-    batch_scheduler = BatchSizeScheduler(curriculum_batch_cfg, default_batch_size=batch_size, total_epochs=epochs)
+    base_eval_global_batch_size = int(
+        cfg_get_nested(config, 'eval_params.batch_size', configured_global_batch_size)
+    )
+    base_eval_batch_size = max(
+        1, int(math.ceil(base_eval_global_batch_size / float(data_parallel_world_size)))
+    )
+    effective_eval_global_batch_size = base_eval_batch_size * data_parallel_world_size
+    if accelerator.is_main_process and effective_eval_global_batch_size != base_eval_global_batch_size:
+        print_fn(
+            "Configured evaluation batch size %d mapped to per-device batch size %d for an effective global size of %d."
+            % (
+                base_eval_global_batch_size,
+                base_eval_batch_size,
+                effective_eval_global_batch_size,
+            )
+        )
 
-    if batch_scheduler.enabled:
-        print(f"[Curriculum] Batch size schedule enabled: {batch_scheduler.summary()}")
-    else:
-        print(f"[Curriculum] Static batch size configured: {batch_size}")
+    curriculum_batch_cfg = cfg_get_nested(config, 'training_curriculum.batch_size_schedule', {}) or {}
+
+    def _scale_curriculum_batch_sizes(schedule_cfg, divisor):
+        if not schedule_cfg or divisor <= 1:
+            return schedule_cfg
+
+        scaled_cfg = copy.deepcopy(schedule_cfg)
+
+        def _scale_value(value):
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return value
+            return max(1, int(math.ceil(numeric / float(divisor))))
+
+        for key in ('base_batch_size', 'initial_batch_size'):
+            if key in scaled_cfg:
+                scaled_cfg[key] = _scale_value(scaled_cfg[key])
+
+        strategies = scaled_cfg.get('strategies')
+        if isinstance(strategies, dict):
+            milestone_cfg = strategies.get('milestones')
+            if isinstance(milestone_cfg, dict):
+                schedule = milestone_cfg.get('schedule')
+                if isinstance(schedule, dict):
+                    for sched_key, sched_value in list(schedule.items()):
+                        schedule[sched_key] = _scale_value(sched_value)
+                elif isinstance(schedule, list):
+                    new_schedule = []
+                    for entry in schedule:
+                        if isinstance(entry, dict):
+                            if 'batch_size' in entry:
+                                entry['batch_size'] = _scale_value(entry['batch_size'])
+                            if 'value' in entry:
+                                entry['value'] = _scale_value(entry['value'])
+                            new_schedule.append(entry)
+                        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                            entry_list = list(entry)
+                            entry_list[1] = _scale_value(entry_list[1])
+                            if isinstance(entry, tuple):
+                                new_schedule.append(tuple(entry_list))
+                            else:
+                                new_schedule.append(entry_list)
+                        else:
+                            new_schedule.append(entry)
+                    milestone_cfg['schedule'] = new_schedule
+
+            linear_cfg = strategies.get('linear')
+            if isinstance(linear_cfg, dict):
+                for key in ('start_batch_size', 'end_batch_size'):
+                    if key in linear_cfg:
+                        linear_cfg[key] = _scale_value(linear_cfg[key])
+
+        return scaled_cfg
+
+    scaled_curriculum_cfg = _scale_curriculum_batch_sizes(curriculum_batch_cfg, effective_batch_factor)
+    batch_scheduler = BatchSizeScheduler(scaled_curriculum_cfg, default_batch_size=batch_size, total_epochs=epochs)
+
+    def _curriculum_summary(scale_factor):
+        transitions = []
+        last_value = None
+        for epoch_idx in range(1, epochs + 1):
+            value = batch_scheduler.batch_size_for_epoch(epoch_idx)
+            if value != last_value:
+                transitions.append((epoch_idx, value))
+                last_value = value
+        if not transitions:
+            return ''
+
+        parts = []
+        for epoch_idx, value in transitions:
+            if scale_factor == 1:
+                parts.append(f"{epoch_idx}\u2192{value}")
+            else:
+                parts.append(f"{epoch_idx}\u2192{value * scale_factor} (per-device {value})")
+        return ', '.join(parts)
+
+    if accelerator.is_main_process:
+        summary = _curriculum_summary(effective_batch_factor)
+        if batch_scheduler.enabled:
+            print_fn(f"[Curriculum] Batch size schedule: {summary}")
+        elif summary:
+            print_fn(f"[Curriculum] Static batch size configured: {summary}")
 
     collate_config = {'return_speaker_ids': True}
+
+    def _prepare_dataloaders(sorted_train, shuffled_train, sorted_val, shuffled_val):
+        dataloaders = [sorted_train, shuffled_train, sorted_val, shuffled_val]
+        to_prepare = [dl for dl in dataloaders if dl is not None]
+        if not to_prepare:
+            return tuple(dataloaders)
+
+        prepared = accelerator.prepare(*to_prepare)
+        if len(to_prepare) == 1:
+            prepared = (prepared,)
+        iterator = iter(prepared)
+        prepared_loaders = []
+        for dl in dataloaders:
+            if dl is None:
+                prepared_loaders.append(None)
+            else:
+                prepared_loaders.append(next(iterator))
+        return tuple(prepared_loaders)
 
     def _build_dataloaders_for_batch(current_batch_size):
         current_batch_size = int(current_batch_size)
@@ -579,7 +747,7 @@ def main(config_path):
             batch_size=current_batch_size,
             num_workers=train_num_workers,
             dataset_config=dataset_params,
-            device=device,
+            device=device_str,
             collate_config=collate_config,
             dataset_name="train")
 
@@ -588,7 +756,7 @@ def main(config_path):
             batch_size=current_batch_size,
             num_workers=train_num_workers,
             dataset_config=dataset_params,
-            device=device,
+            device=device_str,
             lengths=train_durations,
             bucket_sampler_config=train_bucket_sampler_config,
             collate_config=collate_config,
@@ -599,7 +767,7 @@ def main(config_path):
             batch_size=validation_batch_size,
             validation=True,
             num_workers=val_num_workers,
-            device=device,
+            device=device_str,
             dataset_config=dataset_params,
             collate_config=collate_config,
             dataset_name="val")
@@ -609,45 +777,132 @@ def main(config_path):
             batch_size=validation_batch_size,
             validation=True,
             num_workers=val_num_workers,
-            device=device,
+            device=device_str,
             dataset_config=dataset_params,
             collate_config=collate_config,
             dataset_name="val")
 
-        steps = len(sorted_train_loader) if sorted_train_loader is not None else len(shuffled_train_loader)
-        steps = int(steps)
-        if steps <= 0:
+        raw_steps = len(sorted_train_loader) if sorted_train_loader is not None else len(shuffled_train_loader)
+        raw_steps = int(raw_steps)
+        if raw_steps <= 0:
             raise ValueError(
                 f"Curriculum batch size {current_batch_size} is too large for the training set and would produce no steps."
             )
 
-        return (
+        prepared_sorted_train, prepared_shuffled_train, prepared_sorted_val, prepared_shuffled_val = _prepare_dataloaders(
             sorted_train_loader,
             shuffled_train_loader,
             sorted_val_loader,
             shuffled_val_loader,
-            steps,
+        )
+
+        prepared_train_loader = (
+            prepared_sorted_train if prepared_sorted_train is not None else prepared_shuffled_train
+        )
+        per_rank_steps = raw_steps
+        inferred_world_size = 1
+
+        if prepared_train_loader is not None:
+            try:
+                prepared_steps = int(len(prepared_train_loader))
+            except TypeError:
+                prepared_steps = None
+
+            if prepared_steps is not None and prepared_steps > 0:
+                max_prepared_steps = prepared_steps
+                if data_parallel_world_size > 1:
+                    steps_tensor = torch.tensor(
+                        [prepared_steps],
+                        device=accelerator.device,
+                        dtype=torch.long,
+                    )
+                    gathered_steps = accelerator.gather(steps_tensor)
+                    if gathered_steps is not None and gathered_steps.numel() > 0:
+                        max_prepared_steps = int(gathered_steps.max().item())
+                        min_prepared_steps = int(gathered_steps.min().item())
+                        if (
+                            accelerator.is_main_process
+                            and max_prepared_steps != min_prepared_steps
+                        ):
+                            print_fn(
+                                "[Scheduler] Detected uneven per-rank dataloader lengths (%d vs %d). "
+                                "Planning the LR schedule with the maximum to avoid early decay."
+                                % (min_prepared_steps, max_prepared_steps)
+                            )
+
+                planned_steps = max(raw_steps, max_prepared_steps)
+                per_rank_steps = planned_steps
+                if (
+                    accelerator.is_main_process
+                    and max_prepared_steps < raw_steps
+                ):
+                    print_fn(
+                        "[Scheduler] Detected that accelerate split dataloader batches "
+                        "(%d -> %d steps per rank). Using the unsplit length for LR "
+                        "planning; consider launching with split_batches=False if this "
+                        "was unintended."
+                        % (raw_steps, max_prepared_steps)
+                    )
+                if raw_steps > 0 and max_prepared_steps > 0:
+                    inferred = int(round(raw_steps / float(max_prepared_steps)))
+                    inferred_world_size = max(
+                        1, min(data_parallel_world_size, inferred)
+                    )
+            else:
+                per_rank_steps = raw_steps
+        else:
+            per_rank_steps = raw_steps
+
+        per_rank_steps = max(1, int(per_rank_steps))
+        dataset_items = max(len(train_entries), len(train_list_sorted))
+        per_rank_dataset_estimate = max(
+            1,
+            int(
+                math.ceil(
+                    dataset_items
+                    / float(max(1, inferred_world_size))
+                )
+            ),
+        )
+        per_rank_samples = max(per_rank_steps * current_batch_size, per_rank_dataset_estimate)
+
+        return (
+            prepared_sorted_train,
+            prepared_shuffled_train,
+            prepared_sorted_val,
+            prepared_shuffled_val,
+            per_rank_steps,
+            per_rank_samples,
+            inferred_world_size,
         )
 
     initial_batch_size = batch_scheduler.batch_size_for_epoch(1)
-    sorted_train_dataloader, shuffled_train_dataloader, sorted_val_dataloader, shuffled_val_dataloader, steps_per_epoch = _build_dataloaders_for_batch(initial_batch_size)
+    (
+        sorted_train_dataloader,
+        shuffled_train_dataloader,
+        sorted_val_dataloader,
+        shuffled_val_dataloader,
+        steps_per_epoch,
+        train_samples_per_rank,
+        inferred_scheduler_world_size,
+    ) = _build_dataloaders_for_batch(initial_batch_size)
 
     word_indexes = set(
-        line.strip() for line in open(cfg_get_nested( config, 'phoneme_maps_path', 'Data/word_index_dict.txt'))
+        line.strip() for line in open(cfg_get_nested(config, 'phoneme_maps_path', 'Data/word_index_dict.txt'))
         if line.strip()
     )
 
-    model_params = cfg_get_nested( config, 'model_params', {
+    model_params = cfg_get_nested(config, 'model_params', {
         'input_dim': 80,
         'hidden_dim': 256,
-        'n_token': len( word_indexes ),
+        'n_token': len(word_indexes),
         'token_embedding_dim': 512,
         'n_layers': 5,
         'location_kernel_size': 31
     })
 
-    if not 'n_token' in model_params:
-        model_params['n_token'] = len( word_indexes )
+    if 'n_token' not in model_params:
+        model_params['n_token'] = len(word_indexes)
 
     multi_task_config = cfg_get_nested(config, 'multi_task', {}) or {}
 
@@ -660,7 +915,7 @@ def main(config_path):
                 if speaker_id:
                     speaker_ids.add(speaker_id)
         inferred = max(1, len(speaker_ids))
-        print(f"Inferred {inferred} unique speaker id(s) from metadata")
+        print_fn(f"Inferred {inferred} unique speaker id(s) from metadata")
         speaker_cfg = dict(speaker_cfg)
         speaker_cfg['num_speakers'] = inferred
         multi_task_config['speaker'] = speaker_cfg
@@ -673,33 +928,66 @@ def main(config_path):
     model_params['stabilization_config'] = stabilization_config
     model_params['memory_optimization_config'] = memory_optimization_config
 
-    print("Using model parameters:", model_params)
+    print_fn("Using model parameters:", model_params)
 
     model = build_model(model_params=model_params)
 
-    total_training_steps = batch_scheduler.expected_total_steps(num_train_items)
+    if accelerator.is_main_process and data_parallel_world_size > 1 and inferred_scheduler_world_size < data_parallel_world_size:
+        print_fn(
+            "[Scheduler] Detected that the prepared dataloader does not shard the dataset across all %d workers. "
+            "Estimating scheduler steps with an effective world size of %d to avoid premature LR decay." % (
+                data_parallel_world_size,
+                inferred_scheduler_world_size,
+            )
+        )
+
+    samples_per_rank = max(1, int(train_samples_per_rank))
+    per_epoch_optimizer_steps = max(
+        1, int(math.ceil(steps_per_epoch / float(grad_accumulation_steps)))
+    )
+
+    total_training_steps = 0
+    for epoch_idx in range(1, epochs + 1):
+        per_device_batch = max(1, int(batch_scheduler.batch_size_for_epoch(epoch_idx)))
+        epoch_step_estimate = int(math.ceil(samples_per_rank / float(per_device_batch)))
+        if grad_accumulation_steps > 1:
+            epoch_step_estimate = int(
+                math.ceil(epoch_step_estimate / float(grad_accumulation_steps))
+            )
+        total_training_steps += max(1, epoch_step_estimate)
+
+    if accelerator.is_main_process:
+        print_fn(
+            "[Scheduler] Planning %d optimiser steps (~%d per epoch) for OneCycleLR"
+            % (total_training_steps, per_epoch_optimizer_steps)
+        )
     scheduler_params = {
-            'max_lr': float(cfg_get_nested( config, 'optimizer_params.lr', 5e-4)),
-            'pct_start': float(cfg_get_nested( config, 'optimizer_params.pct_start', 0.1)),
-            'epochs': epochs,
-            'steps_per_epoch': steps_per_epoch,
-            'total_steps': total_training_steps,
-        }
+        'max_lr': float(cfg_get_nested(config, 'optimizer_params.lr', 5e-4)),
+        'pct_start': float(cfg_get_nested(config, 'optimizer_params.pct_start', 0.1)),
+        'epochs': epochs,
+        'steps_per_epoch': steps_per_epoch,
+        'per_rank_samples': train_samples_per_rank,
+        'effective_world_size': inferred_scheduler_world_size,
+        'gradient_accumulation_steps': grad_accumulation_steps,
+        'optimizer_steps_per_epoch': per_epoch_optimizer_steps,
+        'total_steps': total_training_steps,
+    }
     config['scheduler_params'] = scheduler_params
 
-    entropy_params = cfg_get_nested( config, 'entropy_params', { "label_smoothing": 0.1 })
+    entropy_params = cfg_get_nested(config, 'entropy_params', {"label_smoothing": 0.1})
 
     model.to(device)
     optimizer, scheduler = build_optimizer(
-        {"params": model.parameters(), "optimizer_params":{}, "scheduler_params": scheduler_params})
+        {"params": model.parameters(), "optimizer_params": {}, "scheduler_params": scheduler_params})
 
-    blank_index = sorted_train_dataloader.dataset.text_cleaner.word_index_dictionary[" "] # get blank index
+    blank_index = sorted_train_dataloader.dataset.text_cleaner.word_index_dictionary[" "]
     criterion = build_criterion(critic_params={
                 'ctc': {'blank': blank_index, 'reduction': 'none', 'zero_infinity': True},
         }, entropy_params=entropy_params, multi_task_config=multi_task_config)
 
     if enable_early_stopping:
-        early_stopping = EarlyStoppingWithNoLearningRate(patience=max([ 3, int( math.floor( int( cfg_get_nested( config, 'save_freq', 10 ) ) / 2 ) ) ]) )
+        patience = max([3, int(math.floor(int(cfg_get_nested(config, 'save_freq', 10)) / 2))])
+        early_stopping = EarlyStoppingWithNoLearningRate(patience=patience)
     else:
         early_stopping = None
 
@@ -727,7 +1015,30 @@ def main(config_path):
         self_conditioned_ctc_config = dict(self_conditioned_ctc_config)
         self_conditioned_ctc_config['loss_weight'] = float(loss_weight_config.get('self_conditioned_ctc', 0.0))
 
-    steps_per_epoch = len(sorted_train_dataloader) if sorted_train_dataloader is not None else len(shuffled_train_dataloader)
+    if sorted_train_dataloader is not None:
+        try:
+            local_steps = int(len(sorted_train_dataloader))
+        except TypeError:
+            local_steps = None
+    else:
+        try:
+            local_steps = int(len(shuffled_train_dataloader))
+        except TypeError:
+            local_steps = None
+
+    if local_steps is not None and local_steps > 0:
+        steps_per_epoch = max(int(steps_per_epoch), local_steps)
+
+    to_prepare = [model, optimizer]
+    scheduler_included = scheduler is not None
+    if scheduler_included:
+        to_prepare.append(scheduler)
+
+    prepared_objects = accelerator.prepare(*to_prepare)
+    if scheduler_included:
+        model, optimizer, scheduler = prepared_objects
+    else:
+        model, optimizer = prepared_objects
 
     trainer = Trainer(model=model,
                     criterion=criterion,
@@ -735,14 +1046,15 @@ def main(config_path):
                     scheduler=scheduler,
                     config=config,
                     device=device,
+                    accelerator=accelerator,
                     sorted_train_dataloader=sorted_train_dataloader,
                     shuffled_train_dataloader=shuffled_train_dataloader,
                     sorted_val_dataloader=sorted_val_dataloader,
                     shuffled_val_dataloader=shuffled_val_dataloader,
                     logger=logger,
-                    switch_sortagrad_dataset_epoch=cfg_get_nested( config, 'sortagrad_switch_to_shuffled_dataset_epoch', 10),
-                    use_diagonal_attention_prior=(cfg_get_nested( config, 'use_diagonal_attention_prior', True) and use_s2s),
-                    diagonal_attention_prior_weight=cfg_get_nested( config, 'diagonal_attention_prior_weight', 0.1),
+                    switch_sortagrad_dataset_epoch=cfg_get_nested(config, 'sortagrad_switch_to_shuffled_dataset_epoch', 10),
+                    use_diagonal_attention_prior=(cfg_get_nested(config, 'use_diagonal_attention_prior', True) and use_s2s),
+                    diagonal_attention_prior_weight=cfg_get_nested(config, 'diagonal_attention_prior_weight', 0.1),
                     ctc_weight=ctc_weight,
                     s2s_weight=s2s_weight,
                     frame_weight=frame_weight,
@@ -760,6 +1072,7 @@ def main(config_path):
                     )
 
     current_train_batch_size = int(initial_batch_size)
+    current_samples_per_rank = int(train_samples_per_rank)
 
     def _ensure_curriculum_for_epoch(epoch):
         nonlocal sorted_train_dataloader
@@ -768,6 +1081,7 @@ def main(config_path):
         nonlocal shuffled_val_dataloader
         nonlocal steps_per_epoch
         nonlocal current_train_batch_size
+        nonlocal current_samples_per_rank
 
         desired_batch_size = int(batch_scheduler.batch_size_for_epoch(epoch))
         if desired_batch_size != current_train_batch_size:
@@ -777,6 +1091,8 @@ def main(config_path):
                 sorted_val_dataloader,
                 shuffled_val_dataloader,
                 steps_per_epoch,
+                current_samples_per_rank,
+                _,
             ) = _build_dataloaders_for_batch(desired_batch_size)
 
             trainer.update_dataloaders(
@@ -787,49 +1103,53 @@ def main(config_path):
                 steps_per_epoch=steps_per_epoch,
             )
             current_train_batch_size = desired_batch_size
-            print(f"[Curriculum] Epoch {epoch}: updated batch size to {desired_batch_size}")
+            effective_value = desired_batch_size * effective_batch_factor
+            if effective_batch_factor == 1:
+                print_fn(f"[Curriculum] Epoch {epoch}: updated batch size to {effective_value}")
+            else:
+                print_fn(
+                    f"[Curriculum] Epoch {epoch}: updated batch size to {effective_value} (per-device {desired_batch_size})"
+                )
         else:
             trainer.update_dataloaders(steps_per_epoch=steps_per_epoch)
 
     def _curriculum_completed_steps(num_epochs_completed):
         completed = 0
         total_epochs_completed = max(0, int(num_epochs_completed))
+        samples_per_rank = max(1, int(current_samples_per_rank))
         for epoch_idx in range(1, total_epochs_completed + 1):
             batch_sz = max(1, batch_scheduler.batch_size_for_epoch(epoch_idx))
-            completed += max(1, num_train_items // batch_sz)
+            completed += max(1, int(math.ceil(samples_per_rank / float(batch_sz))))
         return completed
 
-    pretrained_model = cfg_get_nested( config, 'pretrained_model', '' )
-    load_only_params = cfg_get_nested( config, 'load_only_params', False )
-    if isinstance(pretrained_model, bool) and pretrained_model == True:
+    pretrained_model = cfg_get_nested(config, 'pretrained_model', '')
+    load_only_params = cfg_get_nested(config, 'load_only_params', False)
+    if isinstance(pretrained_model, bool) and pretrained_model is True:
         try:
-            files = os.listdir(log_dir)
-            ckpts = []
-            for f in os.listdir(log_dir):
-                if f.startswith("epoch_") and f.endswith(".pth"): ckpts.append(f)
-
-            if len(ckpts):
+            ckpts = [f for f in os.listdir(log_dir) if f.startswith("epoch_") and f.endswith(".pth")]
+            if ckpts:
                 iters = [int(f.split('_')[-1].split('.')[0]) for f in ckpts if os.path.isfile(os.path.join(log_dir, f))]
                 iters = sorted(iters)[-1]
-
-                checkpoint_file = log_dir + f"/epoch_{iters:05}.pth"
-                print(f"Starting to train from checkpoint {checkpoint_file}")
+                checkpoint_file = osp.join(log_dir, f"epoch_{iters:05}.pth")
+                print_fn(f"Starting to train from checkpoint {checkpoint_file}")
                 start_epoch = trainer.load_checkpoint(checkpoint_file, load_only_params=load_only_params)
             else:
-                print(f"No previous checkpoints found, starting training from epoch 1.")
+                print_fn("No previous checkpoints found, starting training from epoch 1.")
                 start_epoch = 1
         except Exception as e:
-            print(f"Failed to load latest checkpoint, starting training from epoch 1 - {e}")
+            print_fn(f"Failed to load latest checkpoint, starting training from epoch 1 - {e}")
             start_epoch = 1
     elif isinstance(pretrained_model, str) and pretrained_model != "":
         start_epoch = trainer.load_checkpoint(pretrained_model, load_only_params=load_only_params)
         start_epoch += 1
-        print(f"Checkpoint {pretrained_model} loaded, starting training from epoch {start_epoch}.")
-    elif ( isinstance(pretrained_model, str) and pretrained_model == "" ) or ( isinstance(pretrained_model, bool) and pretrained_model == False ):
-        print(f"Starting training from epoch 1.")
+        print_fn(f"Checkpoint {pretrained_model} loaded, starting training from epoch {start_epoch}.")
+    elif (isinstance(pretrained_model, str) and pretrained_model == "") or (
+        isinstance(pretrained_model, bool) and pretrained_model is False
+    ):
+        print_fn("Starting training from epoch 1.")
         start_epoch = 1
     else:
-        print(f"Unrecognized value for load_checkpoint config option, starting training from epoch 1 - {pretrained_model}")
+        print_fn(f"Unrecognized value for load_checkpoint config option, starting training from epoch 1 - {pretrained_model}")
         start_epoch = 1
 
     _ensure_curriculum_for_epoch(start_epoch)
@@ -838,35 +1158,36 @@ def main(config_path):
         completed_steps = _curriculum_completed_steps(trainer.epochs)
         trainer.sync_scheduler_to_progress(completed_steps=completed_steps)
 
-    for epoch in range(start_epoch, epochs+1):
+    for epoch in range(start_epoch, epochs + 1):
         _ensure_curriculum_for_epoch(epoch)
         train_results = trainer._train_epoch()
         eval_results = trainer._eval_epoch()
 
-        # Get learning rate from training results
-        learning_rate = train_results.get('train/learning_rate', None)  # Ensure 'eval/cer' exists in your eval_results
+        learning_rate = train_results.get('train/learning_rate', None)
 
         if learning_rate is None:
             raise Exception("learning_rate not found in training results! Please check the metric calculation.")
-            continue  # Skip if CER is missing
 
         results = train_results.copy()
         results.update(eval_results)
-        logger.info('--- epoch %d ---' % epoch)
-        for key, value in results.items():
-            if isinstance(value, float):
-                logger.info('%-15s: %.5f' % (key, value))
-                writer.add_scalar(key, value, epoch)
-            else:
-                for v in value:
-                    writer.add_figure('eval_attn', plot_image(v), epoch)
+        if accelerator.is_main_process:
+            logger.info('--- epoch %d ---' % epoch)
+            for key, value in results.items():
+                if isinstance(value, float):
+                    logger.info('%-15s: %.5f' % (key, value))
+                    writer.add_scalar(key, value, epoch)
+                else:
+                    for v in value:
+                        writer.add_figure('eval_attn', plot_image(v), epoch)
 
-        if (epoch % save_freq) == 0 or ( early_stopping != None and early_stopping(learning_rate) ):
-            trainer.save_checkpoint(osp.join(log_dir, 'epoch_%05d.pth' % epoch))
+        if (epoch % save_freq) == 0 or (early_stopping is not None and early_stopping(learning_rate)):
+            if accelerator.is_main_process:
+                trainer.save_checkpoint(osp.join(log_dir, 'epoch_%05d.pth' % epoch))
+            accelerator.wait_for_everyone()
 
-        # Check if early stopping condition is met
-        if early_stopping != None and early_stopping(learning_rate):
-            logger.info(f"Early stopping triggered at epoch {epoch}, learning_rate: {learning_rate:.5f}")
+        if early_stopping is not None and early_stopping(learning_rate):
+            if accelerator.is_main_process:
+                logger.info(f"Early stopping triggered at epoch {epoch}, learning_rate: {learning_rate:.5f}")
             break
 
     return 0

@@ -31,6 +31,7 @@ class Trainer(object):
                  scheduler=None,
                  config={},
                  device=torch.device("cpu"),
+                 accelerator=None,
                  logger=logger,
                  sorted_train_dataloader=None,
                  shuffled_train_dataloader=None,
@@ -70,6 +71,7 @@ class Trainer(object):
         self.val_dataloader = sorted_val_dataloader
         self.config = config
         self.device = device
+        self.accelerator = accelerator
         self.finish_train = False
         self.logger = logger
         self.fp16_run = False
@@ -195,6 +197,17 @@ class Trainer(object):
             if self.shuffled_val_dataloader is not None:
                 self.val_dataloader = self.shuffled_val_dataloader
 
+    def _get_target_model(self):
+        """Return the underlying model, unwrapping accelerator/DDP wrappers."""
+        if self.accelerator is not None:
+            try:
+                return self.accelerator.unwrap_model(self.model)
+            except (AttributeError, ValueError):
+                pass
+        if hasattr(self.model, 'module'):
+            return self.model.module
+        return self.model
+
     def _get_optimizer_step_count(self):
         if self.optimizer is None:
             return 0
@@ -235,6 +248,35 @@ class Trainer(object):
 
         if steps_per_epoch is not None:
             self.steps_per_epoch = int(steps_per_epoch)
+
+    def _reduce_scalar(self, value):
+        if self.accelerator is None:
+            return float(value)
+        tensor = torch.tensor([float(value)], device=self.device, dtype=torch.float32)
+        reduced = self.accelerator.reduce(tensor, reduction="mean")
+        return reduced.item()
+
+    def _gather_metric_list(self, values):
+        values = list(values)
+        if self.accelerator is None:
+            return values
+        local_count = torch.tensor([len(values)], device=self.device, dtype=torch.long)
+        counts = self.accelerator.gather(local_count)
+        max_count = int(counts.max().item())
+        if max_count == 0:
+            return []
+        padded = torch.zeros(max_count, device=self.device, dtype=torch.float32)
+        if values:
+            padded[:len(values)] = torch.tensor(values, device=self.device, dtype=torch.float32)
+        gathered = self.accelerator.gather(padded)
+        results = []
+        offset = 0
+        for count in counts.cpu().tolist():
+            if count > 0:
+                segment = gathered[offset:offset + max_count][:count]
+                results.extend(segment.cpu().tolist())
+            offset += max_count
+        return results
 
     @staticmethod
     def _parse_intermediate_layer_weights(layers_config):
@@ -308,7 +350,8 @@ class Trainer(object):
             return None
         if length is None or length <= 0:
             return None
-        mask = self.model.get_future_mask(length, unmask_future_steps=0)
+        target_model = self._get_target_model()
+        mask = target_model.get_future_mask(length, unmask_future_steps=0)
         if mask is None:
             return None
         return mask.to(self.device) if hasattr(mask, 'to') else mask
@@ -318,7 +361,8 @@ class Trainer(object):
             return None
         if lengths is None:
             return None
-        return self.model.length_to_mask(lengths)
+        target_model = self._get_target_model()
+        return target_model.length_to_mask(lengths)
 
     def _compute_entropy_regularization(self, logits, lengths=None, key='ctc'):
         cfg = self._entropy_target_config(key)
@@ -487,7 +531,10 @@ class Trainer(object):
             "steps": self.steps,
             "epochs": self.epochs,
         }
-        state_dict["model"] = self.model.state_dict()
+        model_to_save = self.model
+        if self.accelerator is not None:
+            model_to_save = self.accelerator.unwrap_model(self.model)
+        state_dict["model"] = model_to_save.state_dict()
 
         if not os.path.exists(os.path.dirname(checkpoint_path)):
             os.makedirs(os.path.dirname(checkpoint_path))
@@ -503,7 +550,8 @@ class Trainer(object):
         """
         self.logger.info("Loading checkpoint from: %s" % checkpoint_path)
         state_dict = torch.load(checkpoint_path, map_location="cpu")
-        self._load(state_dict["model"], self.model)
+        target_model = self.accelerator.unwrap_model(self.model) if self.accelerator is not None else self.model
+        self._load(state_dict["model"], target_model)
 
         if not load_only_params:
             self.steps = state_dict["steps"]
@@ -742,11 +790,13 @@ class Trainer(object):
         if self.mixspeech_enabled and self.model.training:
             mel_input, mix_metadata = self._apply_mixspeech(mel_input)
 
-        mel_input_length = mel_input_length // (2 ** self.model.n_down)
+        target_model = self._get_target_model()
+        downsample_factor = 2 ** getattr(target_model, 'n_down', 1)
+        mel_input_length = mel_input_length // downsample_factor
         future_mask = self._maybe_create_future_mask(
-            mel_input.size(2) // (2 ** self.model.n_down)
+            mel_input.size(2) // downsample_factor
         )
-        mel_mask = self.model.length_to_mask(mel_input_length)
+        mel_mask = target_model.length_to_mask(mel_input_length)
         text_mask = self._maybe_create_text_mask(text_input_length)
 
         autocast_dtype = self.mixed_precision_dtype if self.autocast_enabled else None
@@ -936,7 +986,10 @@ class Trainer(object):
 
             grad_scaler.update()
         else:
-            loss.backward()
+            if self.accelerator is not None:
+                self.accelerator.backward(loss)
+            else:
+                loss.backward()
             torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
             self.optimizer.step()
             optimizer_step_ran = True
@@ -957,7 +1010,10 @@ class Trainer(object):
             losses['ctc'] = loss_ctc.item()
         if 's2s' not in losses:
             losses['s2s'] = loss_s2s.item()
-        return losses
+        reduced_losses = {}
+        for key, value in losses.items():
+            reduced_losses[key] = self._reduce_scalar(value)
+        return reduced_losses
 
     def _train_epoch(self):
         if self._sortagrad_active:
@@ -974,7 +1030,12 @@ class Trainer(object):
 
         train_losses = defaultdict(list)
         self.model.train()
-        for train_steps_per_epoch, batch in enumerate(tqdm(self.train_dataloader, desc="[train]"), 1):
+        if self.accelerator is not None and not self.accelerator.is_local_main_process:
+            data_iterator = self.train_dataloader
+        else:
+            data_iterator = tqdm(self.train_dataloader, desc="[train]")
+
+        for train_steps_per_epoch, batch in enumerate(data_iterator, 1):
             losses = self.run(batch)
             for key, value in losses.items():
                 train_losses["train/%s" % key].append(value)
@@ -983,13 +1044,21 @@ class Trainer(object):
         train_losses['train/learning_rate'] = self._get_lr()
         self.epochs += 1
 
-        gpu_id = 0
-        allocated = torch.cuda.memory_allocated(gpu_id) / 1024**2
+        if torch.cuda.is_available():
+            gpu_id = torch.cuda.current_device()
+            allocated = torch.cuda.memory_allocated(gpu_id) / 1024**2
+        else:
+            allocated = 0.0
         if allocated > self.maxm_mem_usage:
             self.maxm_mem_usage = allocated
 
         train_losses['gpu/max_allocation_recorded'] = self.maxm_mem_usage
         train_losses['gpu/current_allocation'] = allocated
+
+        for key in list(train_losses.keys()):
+            if key.startswith('gpu/'):
+                continue
+            train_losses[key] = self._reduce_scalar(train_losses[key])
         return train_losses
 
     @torch.no_grad()
@@ -997,7 +1066,12 @@ class Trainer(object):
         self.model.eval()
         eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
-        for eval_steps_per_epoch, batch in enumerate(tqdm(self.val_dataloader, desc="[eval]"), 1):
+        if self.accelerator is not None and not self.accelerator.is_local_main_process:
+            data_iterator = self.val_dataloader
+        else:
+            data_iterator = tqdm(self.val_dataloader, desc="[eval]")
+
+        for eval_steps_per_epoch, batch in enumerate(data_iterator, 1):
             processed_batch = []
             for element in batch:
                 if hasattr(element, 'to'):
@@ -1011,11 +1085,13 @@ class Trainer(object):
                 speaker_ids = batch[4].long()
             else:
                 speaker_ids = torch.zeros(text_input.size(0), device=self.device, dtype=torch.long)
-            mel_input_length = mel_input_length // (2 ** self.model.n_down)
+            target_model = self._get_target_model()
+            downsample_factor = 2 ** getattr(target_model, 'n_down', 1)
+            mel_input_length = mel_input_length // downsample_factor
             future_mask = self._maybe_create_future_mask(
-                mel_input.size(2) // (2 ** self.model.n_down)
+                mel_input.size(2) // downsample_factor
             )
-            mel_mask = self.model.length_to_mask(mel_input_length)
+            mel_mask = target_model.length_to_mask(mel_input_length)
             text_mask = self._maybe_create_text_mask(text_input_length)
             model_outputs = self.model(
                 mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
@@ -1032,7 +1108,7 @@ class Trainer(object):
                     text_input_length,
                     mix_metadata=None,
                 )
-                eval_losses["eval/ctc"].append(loss_ctc.item())
+                eval_losses["eval/ctc"].append(self._reduce_scalar(loss_ctc.item()))
             else:
                 loss_ctc = torch.zeros(1, device=self.device)
 
@@ -1041,7 +1117,7 @@ class Trainer(object):
                 for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
                     loss_s2s += self.criterion['ce'](_s2s_pred[:_text_length], _text_input[:_text_length])
                 loss_s2s /= max(1, text_input.size(0))
-                eval_losses["eval/s2s"].append(loss_s2s.item())
+                eval_losses["eval/s2s"].append(self._reduce_scalar(loss_s2s.item()))
             else:
                 loss_s2s = torch.zeros(1, device=self.device)
 
@@ -1056,12 +1132,12 @@ class Trainer(object):
                     entropy_ctc = self._compute_entropy_regularization(ppgs, lengths=mel_input_length, key='ctc')
                     if entropy_ctc is not None:
                         total_eval_loss = total_eval_loss + entropy_ctc
-                        eval_losses['eval/entropy_ctc'].append(entropy_ctc.item())
+                        eval_losses['eval/entropy_ctc'].append(self._reduce_scalar(entropy_ctc.item()))
                 if s2s_pred is not None:
                     entropy_s2s = self._compute_entropy_regularization(s2s_pred, lengths=text_input_length, key='s2s')
                     if entropy_s2s is not None:
                         total_eval_loss = total_eval_loss + entropy_s2s
-                        eval_losses['eval/entropy_s2s'].append(entropy_s2s.item())
+                        eval_losses['eval/entropy_s2s'].append(self._reduce_scalar(entropy_s2s.item()))
 
             intermediate_outputs = model_outputs.get('intermediate_ctc_logits') or {}
             if (
@@ -1083,10 +1159,10 @@ class Trainer(object):
                     )
                     weight = float(self.intermediate_ctc_layer_weights.get(str(layer_key), 1.0))
                     layer_losses = layer_losses + weight * layer_loss
-                    eval_losses[f'eval/intermediate_ctc/layer_{layer_key}'].append(layer_loss.item())
+                    eval_losses[f'eval/intermediate_ctc/layer_{layer_key}'].append(self._reduce_scalar(layer_loss.item()))
 
                 total_eval_loss = total_eval_loss + self.intermediate_ctc_weight * layer_losses
-                eval_losses['eval/intermediate_ctc'].append(layer_losses.item())
+                eval_losses['eval/intermediate_ctc'].append(self._reduce_scalar(layer_losses.item()))
 
             self_conditioned_outputs = model_outputs.get('self_conditioned_ctc_logits') or {}
             if (
@@ -1108,10 +1184,10 @@ class Trainer(object):
                     )
                     weight = float(self.self_conditioned_ctc_layer_weights.get(str(layer_key), 1.0))
                     sc_losses = sc_losses + weight * sc_loss
-                    eval_losses[f'eval/self_conditioned_ctc/layer_{layer_key}'].append(sc_loss.item())
+                    eval_losses[f'eval/self_conditioned_ctc/layer_{layer_key}'].append(self._reduce_scalar(sc_loss.item()))
 
                 total_eval_loss = total_eval_loss + self.self_conditioned_ctc_weight * sc_losses
-                eval_losses['eval/self_conditioned_ctc'].append(sc_losses.item())
+                eval_losses['eval/self_conditioned_ctc'].append(self._reduce_scalar(sc_losses.item()))
 
             if self.enable_frame_classifier and self.frame_weight > 0:
                 frame_logits = model_outputs.get('frame_phoneme_logits')
@@ -1120,17 +1196,17 @@ class Trainer(object):
                     frame_loss = self.criterion['frame_ce'](frame_logits.reshape(-1, frame_logits.size(2)),
                                                             frame_targets.view(-1))
                     total_eval_loss = total_eval_loss + self.frame_weight * frame_loss
-                    eval_losses['eval/frame_phoneme'].append(frame_loss.item())
+                    eval_losses['eval/frame_phoneme'].append(self._reduce_scalar(frame_loss.item()))
 
             if self.enable_speaker and self.speaker_weight > 0:
                 speaker_logits = model_outputs.get('speaker_logits')
                 if speaker_logits is not None:
                     loss_speaker = self.criterion['speaker_ce'](speaker_logits, speaker_ids)
                     total_eval_loss = total_eval_loss + self.speaker_weight * loss_speaker
-                    eval_losses['eval/speaker'].append(loss_speaker.item())
+                    eval_losses['eval/speaker'].append(self._reduce_scalar(loss_speaker.item()))
                     speaker_pred = torch.argmax(speaker_logits, dim=1)
                     speaker_acc = torch.eq(speaker_pred, speaker_ids).float().mean().item()
-                    eval_losses['eval/speaker_acc'].append(speaker_acc)
+                    eval_losses['eval/speaker_acc'].append(self._reduce_scalar(speaker_acc))
 
             if self.enable_pronunciation_error and self.pron_error_weight > 0:
                 pron_logits = model_outputs.get('pron_error_logits')
@@ -1139,12 +1215,12 @@ class Trainer(object):
                     pron_loss = self.criterion['pron_error_ce'](pron_logits.reshape(-1, pron_logits.size(2)),
                                                                 pron_targets.view(-1))
                     total_eval_loss = total_eval_loss + self.pron_error_weight * pron_loss
-                    eval_losses['eval/pronunciation_error'].append(pron_loss.item())
+                    eval_losses['eval/pronunciation_error'].append(self._reduce_scalar(pron_loss.item()))
                     pron_pred = torch.argmax(pron_logits, dim=2)
                     pron_acc = self._sequence_accuracy(pron_pred, pron_targets)
-                    eval_losses['eval/pronunciation_error_acc'].append(pron_acc)
+                    eval_losses['eval/pronunciation_error_acc'].append(self._reduce_scalar(pron_acc))
 
-            eval_losses["eval/loss"].append(total_eval_loss.item())
+            eval_losses["eval/loss"].append(self._reduce_scalar(total_eval_loss.item()))
 
             if ppgs is not None:
                 _, amax_ppgs = torch.max(ppgs, dim=2)
@@ -1153,18 +1229,25 @@ class Trainer(object):
                                  ignore_indexes=list(range(5))) \
                         for target, pred, text_length, mel_length in zip(
                                 text_input.cpu(), amax_ppgs.cpu(), text_input_length.cpu(), mel_input_length.cpu())]
+                wers = self._gather_metric_list(wers)
                 eval_losses["eval/wer"].extend(wers)
 
             if s2s_pred is not None:
                 _, amax_s2s = torch.max(s2s_pred, dim=2)
                 acc = [torch.eq(target[:length], pred[:length]).float().mean().item() \
                        for target, pred, length in zip(text_input.cpu(), amax_s2s.cpu(), text_input_length.cpu())]
+                acc = self._gather_metric_list(acc)
                 eval_losses["eval/acc"].extend(acc)
 
             if s2s_attn is not None and eval_steps_per_epoch <= 2:
-                eval_images["eval/image"].append(
-                    self.get_image([s2s_attn[0].cpu().numpy()]))
+                if self.accelerator is None or self.accelerator.is_main_process:
+                    eval_images["eval/image"].append(
+                        self.get_image([s2s_attn[0].cpu().numpy()]))
 
         eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
         eval_losses.update(eval_images)
+        for key in list(eval_losses.keys()):
+            if key.startswith('eval/image'):
+                continue
+            eval_losses[key] = self._reduce_scalar(eval_losses[key])
         return eval_losses
