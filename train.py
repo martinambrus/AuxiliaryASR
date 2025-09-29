@@ -22,6 +22,7 @@ import importlib
 import importlib.util
 from pathlib import Path
 from accelerate import Accelerator
+from accelerate.utils import DistributedDataParallelKwargs
 
 # enable better memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -484,6 +485,8 @@ def main(config_path):
 
     desired_device = str(cfg_get_nested(config, 'device', 'cpu')).lower()
     accelerator_kwargs = {}
+    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+    accelerator_kwargs['kwargs_handlers'] = [ddp_kwargs]
     if desired_device.startswith('cpu'):
         accelerator_kwargs['cpu'] = True
 
