@@ -16,7 +16,7 @@ distributed:
     cpu_offload:
       enabled: false
       offload_params: true
-      pin_memory: false
+      pin_memory: false  # Ignored when the installed torch build lacks CPUOffload pin_memory support.
     mixed_precision:
       param_dtype: null
       reduce_dtype: null

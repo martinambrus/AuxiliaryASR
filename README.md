@@ -47,7 +47,9 @@ distributed:
 ```
 
 You can further customise sharding, state-dict handling, CPU offloading and auto-wrap behaviour through the rest of the
-`distributed.fsdp` block in `Configs/config.yml`. The trainer will automatically construct the appropriate Accelerate plugin and
+`distributed.fsdp` block in `Configs/config.yml`. When requesting CPU offload pinning keep in mind that older PyTorch builds do
+not expose the `pin_memory` flag on `CPUOffload`; the trainer will automatically ignore the option and emit a warning in that
+case. The trainer will automatically construct the appropriate Accelerate plugin and
 use `accelerator.get_state_dict` when saving checkpoints so that consolidated weights are written from FSDP shards. Launch the
 script with `accelerate launch` to run across multiple GPUs.
 

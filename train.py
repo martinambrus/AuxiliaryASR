@@ -5,6 +5,7 @@ from models import build_model
 from trainer import Trainer
 
 import copy
+import inspect
 import os
 import os.path as osp
 import math
@@ -192,11 +193,18 @@ def _build_fsdp_plugin(fsdp_config, device_hint=None):
     cpu_offload_cfg = fsdp_config.get("cpu_offload", False)
     cpu_offload = None
     if isinstance(cpu_offload_cfg, dict):
-        offload_params = bool(cpu_offload_cfg.get("offload_params", True))
-        cpu_offload = CPUOffload(
-            offload_params=offload_params,
-            pin_memory=bool(cpu_offload_cfg.get("pin_memory", False)),
-        )
+        if cpu_offload_cfg.get("enabled", True):
+            offload_params = bool(cpu_offload_cfg.get("offload_params", True))
+            cpu_offload_kwargs = {"offload_params": offload_params}
+            if cpu_offload_cfg.get("pin_memory"):
+                signature = inspect.signature(CPUOffload)
+                if "pin_memory" in signature.parameters:
+                    cpu_offload_kwargs["pin_memory"] = True
+                else:
+                    warnings.append(
+                        "CPU offload pin_memory requested but not supported by this torch build; ignoring the flag."
+                    )
+            cpu_offload = CPUOffload(**cpu_offload_kwargs)
     elif cpu_offload_cfg:
         cpu_offload = CPUOffload(offload_params=True)
     if cpu_offload is not None:
