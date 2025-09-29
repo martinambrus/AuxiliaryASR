@@ -1030,7 +1030,10 @@ class Collater(object):
         enabled = bool(memory_cfg.get('enabled', False))
         self._memory_opt_enabled = enabled
         self._share_memory = enabled and bool(memory_cfg.get('share_across_workers', True))
-        self._pin_memory = enabled and bool(memory_cfg.get('pin_after_collate', True))
+        requested_pin = enabled and bool(memory_cfg.get('pin_after_collate', True))
+        if requested_pin and not torch.cuda.is_available():
+            requested_pin = False
+        self._pin_memory = requested_pin
 
     def __call__(self, batch):
         batch_size = len(batch)
@@ -1124,7 +1127,7 @@ def build_dataloader(path_list,
 
     loader_cfg = dict(loader_runtime_config or {})
     loader_kwargs: Dict[str, Any] = {}
-    pin_memory = device != 'cpu'
+    pin_memory = device != 'cpu' and torch.cuda.is_available()
     if loader_cfg:
         global_enabled = bool(loader_cfg.get('enabled', True))
 
@@ -1137,10 +1140,13 @@ def build_dataloader(path_list,
 
         pin_cfg = loader_cfg.get('pin_memory', {})
         if _section_enabled(pin_cfg, default=True):
-            pin_memory = True
-            pin_device = pin_cfg.get('device') if isinstance(pin_cfg, dict) else None
-            if pin_device:
-                loader_kwargs['pin_memory_device'] = str(pin_device)
+            if torch.cuda.is_available():
+                pin_memory = True
+                pin_device = pin_cfg.get('device') if isinstance(pin_cfg, dict) else None
+                if pin_device:
+                    loader_kwargs['pin_memory_device'] = str(pin_device)
+            else:
+                pin_memory = False
         elif global_enabled and isinstance(pin_cfg, dict) and not pin_cfg.get('enabled', True):
             pin_memory = False
 
