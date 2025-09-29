@@ -762,6 +762,7 @@ class MelDataset(torch.utils.data.Dataset):
     def __init__(self,
                  data_list,
                  dict_path=DEFAULT_DICT_PATH,
+                 dictionary_config=None,
                  sr=24000,
                  spect_params={
                      "n_fft": 2048,
@@ -781,7 +782,7 @@ class MelDataset(torch.utils.data.Dataset):
                 ):
 
         self.data_list = data_list
-        self.text_cleaner = TextCleaner(dict_path)
+        self.text_cleaner = TextCleaner(dict_path, dictionary_config=dictionary_config)
         self.sr = sr
         self.validation = bool(validation)
         if dataset_name is None:
@@ -1074,11 +1075,14 @@ def build_dataloader(path_list,
 
     dataset_cfg = dict(dataset_config or {})
     mel_cache_cfg = dataset_cfg.pop('mel_cache', None)
+    phoneme_dict_cfg = dataset_cfg.pop('phoneme_dictionary_config', None)
+
     dataset = MelDataset(
         path_list,
         validation=validation,
         mel_cache=mel_cache_cfg,
         dataset_name=dataset_name,
+        dictionary_config=phoneme_dict_cfg,
         **dataset_cfg,
     )
     collate_fn = Collater(**collate_config)
