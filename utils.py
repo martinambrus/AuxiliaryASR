@@ -404,15 +404,26 @@ class BatchSizeScheduler:
     def final_batch_size(self) -> int:
         return self.batch_size_for_epoch(self.total_epochs)
 
-    def expected_total_steps(self, dataset_size: int) -> int:
+    def expected_total_steps(self, dataset_size: int, *, world_size: int = 1) -> int:
+        """Return the number of optimiser steps implied by the schedule.
+
+        Args:
+            dataset_size: Total number of training items across all processes.
+            world_size: Number of data-parallel workers processing the dataset.
+        """
+
         dataset_size = max(1, int(dataset_size))
+        world_size = max(1, int(world_size))
+        samples_per_rank = max(1, math.ceil(dataset_size / float(world_size)))
+
         total_steps = 0
         for epoch in range(1, self.total_epochs + 1):
             batch_size = max(1, self.batch_size_for_epoch(epoch))
             # ``len(dataloader)`` effectively performs a ``math.ceil`` over the
-            # batch size, so mirror that behaviour here to keep the
-            # OneCycle/linear warm-up schedulers in sync with the true number of
-            # optimisation steps executed per epoch.
-            steps = max(1, math.ceil(dataset_size / float(batch_size)))
+            # batch size, so mirror that behaviour here using the per-rank
+            # dataset size.  This keeps OneCycle/linear warm-up schedulers in
+            # sync with the actual number of optimisation steps executed on each
+            # worker.
+            steps = max(1, math.ceil(samples_per_rank / float(batch_size)))
             total_steps += steps
         return total_steps

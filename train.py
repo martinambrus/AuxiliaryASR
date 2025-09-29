@@ -4,6 +4,7 @@ from utils import *
 from models import build_model
 from trainer import Trainer
 
+import copy
 import os
 import os.path as osp
 import math
@@ -516,7 +517,7 @@ def main(config_path):
         file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
         logger.addHandler(file_handler)
 
-    batch_size = cfg_get_nested(config, 'batch_size', 10)
+    configured_global_batch_size = int(cfg_get_nested(config, 'batch_size', 10))
     epochs = cfg_get_nested(config, 'epochs', 200)
     save_freq = cfg_get_nested(config, 'save_freq', 10)
     train_path = cfg_get_nested(config, 'train_data', None)
@@ -525,6 +526,28 @@ def main(config_path):
 
     device = accelerator.device
     device_str = str(device)
+
+    data_parallel_world_size = max(1, int(accelerator.num_processes))
+    grad_accumulation_steps = max(1, int(getattr(accelerator, 'gradient_accumulation_steps', 1)))
+    effective_batch_factor = max(1, data_parallel_world_size * grad_accumulation_steps)
+    batch_size = max(1, int(math.ceil(configured_global_batch_size / float(effective_batch_factor))))
+    effective_global_batch_size = batch_size * effective_batch_factor
+
+    if accelerator.is_main_process:
+        if data_parallel_world_size > 1 or grad_accumulation_steps > 1:
+            print_fn(
+                "Using %d data parallel process(es) with %d gradient accumulation step(s)."
+                % (data_parallel_world_size, grad_accumulation_steps)
+            )
+        if effective_global_batch_size != configured_global_batch_size:
+            print_fn(
+                "Configured global batch size %d mapped to per-device batch size %d for an effective global size of %d."
+                % (
+                    configured_global_batch_size,
+                    batch_size,
+                    effective_global_batch_size,
+                )
+            )
 
     dataset_params = {
         'dict_path': cfg_get_nested(config, 'phoneme_maps_path', 'Data/word_index_dict.txt'),
@@ -589,14 +612,106 @@ def main(config_path):
     val_num_workers = int(dataloader_params.get('val_num_workers', 2))
     train_bucket_sampler_config = dataloader_params.get('train_bucket_sampler', {})
 
-    base_eval_batch_size = int(cfg_get_nested(config, 'eval_params.batch_size', batch_size))
-    curriculum_batch_cfg = cfg_get_nested(config, 'training_curriculum.batch_size_schedule', {}) or {}
-    batch_scheduler = BatchSizeScheduler(curriculum_batch_cfg, default_batch_size=batch_size, total_epochs=epochs)
+    base_eval_global_batch_size = int(
+        cfg_get_nested(config, 'eval_params.batch_size', configured_global_batch_size)
+    )
+    base_eval_batch_size = max(
+        1, int(math.ceil(base_eval_global_batch_size / float(data_parallel_world_size)))
+    )
+    effective_eval_global_batch_size = base_eval_batch_size * data_parallel_world_size
+    if accelerator.is_main_process and effective_eval_global_batch_size != base_eval_global_batch_size:
+        print_fn(
+            "Configured evaluation batch size %d mapped to per-device batch size %d for an effective global size of %d."
+            % (
+                base_eval_global_batch_size,
+                base_eval_batch_size,
+                effective_eval_global_batch_size,
+            )
+        )
 
-    if batch_scheduler.enabled:
-        print_fn(f"[Curriculum] Batch size schedule enabled: {batch_scheduler.summary()}")
-    else:
-        print_fn(f"[Curriculum] Static batch size configured: {batch_size}")
+    curriculum_batch_cfg = cfg_get_nested(config, 'training_curriculum.batch_size_schedule', {}) or {}
+
+    def _scale_curriculum_batch_sizes(schedule_cfg, divisor):
+        if not schedule_cfg or divisor <= 1:
+            return schedule_cfg
+
+        scaled_cfg = copy.deepcopy(schedule_cfg)
+
+        def _scale_value(value):
+            try:
+                numeric = float(value)
+            except (TypeError, ValueError):
+                return value
+            return max(1, int(math.ceil(numeric / float(divisor))))
+
+        for key in ('base_batch_size', 'initial_batch_size'):
+            if key in scaled_cfg:
+                scaled_cfg[key] = _scale_value(scaled_cfg[key])
+
+        strategies = scaled_cfg.get('strategies')
+        if isinstance(strategies, dict):
+            milestone_cfg = strategies.get('milestones')
+            if isinstance(milestone_cfg, dict):
+                schedule = milestone_cfg.get('schedule')
+                if isinstance(schedule, dict):
+                    for sched_key, sched_value in list(schedule.items()):
+                        schedule[sched_key] = _scale_value(sched_value)
+                elif isinstance(schedule, list):
+                    new_schedule = []
+                    for entry in schedule:
+                        if isinstance(entry, dict):
+                            if 'batch_size' in entry:
+                                entry['batch_size'] = _scale_value(entry['batch_size'])
+                            if 'value' in entry:
+                                entry['value'] = _scale_value(entry['value'])
+                            new_schedule.append(entry)
+                        elif isinstance(entry, (list, tuple)) and len(entry) >= 2:
+                            entry_list = list(entry)
+                            entry_list[1] = _scale_value(entry_list[1])
+                            if isinstance(entry, tuple):
+                                new_schedule.append(tuple(entry_list))
+                            else:
+                                new_schedule.append(entry_list)
+                        else:
+                            new_schedule.append(entry)
+                    milestone_cfg['schedule'] = new_schedule
+
+            linear_cfg = strategies.get('linear')
+            if isinstance(linear_cfg, dict):
+                for key in ('start_batch_size', 'end_batch_size'):
+                    if key in linear_cfg:
+                        linear_cfg[key] = _scale_value(linear_cfg[key])
+
+        return scaled_cfg
+
+    scaled_curriculum_cfg = _scale_curriculum_batch_sizes(curriculum_batch_cfg, effective_batch_factor)
+    batch_scheduler = BatchSizeScheduler(scaled_curriculum_cfg, default_batch_size=batch_size, total_epochs=epochs)
+
+    def _curriculum_summary(scale_factor):
+        transitions = []
+        last_value = None
+        for epoch_idx in range(1, epochs + 1):
+            value = batch_scheduler.batch_size_for_epoch(epoch_idx)
+            if value != last_value:
+                transitions.append((epoch_idx, value))
+                last_value = value
+        if not transitions:
+            return ''
+
+        parts = []
+        for epoch_idx, value in transitions:
+            if scale_factor == 1:
+                parts.append(f"{epoch_idx}\u2192{value}")
+            else:
+                parts.append(f"{epoch_idx}\u2192{value * scale_factor} (per-device {value})")
+        return ', '.join(parts)
+
+    if accelerator.is_main_process:
+        summary = _curriculum_summary(effective_batch_factor)
+        if batch_scheduler.enabled:
+            print_fn(f"[Curriculum] Batch size schedule: {summary}")
+        elif summary:
+            print_fn(f"[Curriculum] Static batch size configured: {summary}")
 
     collate_config = {'return_speaker_ids': True}
 
@@ -732,7 +847,9 @@ def main(config_path):
 
     model = build_model(model_params=model_params)
 
-    total_training_steps = batch_scheduler.expected_total_steps(num_train_items)
+    total_training_steps = batch_scheduler.expected_total_steps(
+        num_train_items, world_size=data_parallel_world_size
+    )
     scheduler_params = {
         'max_lr': float(cfg_get_nested(config, 'optimizer_params.lr', 5e-4)),
         'pct_start': float(cfg_get_nested(config, 'optimizer_params.pct_start', 0.1)),
@@ -855,16 +972,23 @@ def main(config_path):
                 steps_per_epoch=steps_per_epoch,
             )
             current_train_batch_size = desired_batch_size
-            print_fn(f"[Curriculum] Epoch {epoch}: updated batch size to {desired_batch_size}")
+            effective_value = desired_batch_size * effective_batch_factor
+            if effective_batch_factor == 1:
+                print_fn(f"[Curriculum] Epoch {epoch}: updated batch size to {effective_value}")
+            else:
+                print_fn(
+                    f"[Curriculum] Epoch {epoch}: updated batch size to {effective_value} (per-device {desired_batch_size})"
+                )
         else:
             trainer.update_dataloaders(steps_per_epoch=steps_per_epoch)
 
     def _curriculum_completed_steps(num_epochs_completed):
         completed = 0
         total_epochs_completed = max(0, int(num_epochs_completed))
+        samples_per_rank = max(1, int(math.ceil(num_train_items / float(data_parallel_world_size))))
         for epoch_idx in range(1, total_epochs_completed + 1):
             batch_sz = max(1, batch_scheduler.batch_size_for_epoch(epoch_idx))
-            completed += max(1, num_train_items // batch_sz)
+            completed += max(1, int(math.ceil(samples_per_rank / float(batch_sz))))
         return completed
 
     pretrained_model = cfg_get_nested(config, 'pretrained_model', '')

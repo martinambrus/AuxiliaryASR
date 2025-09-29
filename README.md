@@ -25,7 +25,10 @@ accelerate launch --num_processes <num_gpus> train.py --config_path ./Configs/co
 ```
 
 The script automatically handles distributed setup, device placement and metric aggregation when run under `accelerate launch`.
-Please specify the training and validation data in `config.yml` file. The data list format needs to be `filename.wav|label-in-espeak-phonemes|speaker_number`, see [train_list.txt](https://github.com/martinambrus/AuxiliaryASR/blob/main/Data/train_list.txt) as an example (a custom sample of phonemized WAV files used for English training). Note that `speaker_number` can just be `0` for ASR, but it is useful to set a meaningful number for TTS training in StyleTTS2. 
+The `batch_size` defined in `Configs/config.yml` represents the desired *global* batch size. When training across multiple GPUs
+the launcher will automatically downscale the per-device batch size and keep the learning-rate scheduler in sync so that the
+effective global batch matches the single-GPU configuration.
+Please specify the training and validation data in `config.yml` file. The data list format needs to be `filename.wav|label-in-espeak-phonemes|speaker_number`, see [train_list.txt](https://github.com/martinambrus/AuxiliaryASR/blob/main/Data/train_list.txt) as an example (a custom sample of phonemized WAV files used for English training). Note that `speaker_number` can just be `0` for ASR, but it is useful to set a meaningful number for TTS training in StyleTTS2.
 
 Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take - but not beyond 64, as anything beyond this value did not yield desired results in my testing. Please note that `batch_size = 64` will take around 10G GPU RAM.
 
