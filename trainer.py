@@ -197,6 +197,17 @@ class Trainer(object):
             if self.shuffled_val_dataloader is not None:
                 self.val_dataloader = self.shuffled_val_dataloader
 
+    def _get_target_model(self):
+        """Return the underlying model, unwrapping accelerator/DDP wrappers."""
+        if self.accelerator is not None:
+            try:
+                return self.accelerator.unwrap_model(self.model)
+            except (AttributeError, ValueError):
+                pass
+        if hasattr(self.model, 'module'):
+            return self.model.module
+        return self.model
+
     def _get_optimizer_step_count(self):
         if self.optimizer is None:
             return 0
@@ -339,7 +350,8 @@ class Trainer(object):
             return None
         if length is None or length <= 0:
             return None
-        mask = self.model.get_future_mask(length, unmask_future_steps=0)
+        target_model = self._get_target_model()
+        mask = target_model.get_future_mask(length, unmask_future_steps=0)
         if mask is None:
             return None
         return mask.to(self.device) if hasattr(mask, 'to') else mask
@@ -349,7 +361,8 @@ class Trainer(object):
             return None
         if lengths is None:
             return None
-        return self.model.length_to_mask(lengths)
+        target_model = self._get_target_model()
+        return target_model.length_to_mask(lengths)
 
     def _compute_entropy_regularization(self, logits, lengths=None, key='ctc'):
         cfg = self._entropy_target_config(key)
@@ -777,11 +790,13 @@ class Trainer(object):
         if self.mixspeech_enabled and self.model.training:
             mel_input, mix_metadata = self._apply_mixspeech(mel_input)
 
-        mel_input_length = mel_input_length // (2 ** self.model.n_down)
+        target_model = self._get_target_model()
+        downsample_factor = 2 ** getattr(target_model, 'n_down', 1)
+        mel_input_length = mel_input_length // downsample_factor
         future_mask = self._maybe_create_future_mask(
-            mel_input.size(2) // (2 ** self.model.n_down)
+            mel_input.size(2) // downsample_factor
         )
-        mel_mask = self.model.length_to_mask(mel_input_length)
+        mel_mask = target_model.length_to_mask(mel_input_length)
         text_mask = self._maybe_create_text_mask(text_input_length)
 
         autocast_dtype = self.mixed_precision_dtype if self.autocast_enabled else None
@@ -1070,11 +1085,13 @@ class Trainer(object):
                 speaker_ids = batch[4].long()
             else:
                 speaker_ids = torch.zeros(text_input.size(0), device=self.device, dtype=torch.long)
-            mel_input_length = mel_input_length // (2 ** self.model.n_down)
+            target_model = self._get_target_model()
+            downsample_factor = 2 ** getattr(target_model, 'n_down', 1)
+            mel_input_length = mel_input_length // downsample_factor
             future_mask = self._maybe_create_future_mask(
-                mel_input.size(2) // (2 ** self.model.n_down)
+                mel_input.size(2) // downsample_factor
             )
-            mel_mask = self.model.length_to_mask(mel_input_length)
+            mel_mask = target_model.length_to_mask(mel_input_length)
             text_mask = self._maybe_create_text_mask(text_input_length)
             model_outputs = self.model(
                 mel_input, src_key_padding_mask=mel_mask, text_input=text_input)
