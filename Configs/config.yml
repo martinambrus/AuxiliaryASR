@@ -221,6 +221,10 @@ dataloader_params:
     bucket_size_multiplier: 20  # bucket = batch_size * multiplier
     shuffle_within_bucket: true
     shuffle_batches: true
+    lazy_state:
+      enabled: true  # Toggle lazy sampler bookkeeping to avoid re-sorting buckets each epoch.
+      cache_sorted_indices: true  # Cache the sorted index list once per run when lazy_state is enabled.
+      cache_bucket_assignments: true  # Persist bucket membership and reuse it while still shuffling per epoch.
 
 training_curriculum:
   batch_size_schedule:

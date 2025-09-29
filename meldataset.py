@@ -704,7 +704,9 @@ class LengthAwareBatchSampler(Sampler):
                  shuffle_batches=True,
                  shuffle_within_bucket=True,
                  drop_last=False,
-                 seed=None):
+                 seed=None,
+                 cache_sorted_indices=False,
+                 cache_bucket_assignments=False):
         if batch_size <= 0:
             raise ValueError("batch_size must be a positive integer")
         self.lengths = list(lengths)
@@ -719,7 +721,14 @@ class LengthAwareBatchSampler(Sampler):
         self.shuffle_within_bucket = bool(shuffle_within_bucket)
         self.drop_last = bool(drop_last)
         self.seed = seed
+        self.cache_sorted_indices = bool(cache_sorted_indices)
+        self.cache_bucket_assignments = bool(cache_bucket_assignments)
+        if self.cache_bucket_assignments:
+            # Bucket assignment caching implies we must preserve the sorted order.
+            self.cache_sorted_indices = True
         self._epoch = 0
+        self._sorted_indices = None
+        self._bucket_templates = None
 
     def __iter__(self):
         if self.seed is not None:
@@ -728,10 +737,7 @@ class LengthAwareBatchSampler(Sampler):
             rng = random.Random()
         self._epoch += 1
 
-        indices = list(range(len(self.lengths)))
-        indices.sort(key=lambda idx: self.lengths[idx])
-
-        buckets = [indices[i:i + self.bucket_size] for i in range(0, len(indices), self.bucket_size)]
+        buckets = self._prepare_buckets()
         if self.shuffle_batches:
             rng.shuffle(buckets)
 
@@ -756,6 +762,35 @@ class LengthAwareBatchSampler(Sampler):
         if self.drop_last:
             return len(self.lengths) // self.batch_size
         return math.ceil(len(self.lengths) / self.batch_size)
+
+    def _get_sorted_indices(self):
+        if self.cache_sorted_indices and self._sorted_indices is not None:
+            return list(self._sorted_indices)
+
+        indices = list(range(len(self.lengths)))
+        indices.sort(key=lambda idx: self.lengths[idx])
+
+        if self.cache_sorted_indices:
+            # Store as a tuple to guard against accidental in-place modifications.
+            self._sorted_indices = tuple(indices)
+
+        return indices
+
+    def _generate_bucket_templates(self, sorted_indices):
+        buckets = [sorted_indices[i:i + self.bucket_size] for i in range(0, len(sorted_indices), self.bucket_size)]
+        if self.cache_bucket_assignments:
+            self._bucket_templates = tuple(tuple(bucket) for bucket in buckets)
+        return buckets
+
+    def _prepare_buckets(self):
+        if self.cache_bucket_assignments and self._bucket_templates is not None:
+            return [list(bucket) for bucket in self._bucket_templates]
+
+        sorted_indices = self._get_sorted_indices()
+        buckets = self._generate_bucket_templates(sorted_indices)
+        if self.cache_bucket_assignments:
+            return [list(bucket) for bucket in self._bucket_templates]
+        return buckets
 
 
 class MelDataset(torch.utils.data.Dataset):
@@ -1105,6 +1140,14 @@ def build_dataloader(path_list,
             drop_last = bucket_sampler_config.get('drop_last', not validation)
             seed = bucket_sampler_config.get('seed')
 
+            lazy_state_config = bucket_sampler_config.get('lazy_state', {})
+            lazy_state_enabled = bool(lazy_state_config.get('enabled', False))
+            cache_sorted_indices = False
+            cache_bucket_assignments = False
+            if lazy_state_enabled:
+                cache_sorted_indices = bool(lazy_state_config.get('cache_sorted_indices', True))
+                cache_bucket_assignments = bool(lazy_state_config.get('cache_bucket_assignments', True))
+
             batch_sampler = LengthAwareBatchSampler(
                 lengths=lengths,
                 batch_size=batch_size,
@@ -1113,6 +1156,8 @@ def build_dataloader(path_list,
                 shuffle_within_bucket=shuffle_within_bucket,
                 drop_last=drop_last,
                 seed=seed,
+                cache_sorted_indices=cache_sorted_indices,
+                cache_bucket_assignments=cache_bucket_assignments,
             )
             use_bucket_sampler = True
 
