@@ -791,7 +791,9 @@ def main(config_path):
             shuffled_val_loader,
         )
 
-        prepared_train_loader = prepared_sorted_train if prepared_sorted_train is not None else prepared_shuffled_train
+        prepared_train_loader = (
+            prepared_sorted_train if prepared_sorted_train is not None else prepared_shuffled_train
+        )
         per_rank_steps = raw_steps
         inferred_world_size = 1
 
@@ -802,10 +804,33 @@ def main(config_path):
                 prepared_steps = None
 
             if prepared_steps is not None and prepared_steps > 0:
-                per_rank_steps = prepared_steps
-                if raw_steps > 0:
-                    inferred = int(round(raw_steps / float(prepared_steps)))
-                    inferred_world_size = max(1, min(data_parallel_world_size, inferred))
+                max_prepared_steps = prepared_steps
+                if data_parallel_world_size > 1:
+                    steps_tensor = torch.tensor(
+                        [prepared_steps],
+                        device=accelerator.device,
+                        dtype=torch.long,
+                    )
+                    gathered_steps = accelerator.gather(steps_tensor)
+                    if gathered_steps is not None and gathered_steps.numel() > 0:
+                        max_prepared_steps = int(gathered_steps.max().item())
+                        min_prepared_steps = int(gathered_steps.min().item())
+                        if (
+                            accelerator.is_main_process
+                            and max_prepared_steps != min_prepared_steps
+                        ):
+                            print_fn(
+                                "[Scheduler] Detected uneven per-rank dataloader lengths (%d vs %d). "
+                                "Planning the LR schedule with the maximum to avoid early decay."
+                                % (min_prepared_steps, max_prepared_steps)
+                            )
+
+                per_rank_steps = max_prepared_steps
+                if raw_steps > 0 and per_rank_steps > 0:
+                    inferred = int(round(raw_steps / float(per_rank_steps)))
+                    inferred_world_size = max(
+                        1, min(data_parallel_world_size, inferred)
+                    )
             else:
                 per_rank_steps = raw_steps
         else:
@@ -963,7 +988,19 @@ def main(config_path):
         self_conditioned_ctc_config = dict(self_conditioned_ctc_config)
         self_conditioned_ctc_config['loss_weight'] = float(loss_weight_config.get('self_conditioned_ctc', 0.0))
 
-    steps_per_epoch = len(sorted_train_dataloader) if sorted_train_dataloader is not None else len(shuffled_train_dataloader)
+    if sorted_train_dataloader is not None:
+        try:
+            local_steps = int(len(sorted_train_dataloader))
+        except TypeError:
+            local_steps = None
+    else:
+        try:
+            local_steps = int(len(shuffled_train_dataloader))
+        except TypeError:
+            local_steps = None
+
+    if local_steps is not None and local_steps > 0:
+        steps_per_epoch = max(int(steps_per_epoch), local_steps)
 
     to_prepare = [model, optimizer]
     scheduler_included = scheduler is not None
