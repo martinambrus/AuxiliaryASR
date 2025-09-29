@@ -505,12 +505,15 @@ def main(config_path):
         'mel_params': cfg_get_nested( config, 'preprocess_params.mel_params', { 'n_mels': 80 })
     }
 
+    phoneme_dict_config = cfg_get_nested(config, 'phoneme_dictionary', {}) or {}
+    dataset_params['phoneme_dictionary_config'] = phoneme_dict_config
+
     mel_cache_config = cfg_get_nested(config, 'mel_cache', {}) or {}
     dataset_params['mel_cache'] = mel_cache_config
 
     dataset_additional_params = cfg_get_nested(config, 'dataset_params', {})
     if isinstance(dataset_additional_params, dict):
-        for override_key in ('dict_path', 'sr', 'spect_params', 'mel_params'):
+        for override_key in ('dict_path', 'sr', 'spect_params', 'mel_params', 'phoneme_dictionary_config'):
             if override_key in dataset_additional_params:
                 dataset_params[override_key] = dataset_additional_params[override_key]
 

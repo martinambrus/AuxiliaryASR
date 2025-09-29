@@ -10,6 +10,16 @@ val_data: "Data/val_list.txt"
 ood_data: "Data/OOD_texts.txt"
 phoneme_maps_path: "Data/word_index_dict.txt"
 
+# Control how phoneme dictionaries are loaded.  When lazy loading is enabled the
+# CSV file is only parsed the first time a worker needs the mapping.  The shared
+# cache reuses the parsed dictionary across dataloader workers via a
+# multiprocessing manager so that each process avoids re-reading the CSV.
+phoneme_dictionary:
+  lazy_loading:
+    enabled: true  # Set to false to parse the dictionary immediately during dataset initialisation.
+  shared_cache:
+    enabled: true  # Disable to fall back to per-process caching without cross-worker sharing.
+
 # Controls caching of parsed metadata entries and audio durations.  Enabling this
 # significantly reduces start-up time by avoiding repeated WAV header scans.
 metadata_cache:
