@@ -889,11 +889,26 @@ def main(config_path):
             )
         )
 
-    total_training_steps = batch_scheduler.expected_total_steps(
-        num_train_items,
-        world_size=inferred_scheduler_world_size,
-        per_rank_samples=train_samples_per_rank,
+    samples_per_rank = max(1, int(train_samples_per_rank))
+    per_epoch_optimizer_steps = max(
+        1, int(math.ceil(steps_per_epoch / float(grad_accumulation_steps)))
     )
+
+    total_training_steps = 0
+    for epoch_idx in range(1, epochs + 1):
+        per_device_batch = max(1, int(batch_scheduler.batch_size_for_epoch(epoch_idx)))
+        epoch_step_estimate = int(math.ceil(samples_per_rank / float(per_device_batch)))
+        if grad_accumulation_steps > 1:
+            epoch_step_estimate = int(
+                math.ceil(epoch_step_estimate / float(grad_accumulation_steps))
+            )
+        total_training_steps += max(1, epoch_step_estimate)
+
+    if accelerator.is_main_process:
+        print_fn(
+            "[Scheduler] Planning %d optimiser steps (~%d per epoch) for OneCycleLR"
+            % (total_training_steps, per_epoch_optimizer_steps)
+        )
     scheduler_params = {
         'max_lr': float(cfg_get_nested(config, 'optimizer_params.lr', 5e-4)),
         'pct_start': float(cfg_get_nested(config, 'optimizer_params.pct_start', 0.1)),
@@ -901,6 +916,8 @@ def main(config_path):
         'steps_per_epoch': steps_per_epoch,
         'per_rank_samples': train_samples_per_rank,
         'effective_world_size': inferred_scheduler_world_size,
+        'gradient_accumulation_steps': grad_accumulation_steps,
+        'optimizer_steps_per_epoch': per_epoch_optimizer_steps,
         'total_steps': total_training_steps,
     }
     config['scheduler_params'] = scheduler_params
