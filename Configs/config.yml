@@ -221,6 +221,21 @@ dataloader_params:
     bucket_size_multiplier: 20  # bucket = batch_size * multiplier
     shuffle_within_bucket: true
     shuffle_batches: true
+  optimizations:
+    enabled: true  # Master switch that enables all DataLoader performance tweaks.
+    persistent_workers:
+      enabled: true  # Keep worker processes alive across epochs to avoid respawn overhead.
+      train: true    # Phase-specific override; omit to reuse the master toggle.
+      val: true
+    prefetch_factor:
+      enabled: true  # Control how many batches each worker preloads ahead of consumption.
+      train: 6       # Tuned number of prefetched batches for the training loader.
+      val: 4         # Slightly lower prefetching for evaluation to reduce latency.
+    pin_memory:
+      enabled: true  # Enable pinned host memory buffers for faster host<->device transfers.
+      device: auto   # Use the current CUDA device when available; set to a device string to override.
+    shared_memory_batches:
+      enabled: true  # Pin collated batches inside the main process so they can be shared across workers.
 
 training_curriculum:
   batch_size_schedule:

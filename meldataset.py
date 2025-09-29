@@ -10,7 +10,7 @@ import hashlib
 from pathlib import Path
 import numpy as np
 import random
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch import nn
@@ -18,6 +18,10 @@ import torch.nn.functional as F
 import torchaudio
 from torch.distributions import Beta
 from torch.utils.data import DataLoader, Sampler
+try:
+    from torch.utils.data._utils.pin_memory import pin_memory as _recursive_pin_memory
+except Exception:  # pragma: no cover - fallback when pin_memory helper is unavailable
+    _recursive_pin_memory = None
 from torchaudio import transforms as T
 
 from nltk.tokenize import word_tokenize
@@ -1070,7 +1074,8 @@ def build_dataloader(path_list,
                      dataset_config={},
                      lengths=None,
                      bucket_sampler_config=None,
-                     dataset_name=None):
+                     dataset_name=None,
+                     dataloader_config=None):
 
     dataset_cfg = dict(dataset_config or {})
     mel_cache_cfg = dataset_cfg.pop('mel_cache', None)
@@ -1082,6 +1087,71 @@ def build_dataloader(path_list,
         **dataset_cfg,
     )
     collate_fn = Collater(**collate_config)
+
+    loader_kwargs: Dict[str, Any] = {}
+    optim_cfg = dataloader_config or {}
+    if not isinstance(optim_cfg, dict):
+        optim_cfg = {}
+
+    optim_enabled = bool(optim_cfg.get('enabled', bool(optim_cfg)))
+
+    default_pin_memory = (device != 'cpu')
+    pin_memory_flag = default_pin_memory
+    pin_device = None
+
+    if optim_enabled:
+        pin_cfg = optim_cfg.get('pin_memory')
+        resolved_pin = _resolve_feature_toggle(pin_cfg, validation, default=None)
+        if isinstance(resolved_pin, bool):
+            pin_memory_flag = resolved_pin
+        elif resolved_pin is None:
+            pin_memory_flag = default_pin_memory
+        else:
+            pin_memory_flag = bool(resolved_pin)
+
+        if isinstance(pin_cfg, dict):
+            device_cfg = _resolve_phase_specific_value(pin_cfg.get('device'), validation)
+            if isinstance(device_cfg, str):
+                if device_cfg.lower() == 'auto':
+                    pin_device = device if isinstance(device, str) else str(device)
+                    if pin_device == 'cpu':
+                        pin_device = None
+                else:
+                    pin_device = device_cfg
+
+        persistent_cfg = optim_cfg.get('persistent_workers')
+        resolved_persistent = _resolve_feature_toggle(persistent_cfg, validation, default=None)
+        if isinstance(resolved_persistent, bool):
+            if resolved_persistent and num_workers > 0:
+                loader_kwargs['persistent_workers'] = True
+            elif resolved_persistent is False:
+                loader_kwargs['persistent_workers'] = False
+
+        prefetch_cfg = optim_cfg.get('prefetch_factor')
+        resolved_prefetch = _resolve_feature_toggle(prefetch_cfg, validation, default=None)
+        if num_workers > 0:
+            if isinstance(resolved_prefetch, bool):
+                if not resolved_prefetch:
+                    loader_kwargs.pop('prefetch_factor', None)
+            elif resolved_prefetch is not None:
+                try:
+                    prefetch_value = int(resolved_prefetch)
+                    if prefetch_value > 0:
+                        loader_kwargs['prefetch_factor'] = prefetch_value
+                except (TypeError, ValueError):
+                    pass
+
+        shared_cfg = optim_cfg.get('shared_memory_batches')
+        resolved_shared = _resolve_feature_toggle(shared_cfg, validation, default=False)
+        shared_enabled = bool(resolved_shared) and pin_memory_flag
+        if shared_enabled:
+            collate_fn = SharedMemoryPinningCollate(collate_fn, pin_device=pin_device)
+    else:
+        pin_memory_flag = default_pin_memory
+
+    if num_workers <= 0:
+        loader_kwargs.pop('persistent_workers', None)
+        loader_kwargs.pop('prefetch_factor', None)
 
     use_bucket_sampler = False
     batch_sampler = None
@@ -1121,7 +1191,8 @@ def build_dataloader(path_list,
                                  batch_sampler=batch_sampler,
                                  num_workers=num_workers,
                                  collate_fn=collate_fn,
-                                 pin_memory=(device != 'cpu'))
+                                 pin_memory=pin_memory_flag,
+                                 **loader_kwargs)
     else:
         data_loader = DataLoader(dataset,
                                  batch_size=batch_size,
@@ -1129,6 +1200,63 @@ def build_dataloader(path_list,
                                  num_workers=num_workers,
                                  drop_last=(not validation),
                                  collate_fn=collate_fn,
-                                 pin_memory=(device != 'cpu'))
+                                 pin_memory=pin_memory_flag,
+                                 **loader_kwargs)
 
     return data_loader
+# -----------------------------------------------------------------------------
+# DataLoader utilities
+# -----------------------------------------------------------------------------
+
+
+def _resolve_phase_specific_value(option: Any, validation: bool) -> Any:
+    """Return the value for the current phase from a config entry.
+
+    The helper accepts plain values or dictionaries with the optional keys
+    ``train``/``val``/``default``/``value``.  When a dictionary is provided the
+    function chooses the phase-specific override or falls back to ``default`` or
+    ``value`` when present.  If ``option`` is ``None`` the function simply
+    returns ``None``.
+    """
+
+    if not isinstance(option, dict):
+        return option
+
+    phase_key = 'val' if validation else 'train'
+    for key in (phase_key, 'default', 'value'):
+        if key in option:
+            return option[key]
+    return None
+
+
+def _resolve_feature_toggle(option: Any, validation: bool, default: Optional[bool] = None) -> Optional[Any]:
+    """Resolve feature toggles that optionally contain an ``enabled`` flag."""
+
+    if option is None:
+        return default
+
+    if isinstance(option, dict):
+        if 'enabled' in option and not bool(option.get('enabled', True)):
+            return False
+        resolved = _resolve_phase_specific_value(option, validation)
+        if resolved is None:
+            return True if option.get('enabled', default if default is not None else True) else False
+        return resolved
+
+    return option
+
+
+class SharedMemoryPinningCollate:
+    """Wrap a collate function to ensure batches reside in pinned shared memory."""
+
+    def __init__(self, collate_fn, pin_device: Optional[str] = None) -> None:
+        self._collate_fn = collate_fn
+        self._pin_device = pin_device
+
+    def __call__(self, batch):
+        output = self._collate_fn(batch)
+        if _recursive_pin_memory is None:
+            return output
+        return _recursive_pin_memory(output, device=self._pin_device)
+
+
