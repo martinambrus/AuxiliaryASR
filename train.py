@@ -777,9 +777,9 @@ def main(config_path):
             collate_config=collate_config,
             dataset_name="val")
 
-        steps = len(sorted_train_loader) if sorted_train_loader is not None else len(shuffled_train_loader)
-        steps = int(steps)
-        if steps <= 0:
+        raw_steps = len(sorted_train_loader) if sorted_train_loader is not None else len(shuffled_train_loader)
+        raw_steps = int(raw_steps)
+        if raw_steps <= 0:
             raise ValueError(
                 f"Curriculum batch size {current_batch_size} is too large for the training set and would produce no steps."
             )
@@ -791,16 +791,49 @@ def main(config_path):
             shuffled_val_loader,
         )
 
+        prepared_train_loader = prepared_sorted_train if prepared_sorted_train is not None else prepared_shuffled_train
+        per_rank_steps = raw_steps
+        inferred_world_size = 1
+
+        if prepared_train_loader is not None:
+            try:
+                prepared_steps = int(len(prepared_train_loader))
+            except TypeError:
+                prepared_steps = None
+
+            if prepared_steps is not None and prepared_steps > 0:
+                per_rank_steps = prepared_steps
+                if raw_steps > 0:
+                    inferred = int(round(raw_steps / float(prepared_steps)))
+                    inferred_world_size = max(1, min(data_parallel_world_size, inferred))
+            else:
+                per_rank_steps = raw_steps
+        else:
+            per_rank_steps = raw_steps
+
+        per_rank_steps = max(1, int(per_rank_steps))
+        per_rank_samples = per_rank_steps * current_batch_size
+
         return (
             prepared_sorted_train,
             prepared_shuffled_train,
             prepared_sorted_val,
             prepared_shuffled_val,
-            steps,
+            per_rank_steps,
+            per_rank_samples,
+            inferred_world_size,
         )
 
     initial_batch_size = batch_scheduler.batch_size_for_epoch(1)
-    sorted_train_dataloader, shuffled_train_dataloader, sorted_val_dataloader, shuffled_val_dataloader, steps_per_epoch = _build_dataloaders_for_batch(initial_batch_size)
+    (
+        sorted_train_dataloader,
+        shuffled_train_dataloader,
+        sorted_val_dataloader,
+        shuffled_val_dataloader,
+        steps_per_epoch,
+        train_samples_per_rank,
+        inferred_scheduler_world_size,
+    ) = _build_dataloaders_for_batch(initial_batch_size)
 
     word_indexes = set(
         line.strip() for line in open(cfg_get_nested(config, 'phoneme_maps_path', 'Data/word_index_dict.txt'))
@@ -847,14 +880,27 @@ def main(config_path):
 
     model = build_model(model_params=model_params)
 
+    if accelerator.is_main_process and data_parallel_world_size > 1 and inferred_scheduler_world_size < data_parallel_world_size:
+        print_fn(
+            "[Scheduler] Detected that the prepared dataloader does not shard the dataset across all %d workers. "
+            "Estimating scheduler steps with an effective world size of %d to avoid premature LR decay." % (
+                data_parallel_world_size,
+                inferred_scheduler_world_size,
+            )
+        )
+
     total_training_steps = batch_scheduler.expected_total_steps(
-        num_train_items, world_size=data_parallel_world_size
+        num_train_items,
+        world_size=inferred_scheduler_world_size,
+        per_rank_samples=train_samples_per_rank,
     )
     scheduler_params = {
         'max_lr': float(cfg_get_nested(config, 'optimizer_params.lr', 5e-4)),
         'pct_start': float(cfg_get_nested(config, 'optimizer_params.pct_start', 0.1)),
         'epochs': epochs,
         'steps_per_epoch': steps_per_epoch,
+        'per_rank_samples': train_samples_per_rank,
+        'effective_world_size': inferred_scheduler_world_size,
         'total_steps': total_training_steps,
     }
     config['scheduler_params'] = scheduler_params
@@ -945,6 +991,7 @@ def main(config_path):
                     )
 
     current_train_batch_size = int(initial_batch_size)
+    current_samples_per_rank = int(train_samples_per_rank)
 
     def _ensure_curriculum_for_epoch(epoch):
         nonlocal sorted_train_dataloader
@@ -953,6 +1000,7 @@ def main(config_path):
         nonlocal shuffled_val_dataloader
         nonlocal steps_per_epoch
         nonlocal current_train_batch_size
+        nonlocal current_samples_per_rank
 
         desired_batch_size = int(batch_scheduler.batch_size_for_epoch(epoch))
         if desired_batch_size != current_train_batch_size:
@@ -962,6 +1010,8 @@ def main(config_path):
                 sorted_val_dataloader,
                 shuffled_val_dataloader,
                 steps_per_epoch,
+                current_samples_per_rank,
+                _,
             ) = _build_dataloaders_for_batch(desired_batch_size)
 
             trainer.update_dataloaders(
@@ -985,7 +1035,7 @@ def main(config_path):
     def _curriculum_completed_steps(num_epochs_completed):
         completed = 0
         total_epochs_completed = max(0, int(num_epochs_completed))
-        samples_per_rank = max(1, int(math.ceil(num_train_items / float(data_parallel_world_size))))
+        samples_per_rank = max(1, int(current_samples_per_rank))
         for epoch_idx in range(1, total_epochs_completed + 1):
             batch_sz = max(1, batch_scheduler.batch_size_for_epoch(epoch_idx))
             completed += max(1, int(math.ceil(samples_per_rank / float(batch_sz))))

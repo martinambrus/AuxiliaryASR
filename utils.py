@@ -404,17 +404,30 @@ class BatchSizeScheduler:
     def final_batch_size(self) -> int:
         return self.batch_size_for_epoch(self.total_epochs)
 
-    def expected_total_steps(self, dataset_size: int, *, world_size: int = 1) -> int:
+    def expected_total_steps(
+        self,
+        dataset_size: int,
+        *,
+        world_size: int = 1,
+        per_rank_samples: Optional[int] = None,
+    ) -> int:
         """Return the number of optimiser steps implied by the schedule.
 
         Args:
             dataset_size: Total number of training items across all processes.
             world_size: Number of data-parallel workers processing the dataset.
+            per_rank_samples: Optional override for the number of samples seen by
+                each rank in an epoch.  When provided, ``world_size`` is ignored
+                and the step estimation is derived directly from this value.
         """
 
-        dataset_size = max(1, int(dataset_size))
-        world_size = max(1, int(world_size))
-        samples_per_rank = max(1, math.ceil(dataset_size / float(world_size)))
+        samples_per_rank: int
+        if per_rank_samples is not None:
+            samples_per_rank = max(1, int(per_rank_samples))
+        else:
+            dataset_size = max(1, int(dataset_size))
+            world_size = max(1, int(world_size))
+            samples_per_rank = max(1, math.ceil(dataset_size / float(world_size)))
 
         total_steps = 0
         for epoch in range(1, self.total_epochs + 1):
