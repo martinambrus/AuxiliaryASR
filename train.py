@@ -24,6 +24,10 @@ import importlib.util
 from pathlib import Path
 from accelerate import Accelerator
 from accelerate.utils import DistributedDataParallelKwargs
+try:
+    from accelerate.utils import FullyShardedDataParallelPlugin
+except ImportError:  # pragma: no cover - older accelerate versions
+    FullyShardedDataParallelPlugin = None
 
 # enable better memory management
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -60,6 +64,193 @@ _OPTIONAL_TQDM = _load_optional_tqdm()
 
 
 _METADATA_CACHE_VERSION = 2
+
+
+def _normalise_choice(value):
+    if value is None:
+        return None
+    if isinstance(value, str):
+        text = value
+    else:
+        text = str(value)
+    return text.strip().replace("-", "_").replace(" ", "_").upper()
+
+
+def _enum_member_from_config(enum_cls, value, config_key, warnings):
+    if value is None:
+        return None
+    if isinstance(value, enum_cls):
+        return value
+    if isinstance(value, str):
+        normalised = _normalise_choice(value)
+        for member in enum_cls:
+            if member.name == normalised:
+                return member
+        warnings.append(
+            f"Unrecognised value '{value}' for {config_key}; falling back to the default."
+        )
+        return None
+    warnings.append(
+        f"Unsupported type {type(value).__name__} for {config_key}; falling back to the default."
+    )
+    return None
+
+
+def _dtype_from_config(value, config_key, warnings):
+    if value is None:
+        return None
+    dtype_map = {
+        "float16": torch.float16,
+        "half": torch.float16,
+        "fp16": torch.float16,
+        "bfloat16": torch.bfloat16,
+        "bf16": torch.bfloat16,
+        "float32": torch.float32,
+        "fp32": torch.float32,
+        "float64": torch.float64,
+        "fp64": torch.float64,
+    }
+    key = str(value).strip().lower()
+    if key in dtype_map:
+        return dtype_map[key]
+    warnings.append(
+        f"Unrecognised dtype '{value}' for {config_key}; falling back to the default."
+    )
+    return None
+
+
+def _build_fsdp_plugin(fsdp_config, device_hint=None):
+    if not isinstance(fsdp_config, dict) or not fsdp_config.get("enabled", False):
+        return None, []
+
+    if FullyShardedDataParallelPlugin is None:
+        raise RuntimeError(
+            "FSDP support requires accelerate >= 0.17.0 with FullyShardedDataParallelPlugin available."
+        )
+
+    if device_hint is not None and str(device_hint).lower().startswith("cpu"):
+        raise RuntimeError(
+            "Fully Sharded Data Parallel currently requires CUDA devices; please set device to 'cuda'."
+        )
+
+    try:
+        from torch.distributed.fsdp import (
+            BackwardPrefetch,
+            CPUOffload,
+            MixedPrecision,
+            ShardingStrategy,
+            StateDictType,
+        )
+        from torch.distributed.fsdp.wrap import size_based_auto_wrap_policy
+    except ImportError as exc:  # pragma: no cover - depends on torch build
+        raise RuntimeError(
+            "FSDP was requested but torch.distributed.fsdp is unavailable in this PyTorch build."
+        ) from exc
+
+    warnings = []
+    plugin_kwargs = {}
+
+    sharding_strategy = _enum_member_from_config(
+        ShardingStrategy,
+        fsdp_config.get("sharding_strategy"),
+        "distributed.fsdp.sharding_strategy",
+        warnings,
+    )
+    if sharding_strategy is not None:
+        plugin_kwargs["sharding_strategy"] = sharding_strategy
+
+    backward_prefetch = _enum_member_from_config(
+        BackwardPrefetch,
+        fsdp_config.get("backward_prefetch"),
+        "distributed.fsdp.backward_prefetch",
+        warnings,
+    )
+    if backward_prefetch is not None:
+        plugin_kwargs["backward_prefetch"] = backward_prefetch
+
+    state_dict_type = _enum_member_from_config(
+        StateDictType,
+        fsdp_config.get("state_dict_type"),
+        "distributed.fsdp.state_dict_type",
+        warnings,
+    )
+    if state_dict_type is not None:
+        plugin_kwargs["state_dict_type"] = state_dict_type
+
+    if "limit_all_gathers" in fsdp_config:
+        plugin_kwargs["limit_all_gathers"] = bool(fsdp_config.get("limit_all_gathers"))
+
+    if "use_orig_params" in fsdp_config:
+        plugin_kwargs["use_orig_params"] = bool(fsdp_config.get("use_orig_params"))
+
+    if "forward_prefetch" in fsdp_config:
+        plugin_kwargs["forward_prefetch"] = bool(fsdp_config.get("forward_prefetch"))
+
+    if "sync_module_states" in fsdp_config:
+        plugin_kwargs["sync_module_states"] = bool(fsdp_config.get("sync_module_states"))
+
+    cpu_offload_cfg = fsdp_config.get("cpu_offload", False)
+    cpu_offload = None
+    if isinstance(cpu_offload_cfg, dict):
+        offload_params = bool(cpu_offload_cfg.get("offload_params", True))
+        cpu_offload = CPUOffload(
+            offload_params=offload_params,
+            pin_memory=bool(cpu_offload_cfg.get("pin_memory", False)),
+        )
+    elif cpu_offload_cfg:
+        cpu_offload = CPUOffload(offload_params=True)
+    if cpu_offload is not None:
+        plugin_kwargs["cpu_offload"] = cpu_offload
+
+    mixed_precision_cfg = fsdp_config.get("mixed_precision")
+    if isinstance(mixed_precision_cfg, dict) and mixed_precision_cfg:
+        mp_kwargs = {}
+        for key in ("param_dtype", "reduce_dtype", "buffer_dtype"):
+            dtype = _dtype_from_config(
+                mixed_precision_cfg.get(key),
+                f"distributed.fsdp.mixed_precision.{key}",
+                warnings,
+            )
+            if dtype is not None:
+                mp_kwargs[key] = dtype
+        if mp_kwargs:
+            plugin_kwargs["mixed_precision_policy"] = MixedPrecision(**mp_kwargs)
+
+    auto_wrap_cfg = fsdp_config.get("auto_wrap_policy")
+    if isinstance(auto_wrap_cfg, dict) and auto_wrap_cfg:
+        enabled = auto_wrap_cfg.get("enabled", True)
+        if enabled:
+            policy_type = auto_wrap_cfg.get("type")
+            normalised_type = _normalise_choice(policy_type)
+            if normalised_type in (None, "SIZE_BASED"):
+                min_params = auto_wrap_cfg.get("min_num_params")
+                if min_params is None:
+                    min_params = auto_wrap_cfg.get("min_params")
+                if min_params is not None:
+                    try:
+                        min_params_value = int(min_params)
+                    except (TypeError, ValueError):
+                        warnings.append(
+                            "auto_wrap_policy.min_num_params must be an integer; ignoring the value."
+                        )
+                    else:
+                        min_params_value = max(1, min_params_value)
+                        plugin_kwargs["auto_wrap_policy"] = size_based_auto_wrap_policy
+                        plugin_kwargs["auto_wrap_policy_kwargs"] = {
+                            "min_num_params": min_params_value
+                        }
+            else:
+                warnings.append(
+                    "Only the 'size_based' auto_wrap_policy is supported in the configuration; ignoring the setting."
+                )
+
+    activation_ckpt_cfg = fsdp_config.get("activation_checkpointing")
+    if isinstance(activation_ckpt_cfg, dict) and activation_ckpt_cfg.get("enabled", False):
+        plugin_kwargs["activation_checkpointing_config"] = activation_ckpt_cfg.get(
+            "config"
+        )
+
+    return FullyShardedDataParallelPlugin(**plugin_kwargs), warnings
 
 
 def prepare_data_list(
@@ -486,8 +677,40 @@ def main(config_path):
 
     desired_device = str(cfg_get_nested(config, 'device', 'cpu')).lower()
     accelerator_kwargs = {}
-    ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
-    accelerator_kwargs['kwargs_handlers'] = [ddp_kwargs]
+    distributed_config = cfg_get_nested(config, 'distributed', {}) or {}
+    fsdp_plugin = None
+    fsdp_warnings = []
+    if isinstance(distributed_config, dict):
+        fsdp_plugin, fsdp_warnings = _build_fsdp_plugin(
+            distributed_config.get('fsdp', {}),
+            desired_device,
+        )
+    else:
+        distributed_config = {}
+
+    if fsdp_plugin is not None:
+        accelerator_kwargs['fsdp_plugin'] = fsdp_plugin
+    else:
+        ddp_config = distributed_config.get('ddp', {}) if isinstance(distributed_config, dict) else {}
+        ddp_options = {}
+        if isinstance(ddp_config, dict):
+            if 'find_unused_parameters' in ddp_config:
+                ddp_options['find_unused_parameters'] = bool(ddp_config['find_unused_parameters'])
+            if 'broadcast_buffers' in ddp_config:
+                ddp_options['broadcast_buffers'] = bool(ddp_config['broadcast_buffers'])
+            if 'gradient_as_bucket_view' in ddp_config:
+                ddp_options['gradient_as_bucket_view'] = bool(ddp_config['gradient_as_bucket_view'])
+            if 'static_graph' in ddp_config:
+                ddp_options['static_graph'] = bool(ddp_config['static_graph'])
+            if 'bucket_cap_mb' in ddp_config and ddp_config['bucket_cap_mb'] is not None:
+                try:
+                    ddp_options['bucket_cap_mb'] = int(ddp_config['bucket_cap_mb'])
+                except (TypeError, ValueError):
+                    pass
+        if 'find_unused_parameters' not in ddp_options:
+            ddp_options['find_unused_parameters'] = True
+        accelerator_kwargs['kwargs_handlers'] = [DistributedDataParallelKwargs(**ddp_options)]
+
     # ``split_batches`` defaults to ``True`` which would further subdivide each
     # dataloader batch across data-parallel workers.  The training scripts
     # already size batches per device, so keep them intact by disabling that
@@ -498,6 +721,12 @@ def main(config_path):
 
     accelerator = Accelerator(**accelerator_kwargs)
     print_fn = accelerator.print
+
+    if fsdp_plugin is not None and accelerator.is_main_process:
+        print_fn("[Distributed] Using Fully Sharded Data Parallel via accelerate.")
+    if fsdp_warnings and accelerator.is_main_process:
+        for warning_msg in fsdp_warnings:
+            print_fn(f"[FSDP] {warning_msg}")
 
     print_fn(f"Loading config data from: {config_path}")
 

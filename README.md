@@ -28,6 +28,29 @@ The script automatically handles distributed setup, device placement and metric 
 The `batch_size` defined in `Configs/config.yml` represents the desired *global* batch size. When training across multiple GPUs
 the launcher will automatically downscale the per-device batch size and keep the learning-rate scheduler in sync so that the
 effective global batch matches the single-GPU configuration.
+
+### Fully Sharded Data Parallel
+
+Training very large models can be memory bound even when using several GPUs. AuxiliaryASR now supports
+[Fully Sharded Data Parallel](https://pytorch.org/docs/stable/fsdp.html) via 🤗 Accelerate. Enable it in your configuration by
+setting `distributed.fsdp.enabled: true`:
+
+```yaml
+distributed:
+  fsdp:
+    enabled: true
+    sharding_strategy: full_shard
+    mixed_precision:
+      param_dtype: float16
+      reduce_dtype: float16
+      buffer_dtype: float16
+```
+
+You can further customise sharding, state-dict handling, CPU offloading and auto-wrap behaviour through the rest of the
+`distributed.fsdp` block in `Configs/config.yml`. The trainer will automatically construct the appropriate Accelerate plugin and
+use `accelerator.get_state_dict` when saving checkpoints so that consolidated weights are written from FSDP shards. Launch the
+script with `accelerate launch` to run across multiple GPUs.
+
 Please specify the training and validation data in `config.yml` file. The data list format needs to be `filename.wav|label-in-espeak-phonemes|speaker_number`, see [train_list.txt](https://github.com/martinambrus/AuxiliaryASR/blob/main/Data/train_list.txt) as an example (a custom sample of phonemized WAV files used for English training). Note that `speaker_number` can just be `0` for ASR, but it is useful to set a meaningful number for TTS training in StyleTTS2.
 
 Checkpoints and Tensorboard logs will be saved at `log_dir`. To speed up training, you may want to make `batch_size` as large as your GPU RAM can take - but not beyond 64, as anything beyond this value did not yield desired results in my testing. Please note that `batch_size = 64` will take around 10G GPU RAM.

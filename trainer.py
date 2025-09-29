@@ -532,9 +532,15 @@ class Trainer(object):
             "epochs": self.epochs,
         }
         model_to_save = self.model
+        model_state = None
         if self.accelerator is not None:
             model_to_save = self.accelerator.unwrap_model(self.model)
-        state_dict["model"] = model_to_save.state_dict()
+            get_state_dict = getattr(self.accelerator, "get_state_dict", None)
+            if callable(get_state_dict):
+                model_state = get_state_dict(model_to_save)
+        if model_state is None:
+            model_state = model_to_save.state_dict()
+        state_dict["model"] = model_state
 
         if not os.path.exists(os.path.dirname(checkpoint_path)):
             os.makedirs(os.path.dirname(checkpoint_path))

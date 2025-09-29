@@ -1,6 +1,35 @@
 log_dir: "Checkpoint"
 save_freq: 10
 device: "cuda"
+distributed:
+  fsdp:
+    enabled: false
+    # Available options: FULL_SHARD, SHARD_GRAD_OP, NO_SHARD, HYBRID_SHARD
+    sharding_strategy: full_shard
+    # Options: BACKWARD_POST, BACKWARD_PRE
+    backward_prefetch: backward_post
+    # Options: FULL_STATE_DICT, LOCAL_STATE_DICT, SHARDED_STATE_DICT
+    state_dict_type: full_state_dict
+    limit_all_gathers: true
+    use_orig_params: false
+    forward_prefetch: true
+    cpu_offload:
+      enabled: false
+      offload_params: true
+      pin_memory: false
+    mixed_precision:
+      param_dtype: null
+      reduce_dtype: null
+      buffer_dtype: null
+    auto_wrap_policy:
+      enabled: false
+      min_num_params: 100000000
+    activation_checkpointing:
+      enabled: false
+      config: null
+  ddp:
+    find_unused_parameters: true
+    broadcast_buffers: true
 epochs: 200
 batch_size: 64
 pretrained_model: true
