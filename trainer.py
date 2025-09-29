@@ -72,6 +72,7 @@ class Trainer(object):
         self.config = config
         self.device = device
         self.accelerator = accelerator
+        self._accelerator_scaler = getattr(self.accelerator, 'scaler', None) if self.accelerator is not None else None
         self.finish_train = False
         self.logger = logger
         self.fp16_run = False
@@ -155,8 +156,15 @@ class Trainer(object):
         grad_scaler_cfg = mp_cfg.get('grad_scaler', {}) if isinstance(mp_cfg, dict) else {}
         if not isinstance(grad_scaler_cfg, dict):
             grad_scaler_cfg = {}
-        scaler_enabled = bool(grad_scaler_cfg.get('enabled', True)) and self.autocast_enabled
-        if scaler_enabled:
+        self._uses_accelerator_scaler = self._accelerator_scaler is not None
+        scaler_enabled = (
+            bool(grad_scaler_cfg.get('enabled', True))
+            and self.autocast_enabled
+            and not self._uses_accelerator_scaler
+        )
+        if self._uses_accelerator_scaler:
+            self.grad_scaler = self._accelerator_scaler
+        elif scaler_enabled:
             init_scale = float(grad_scaler_cfg.get('init_scale', 65536.0))
             growth_factor = float(grad_scaler_cfg.get('growth_factor', 2.0))
             backoff_factor = float(grad_scaler_cfg.get('backoff_factor', 0.5))
@@ -806,7 +814,10 @@ class Trainer(object):
         text_mask = self._maybe_create_text_mask(text_input_length)
 
         autocast_dtype = self.mixed_precision_dtype if self.autocast_enabled else None
-        grad_scaler = self.grad_scaler if self.grad_scaler is not None else None
+        using_accelerator = self.accelerator is not None
+        grad_scaler = (
+            self.grad_scaler if self.grad_scaler is not None and not using_accelerator else None
+        )
 
         if self.autocast_enabled:
             autocast_cm = amp.autocast(
@@ -992,13 +1003,22 @@ class Trainer(object):
 
             grad_scaler.update()
         else:
-            if self.accelerator is not None:
+            if using_accelerator:
                 self.accelerator.backward(loss)
             else:
                 loss.backward()
             torch.nn.utils.clip_grad_value_(self.model.parameters(), 5)
-            self.optimizer.step()
-            optimizer_step_ran = True
+            if using_accelerator:
+                should_step = bool(getattr(self.accelerator, 'sync_gradients', True))
+                if should_step:
+                    # The accelerator-wrapped optimizer handles gradient scaling when needed.
+                    self.optimizer.step()
+                    optimizer_step_ran = True
+                else:
+                    optimizer_step_ran = False
+            else:
+                self.optimizer.step()
+                optimizer_step_ran = True
 
         if optimizer_step_ran:
             self._optimizer_step_count += 1
