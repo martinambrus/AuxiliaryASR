@@ -221,6 +221,22 @@ dataloader_params:
     bucket_size_multiplier: 20  # bucket = batch_size * multiplier
     shuffle_within_bucket: true
     shuffle_batches: true
+  # Centralised toggles for optimising DataLoader throughput.  These settings
+  # apply to both training and evaluation loaders unless overridden below.
+  optimizations:
+    enabled: true  # Master switch controlling whether the optimisations below are applied.
+    persistent_workers: true  # Keep worker processes alive between epochs (requires num_workers > 0).
+    pin_memory: auto  # Options: true, false or auto.  Auto pins only when the target device is CUDA.
+    pin_memory_device: "cuda"  # Explicit CUDA device to use for pinned host buffers (set to null for default behaviour).
+    prefetch_factor:
+      train: 4  # Number of batches each worker preloads during training.
+      eval: 2   # Number of batches each worker preloads for validation/evaluation.
+    shared_memory_batches:
+      enabled: true  # Allocate collated CPU tensors in shared memory before pinning to avoid extra copies.
+      train_only: false  # When true the shared-memory path is skipped for validation/evaluation loaders.
+  # Split-specific overrides can fine tune the shared configuration above.
+  train_optimizations: {}  # e.g. { prefetch_factor: { train: 6 } }
+  eval_optimizations: {}   # e.g. { shared_memory_batches: { enabled: false } }
 
 training_curriculum:
   batch_size_schedule:

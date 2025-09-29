@@ -1016,10 +1016,26 @@ class Collater(object):
       return_wave (bool): if true, will return the wave data along with spectrogram. 
     """
 
-    def __init__(self, return_wave=False, return_speaker_ids=False):
+    def __init__(self, return_wave=False, return_speaker_ids=False, share_memory=False):
         self.text_pad_index = 0
         self.return_wave = return_wave
         self.return_speaker_ids = return_speaker_ids
+        self.share_memory = bool(share_memory)
+
+    @staticmethod
+    def _share_batch_item(item):
+        if torch.is_tensor(item) and item.device.type == "cpu":
+            try:
+                item.share_memory_()
+            except RuntimeError:
+                pass
+        elif isinstance(item, (list, tuple)):
+            for element in item:
+                Collater._share_batch_item(element)
+        elif isinstance(item, dict):
+            for element in item.values():
+                Collater._share_batch_item(element)
+        return item
 
     def __call__(self, batch):
         batch_size = len(batch)
@@ -1056,6 +1072,8 @@ class Collater(object):
         if self.return_wave:
             waves = [b[0] for b in batch]
             outputs.append(waves)
+        if self.share_memory:
+            outputs = [self._share_batch_item(item) for item in outputs]
 
         return tuple(outputs)
 
@@ -1070,7 +1088,8 @@ def build_dataloader(path_list,
                      dataset_config={},
                      lengths=None,
                      bucket_sampler_config=None,
-                     dataset_name=None):
+                     dataset_name=None,
+                     loader_config=None):
 
     dataset_cfg = dict(dataset_config or {})
     mel_cache_cfg = dataset_cfg.pop('mel_cache', None)
@@ -1081,7 +1100,70 @@ def build_dataloader(path_list,
         dataset_name=dataset_name,
         **dataset_cfg,
     )
-    collate_fn = Collater(**collate_config)
+    loader_opts = dict(loader_config or {})
+    optimizations_enabled = bool(loader_opts.get('enabled', True)) if loader_opts else True
+
+    device_str = str(device) if device is not None else 'cpu'
+    device_lower = device_str.lower()
+
+    collate_cfg = dict(collate_config or {})
+    if optimizations_enabled and loader_opts:
+        shared_cfg = loader_opts.get('shared_memory_batches', {})
+        shared_enabled = False
+        train_only = False
+        if isinstance(shared_cfg, dict):
+            shared_enabled = bool(shared_cfg.get('enabled', False))
+            train_only = bool(shared_cfg.get('train_only', False))
+        elif shared_cfg is not None:
+            shared_enabled = bool(shared_cfg)
+        if validation and train_only:
+            shared_enabled = False
+        if shared_enabled:
+            collate_cfg['share_memory'] = bool(collate_cfg.get('share_memory', False) or shared_enabled)
+    collate_fn = Collater(**collate_cfg)
+
+    persistent_workers = False
+    pin_memory_flag = device_lower != 'cpu'
+    pin_memory_device = None
+    if optimizations_enabled and loader_opts:
+        persistent_workers = bool(loader_opts.get('persistent_workers', False)) if num_workers > 0 else False
+
+        pin_memory_cfg = loader_opts.get('pin_memory', None)
+        if isinstance(pin_memory_cfg, str) and pin_memory_cfg.lower() == 'auto':
+            pin_memory_flag = device_lower != 'cpu'
+        elif pin_memory_cfg is not None:
+            pin_memory_flag = bool(pin_memory_cfg)
+
+        pin_memory_device = loader_opts.get('pin_memory_device', None)
+        if pin_memory_device is not None:
+            pin_memory_device = str(pin_memory_device)
+
+    if device_lower == 'cpu':
+        pin_memory_flag = False
+
+    prefetch_factor = None
+    if optimizations_enabled and loader_opts and num_workers > 0:
+        prefetch_cfg = loader_opts.get('prefetch_factor', None)
+        if isinstance(prefetch_cfg, dict):
+            key = 'eval' if validation else 'train'
+            prefetch_factor = prefetch_cfg.get(key, prefetch_cfg.get('default'))
+        else:
+            prefetch_factor = prefetch_cfg
+        if prefetch_factor is not None:
+            try:
+                prefetch_factor = int(prefetch_factor)
+            except (TypeError, ValueError):
+                raise ValueError(f"Invalid prefetch_factor value: {prefetch_factor}")
+            if prefetch_factor <= 0:
+                prefetch_factor = None
+
+    dataloader_kwargs = {}
+    if persistent_workers:
+        dataloader_kwargs['persistent_workers'] = True
+    if prefetch_factor is not None:
+        dataloader_kwargs['prefetch_factor'] = int(prefetch_factor)
+    if pin_memory_device and pin_memory_flag:
+        dataloader_kwargs['pin_memory_device'] = pin_memory_device
 
     use_bucket_sampler = False
     batch_sampler = None
@@ -1121,7 +1203,8 @@ def build_dataloader(path_list,
                                  batch_sampler=batch_sampler,
                                  num_workers=num_workers,
                                  collate_fn=collate_fn,
-                                 pin_memory=(device != 'cpu'))
+                                 pin_memory=pin_memory_flag,
+                                 **dataloader_kwargs)
     else:
         data_loader = DataLoader(dataset,
                                  batch_size=batch_size,
@@ -1129,6 +1212,7 @@ def build_dataloader(path_list,
                                  num_workers=num_workers,
                                  drop_last=(not validation),
                                  collate_fn=collate_fn,
-                                 pin_memory=(device != 'cpu'))
+                                 pin_memory=pin_memory_flag,
+                                 **dataloader_kwargs)
 
     return data_loader

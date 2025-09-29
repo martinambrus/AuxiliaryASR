@@ -556,6 +556,28 @@ def main(config_path):
     val_num_workers = int(dataloader_params.get('val_num_workers', 2))
     train_bucket_sampler_config = dataloader_params.get('train_bucket_sampler', {})
 
+    def _merge_opt_dicts(base_dict, override_dict):
+        result = dict(base_dict or {})
+        if not override_dict:
+            return result
+        for key, value in override_dict.items():
+            if key in result and isinstance(result[key], dict) and isinstance(value, dict):
+                result[key] = _merge_opt_dicts(result[key], value)
+            else:
+                result[key] = value
+        return result
+
+    loader_base_opts = dataloader_params.get('optimizations', {}) or {}
+    train_loader_overrides = dataloader_params.get('train_optimizations', {}) or {}
+    eval_loader_overrides = dataloader_params.get('eval_optimizations', {}) or {}
+
+    def _resolve_loader_opts(validation):
+        base = loader_base_opts
+        override = eval_loader_overrides if validation else train_loader_overrides
+        if not base and not override:
+            return {}
+        return _merge_opt_dicts(base, override)
+
     base_eval_batch_size = int(cfg_get_nested(config, 'eval_params.batch_size', batch_size))
     curriculum_batch_cfg = cfg_get_nested(config, 'training_curriculum.batch_size_schedule', {}) or {}
     batch_scheduler = BatchSizeScheduler(curriculum_batch_cfg, default_batch_size=batch_size, total_epochs=epochs)
@@ -578,7 +600,8 @@ def main(config_path):
             dataset_config=dataset_params,
             device=device,
             collate_config=collate_config,
-            dataset_name="train")
+            dataset_name="train",
+            loader_config=_resolve_loader_opts(validation=False))
 
         shuffled_train_loader = build_dataloader(
             train_entries,
@@ -589,7 +612,8 @@ def main(config_path):
             lengths=train_durations,
             bucket_sampler_config=train_bucket_sampler_config,
             collate_config=collate_config,
-            dataset_name="train")
+            dataset_name="train",
+            loader_config=_resolve_loader_opts(validation=False))
 
         sorted_val_loader = build_dataloader(
             val_list_sorted,
@@ -599,7 +623,8 @@ def main(config_path):
             device=device,
             dataset_config=dataset_params,
             collate_config=collate_config,
-            dataset_name="val")
+            dataset_name="val",
+            loader_config=_resolve_loader_opts(validation=True))
 
         shuffled_val_loader = build_dataloader(
             val_entries,
@@ -609,7 +634,8 @@ def main(config_path):
             device=device,
             dataset_config=dataset_params,
             collate_config=collate_config,
-            dataset_name="val")
+            dataset_name="val",
+            loader_config=_resolve_loader_opts(validation=True))
 
         steps = len(sorted_train_loader) if sorted_train_loader is not None else len(shuffled_train_loader)
         steps = int(steps)
