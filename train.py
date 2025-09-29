@@ -464,6 +464,173 @@ def cfg_get_nested(cfg: dict, path, default=None, sep="."):
             return default
     return cur
 
+
+def _compute_per_device_batch(target_global_size, world_size, grad_accumulation_steps=1, max_per_device=None):
+    """Return per-device batch size for a desired global batch size.
+
+    Args:
+        target_global_size: Desired effective batch size across all devices and
+            gradient accumulation steps.
+        world_size: Number of data parallel processes.
+        grad_accumulation_steps: Gradient accumulation factor.
+        max_per_device: Optional upper bound for the per-device batch size.
+
+    Returns:
+        Tuple ``(per_device_batch, adjusted_global_batch, was_clamped)``.
+    """
+
+    effective_factor = max(1, int(world_size) * max(1, int(grad_accumulation_steps)))
+    target_global_size = max(1, int(target_global_size))
+    per_device = max(1, int(math.ceil(target_global_size / float(effective_factor))))
+    clamped = False
+
+    if max_per_device is not None:
+        max_per_device = max(1, int(max_per_device))
+        if per_device > max_per_device:
+            per_device = max_per_device
+            target_global_size = per_device * effective_factor
+            clamped = True
+
+    return per_device, target_global_size, clamped
+
+
+def _resolve_distributed_scaling(config, accelerator):
+    """Derive runtime batch scaling and LR behaviour for distributed training."""
+
+    scaling_cfg = cfg_get_nested(config, 'distributed_scaling', {}) or {}
+    if not isinstance(scaling_cfg, dict):
+        scaling_cfg = {}
+
+    enabled = bool(scaling_cfg.get('enabled', True))
+
+    configured_batch_size = int(cfg_get_nested(config, 'batch_size', 10))
+    reference_world_size = max(
+        1,
+        int(
+            scaling_cfg.get(
+                'base_world_size', scaling_cfg.get('reference_world_size', 1)
+            )
+        ),
+    )
+    reference_global_batch_size = max(
+        1,
+        int(
+            scaling_cfg.get(
+                'base_batch_size',
+                scaling_cfg.get('reference_batch_size', configured_batch_size),
+            )
+        ),
+    )
+
+    max_per_device_batch = scaling_cfg.get('max_per_device_batch_size')
+    if max_per_device_batch is None:
+        max_per_device_batch = cfg_get_nested(
+            config, 'max_per_device_batch_size', reference_global_batch_size
+        )
+    max_per_device_batch = max(1, int(max_per_device_batch))
+
+    world_size = max(1, int(getattr(accelerator, 'num_processes', 1)))
+    grad_accumulation_steps = max(
+        1, int(getattr(accelerator, 'gradient_accumulation_steps', 1))
+    )
+    effective_batch_factor = world_size * grad_accumulation_steps
+
+    if enabled:
+        desired_global = int(
+            math.ceil(
+                reference_global_batch_size
+                * (effective_batch_factor / float(reference_world_size))
+            )
+        )
+    else:
+        desired_global = configured_batch_size
+
+    per_device_batch, effective_global_batch, clamped = _compute_per_device_batch(
+        desired_global,
+        world_size,
+        grad_accumulation_steps,
+        max_per_device=max_per_device_batch if enabled else None,
+    )
+
+    if not enabled:
+        effective_global_batch = max(
+            effective_global_batch, per_device_batch * effective_batch_factor
+        )
+
+    lr_scale = 1.0
+    if enabled and reference_global_batch_size > 0:
+        lr_scale = effective_global_batch / float(reference_global_batch_size)
+
+    return {
+        'enabled': enabled,
+        'configured_batch_size': configured_batch_size,
+        'reference_world_size': reference_world_size,
+        'reference_global_batch_size': reference_global_batch_size,
+        'requested_global_batch_size': desired_global,
+        'effective_global_batch_size': effective_global_batch,
+        'per_device_batch_size': per_device_batch,
+        'max_per_device_batch_size': max_per_device_batch,
+        'used_max_per_device_limit': clamped,
+        'data_parallel_world_size': world_size,
+        'grad_accumulation_steps': grad_accumulation_steps,
+        'effective_batch_factor': effective_batch_factor,
+        'learning_rate_scale': lr_scale,
+        'scale_learning_rate': bool(
+            scaling_cfg.get('auto_scale_learning_rate', enabled)
+        ),
+    }
+
+
+def _resolve_eval_batch_size(config, scaling_info):
+    eval_cfg = cfg_get_nested(config, 'eval_params', {}) or {}
+    if not isinstance(eval_cfg, dict):
+        eval_cfg = {}
+
+    base_eval_batch = int(
+        eval_cfg.get('batch_size', scaling_info['reference_global_batch_size'])
+    )
+    reference_eval_world = max(
+        1,
+        int(
+            eval_cfg.get(
+                'base_world_size', scaling_info['reference_world_size']
+            )
+        ),
+    )
+    eval_max_per_device = eval_cfg.get('max_per_device_batch_size')
+    if eval_max_per_device is None:
+        eval_max_per_device = scaling_info['max_per_device_batch_size']
+    eval_max_per_device = max(1, int(eval_max_per_device))
+
+    if scaling_info['enabled']:
+        desired_eval_global = int(
+            math.ceil(
+                base_eval_batch
+                * (
+                    scaling_info['data_parallel_world_size']
+                    / float(reference_eval_world)
+                )
+            )
+        )
+    else:
+        desired_eval_global = base_eval_batch
+
+    eval_per_device, eval_effective_global, eval_clamped = _compute_per_device_batch(
+        desired_eval_global,
+        scaling_info['data_parallel_world_size'],
+        1,
+        max_per_device=eval_max_per_device,
+    )
+
+    return {
+        'configured_batch_size': base_eval_batch,
+        'requested_global_batch_size': desired_eval_global,
+        'per_device_batch_size': eval_per_device,
+        'effective_global_batch_size': eval_effective_global,
+        'used_max_per_device_limit': eval_clamped,
+        'max_per_device_batch_size': eval_max_per_device,
+    }
+
 class EarlyStoppingWithNoLearningRate:
     def __init__(self, patience=5):
         self.patience = patience  # Number of epochs to wait for improvement
@@ -522,7 +689,11 @@ def main(config_path):
         file_handler.setFormatter(logging.Formatter('%(levelname)s:%(asctime)s: %(message)s'))
         logger.addHandler(file_handler)
 
-    configured_global_batch_size = int(cfg_get_nested(config, 'batch_size', 10))
+    scaling_info = _resolve_distributed_scaling(config, accelerator)
+    config.setdefault('runtime', {})
+    config['runtime']['distributed_scaling'] = scaling_info
+
+    configured_global_batch_size = scaling_info['configured_batch_size']
     epochs = cfg_get_nested(config, 'epochs', 200)
     save_freq = cfg_get_nested(config, 'save_freq', 10)
     train_path = cfg_get_nested(config, 'train_data', None)
@@ -532,11 +703,11 @@ def main(config_path):
     device = accelerator.device
     device_str = str(device)
 
-    data_parallel_world_size = max(1, int(accelerator.num_processes))
-    grad_accumulation_steps = max(1, int(getattr(accelerator, 'gradient_accumulation_steps', 1)))
-    effective_batch_factor = max(1, data_parallel_world_size * grad_accumulation_steps)
-    batch_size = max(1, int(math.ceil(configured_global_batch_size / float(effective_batch_factor))))
-    effective_global_batch_size = batch_size * effective_batch_factor
+    data_parallel_world_size = scaling_info['data_parallel_world_size']
+    grad_accumulation_steps = scaling_info['grad_accumulation_steps']
+    effective_batch_factor = scaling_info['effective_batch_factor']
+    batch_size = scaling_info['per_device_batch_size']
+    effective_global_batch_size = scaling_info['effective_global_batch_size']
 
     if accelerator.is_main_process:
         if data_parallel_world_size > 1 or grad_accumulation_steps > 1:
@@ -544,7 +715,24 @@ def main(config_path):
                 "Using %d data parallel process(es) with %d gradient accumulation step(s)."
                 % (data_parallel_world_size, grad_accumulation_steps)
             )
-        if effective_global_batch_size != configured_global_batch_size:
+        if scaling_info['enabled']:
+            print_fn(
+                "[Scaling] Reference global batch size %d on %d device(s) -> requested %d. "
+                "Per-device batch size set to %d for an effective global batch of %d."
+                % (
+                    scaling_info['reference_global_batch_size'],
+                    scaling_info['reference_world_size'],
+                    scaling_info['requested_global_batch_size'],
+                    batch_size,
+                    effective_global_batch_size,
+                )
+            )
+            if scaling_info['used_max_per_device_limit']:
+                print_fn(
+                    "[Scaling] Per-device batch size capped at %d due to configured limits."
+                    % (scaling_info['max_per_device_batch_size'],)
+                )
+        elif effective_global_batch_size != configured_global_batch_size:
             print_fn(
                 "Configured global batch size %d mapped to per-device batch size %d for an effective global size of %d."
                 % (
@@ -553,6 +741,36 @@ def main(config_path):
                     effective_global_batch_size,
                 )
             )
+
+    optimizer_params_cfg = cfg_get_nested(config, 'optimizer_params', {}) or {}
+    if not isinstance(optimizer_params_cfg, dict):
+        optimizer_params_cfg = {}
+    optimizer_params_cfg = dict(optimizer_params_cfg)
+    base_lr = float(optimizer_params_cfg.get('base_lr', optimizer_params_cfg.get('lr', 5e-4)))
+    lr_scale_factor = scaling_info['learning_rate_scale'] if scaling_info['scale_learning_rate'] else 1.0
+    scaled_lr = base_lr * lr_scale_factor
+    optimizer_params_cfg['base_lr'] = base_lr
+    optimizer_params_cfg['lr'] = scaled_lr
+    optimizer_params_cfg['effective_lr'] = scaled_lr
+    optimizer_params_cfg['lr_scale_factor'] = lr_scale_factor
+    config['optimizer_params'] = optimizer_params_cfg
+
+    config['runtime']['learning_rate'] = {
+        'base_lr': base_lr,
+        'scaled_lr': scaled_lr,
+        'scale_factor': lr_scale_factor,
+        'auto_scaled': scaling_info['scale_learning_rate'],
+    }
+
+    if (
+        accelerator.is_main_process
+        and scaling_info['scale_learning_rate']
+        and not math.isclose(lr_scale_factor, 1.0, rel_tol=1e-6)
+    ):
+        print_fn(
+            "[Scaling] Learning rate scaled from %.6f to %.6f (factor %.3f)."
+            % (base_lr, scaled_lr, lr_scale_factor)
+        )
 
     dataset_params = {
         'dict_path': cfg_get_nested(config, 'phoneme_maps_path', 'Data/word_index_dict.txt'),
@@ -617,22 +835,36 @@ def main(config_path):
     val_num_workers = int(dataloader_params.get('val_num_workers', 2))
     train_bucket_sampler_config = dataloader_params.get('train_bucket_sampler', {})
 
-    base_eval_global_batch_size = int(
-        cfg_get_nested(config, 'eval_params.batch_size', configured_global_batch_size)
-    )
-    base_eval_batch_size = max(
-        1, int(math.ceil(base_eval_global_batch_size / float(data_parallel_world_size)))
-    )
-    effective_eval_global_batch_size = base_eval_batch_size * data_parallel_world_size
-    if accelerator.is_main_process and effective_eval_global_batch_size != base_eval_global_batch_size:
-        print_fn(
-            "Configured evaluation batch size %d mapped to per-device batch size %d for an effective global size of %d."
-            % (
-                base_eval_global_batch_size,
-                base_eval_batch_size,
-                effective_eval_global_batch_size,
+    eval_scaling = _resolve_eval_batch_size(config, scaling_info)
+    config['runtime']['evaluation_batch_scaling'] = eval_scaling
+
+    base_eval_batch_size = eval_scaling['per_device_batch_size']
+    effective_eval_global_batch_size = eval_scaling['effective_global_batch_size']
+    if accelerator.is_main_process:
+        if scaling_info['enabled']:
+            print_fn(
+                "[Scaling] Evaluation global batch %d -> requested %d. Per-device evaluation batch size %d (effective %d)."
+                % (
+                    eval_scaling['configured_batch_size'],
+                    eval_scaling['requested_global_batch_size'],
+                    base_eval_batch_size,
+                    effective_eval_global_batch_size,
+                )
             )
-        )
+        elif effective_eval_global_batch_size != eval_scaling['configured_batch_size']:
+            print_fn(
+                "Configured evaluation batch size %d mapped to per-device batch size %d for an effective global size of %d."
+                % (
+                    eval_scaling['configured_batch_size'],
+                    base_eval_batch_size,
+                    effective_eval_global_batch_size,
+                )
+            )
+        if eval_scaling['used_max_per_device_limit']:
+            print_fn(
+                "[Scaling] Evaluation per-device batch size capped at %d due to configured limits."
+                % (eval_scaling['max_per_device_batch_size'],)
+            )
 
     curriculum_batch_cfg = cfg_get_nested(config, 'training_curriculum.batch_size_schedule', {}) or {}
 
@@ -971,6 +1203,9 @@ def main(config_path):
         'gradient_accumulation_steps': grad_accumulation_steps,
         'optimizer_steps_per_epoch': per_epoch_optimizer_steps,
         'total_steps': total_training_steps,
+        'lr_scale_factor': lr_scale_factor,
+        'reference_global_batch_size': scaling_info['reference_global_batch_size'],
+        'effective_global_batch_size': effective_global_batch_size,
     }
     config['scheduler_params'] = scheduler_params
 

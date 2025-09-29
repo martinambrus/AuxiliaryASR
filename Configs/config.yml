@@ -3,6 +3,23 @@ save_freq: 10
 device: "cuda"
 epochs: 200
 batch_size: 64
+
+distributed_scaling:
+  enabled: true
+  # Number of GPUs (or processes) used when the baseline hyperparameters were
+  # tuned. The trainer scales batch sizes and learning rates relative to this
+  # reference setup.
+  base_world_size: 1
+  # Baseline effective global batch size that worked well on ``base_world_size``
+  # device(s). When running with more GPUs the trainer multiplies this value by
+  # the ratio of world sizes so that each device keeps a similar per-GPU load.
+  base_batch_size: 64
+  # Hard limit for per-device batch size to avoid running out of memory.
+  max_per_device_batch_size: 64
+  # Automatically scale the learning rate in proportion to the effective global
+  # batch size.
+  auto_scale_learning_rate: true
+
 pretrained_model: true
 load_only_params: false
 train_data: "Data/train_list.txt"
