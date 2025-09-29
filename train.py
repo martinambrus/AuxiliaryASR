@@ -488,6 +488,11 @@ def main(config_path):
     accelerator_kwargs = {}
     ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
     accelerator_kwargs['kwargs_handlers'] = [ddp_kwargs]
+    # ``split_batches`` defaults to ``True`` which would further subdivide each
+    # dataloader batch across data-parallel workers.  The training scripts
+    # already size batches per device, so keep them intact by disabling that
+    # behaviour explicitly.
+    accelerator_kwargs['split_batches'] = False
     if desired_device.startswith('cpu'):
         accelerator_kwargs['cpu'] = True
 
@@ -825,9 +830,21 @@ def main(config_path):
                                 % (min_prepared_steps, max_prepared_steps)
                             )
 
-                per_rank_steps = max_prepared_steps
-                if raw_steps > 0 and per_rank_steps > 0:
-                    inferred = int(round(raw_steps / float(per_rank_steps)))
+                planned_steps = max(raw_steps, max_prepared_steps)
+                per_rank_steps = planned_steps
+                if (
+                    accelerator.is_main_process
+                    and max_prepared_steps < raw_steps
+                ):
+                    print_fn(
+                        "[Scheduler] Detected that accelerate split dataloader batches "
+                        "(%d -> %d steps per rank). Using the unsplit length for LR "
+                        "planning; consider launching with split_batches=False if this "
+                        "was unintended."
+                        % (raw_steps, max_prepared_steps)
+                    )
+                if raw_steps > 0 and max_prepared_steps > 0:
+                    inferred = int(round(raw_steps / float(max_prepared_steps)))
                     inferred_world_size = max(
                         1, min(data_parallel_world_size, inferred)
                     )
@@ -837,7 +854,17 @@ def main(config_path):
             per_rank_steps = raw_steps
 
         per_rank_steps = max(1, int(per_rank_steps))
-        per_rank_samples = per_rank_steps * current_batch_size
+        dataset_items = max(len(train_entries), len(train_list_sorted))
+        per_rank_dataset_estimate = max(
+            1,
+            int(
+                math.ceil(
+                    dataset_items
+                    / float(max(1, inferred_world_size))
+                )
+            ),
+        )
+        per_rank_samples = max(per_rank_steps * current_batch_size, per_rank_dataset_estimate)
 
         return (
             prepared_sorted_train,
