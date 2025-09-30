@@ -589,7 +589,6 @@ class ASRCNN(nn.Module):
         if needs_ctc_sharing_remap:
             optional_prefixes_set.discard("ctc_state_projector")
             optional_prefixes_set.discard("ctc_classifier")
-            optional_prefixes_set.discard("ctc_seq2seq_adapter")
 
         if optional_prefixes_set:
             def _is_optional(key):
