@@ -570,10 +570,30 @@ class ASRCNN(nn.Module):
                 for key, value in state_dict.items()
             )
 
-        optional_prefixes = self._optional_state_prefixes()
-        if optional_prefixes:
+        optional_prefixes = list(self._optional_state_prefixes())
+        optional_prefixes_set = set(optional_prefixes)
+
+        def _has_prefix(prefix: str) -> bool:
+            return any(key.startswith(prefix) for key in state_dict.keys())
+
+        needs_ctc_sharing_remap = (
+            not self.enable_ctc_seq2seq_sharing
+            and self.ctc_linear is not None
+            and not any(key.startswith("ctc_linear.") for key in state_dict.keys())
+            and (
+                _has_prefix("ctc_state_projector.")
+                or _has_prefix("ctc_classifier.")
+            )
+        )
+
+        if needs_ctc_sharing_remap:
+            optional_prefixes_set.discard("ctc_state_projector")
+            optional_prefixes_set.discard("ctc_classifier")
+            optional_prefixes_set.discard("ctc_seq2seq_adapter")
+
+        if optional_prefixes_set:
             def _is_optional(key):
-                return any(key.startswith(prefix) for prefix in optional_prefixes)
+                return any(key.startswith(prefix) for prefix in optional_prefixes_set)
 
             filtered_state = state_dict.__class__(
                 (key, value) for key, value in state_dict.items() if not _is_optional(key)
@@ -583,6 +603,23 @@ class ASRCNN(nn.Module):
 
         remapped = filtered_state.__class__()
         for key, value in filtered_state.items():
+            if needs_ctc_sharing_remap and not self.enable_ctc_seq2seq_sharing:
+                if key.startswith('ctc_state_projector.linear_layer.'):
+                    new_key = key.replace(
+                        'ctc_state_projector.linear_layer.',
+                        'ctc_linear.0.linear_layer.',
+                        1,
+                    )
+                    remapped[new_key] = value
+                    continue
+                if key.startswith('ctc_classifier.linear_layer.'):
+                    new_key = key.replace(
+                        'ctc_classifier.linear_layer.',
+                        'ctc_linear.2.linear_layer.',
+                        1,
+                    )
+                    remapped[new_key] = value
+                    continue
             if self.enable_ctc_seq2seq_sharing and key.startswith('ctc_linear.'):
                 if key.startswith('ctc_linear.0.'):
                     key = key.replace('ctc_linear.0.', 'ctc_state_projector.linear_layer.', 1)
