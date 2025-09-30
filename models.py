@@ -581,8 +581,38 @@ class ASRCNN(nn.Module):
         else:
             filtered_state = state_dict
 
+        has_new_ctc_linear = any(key.startswith("ctc_linear.") for key in filtered_state)
+        has_legacy_ctc_heads = any(
+            key.startswith("ctc_state_projector.") or key.startswith("ctc_classifier.")
+            for key in filtered_state
+        )
+        merge_legacy_ctc = (
+            self.use_ctc
+            and not self.enable_ctc_seq2seq_sharing
+            and self.ctc_linear is not None
+            and not has_new_ctc_linear
+            and has_legacy_ctc_heads
+        )
+
         remapped = filtered_state.__class__()
         for key, value in filtered_state.items():
+            if merge_legacy_ctc:
+                if key.startswith("ctc_state_projector.linear_layer."):
+                    new_key = key.replace(
+                        "ctc_state_projector.linear_layer.",
+                        "ctc_linear.0.linear_layer.",
+                        1,
+                    )
+                    remapped[new_key] = value
+                    continue
+                if key.startswith("ctc_classifier.linear_layer."):
+                    new_key = key.replace(
+                        "ctc_classifier.linear_layer.",
+                        "ctc_linear.2.linear_layer.",
+                        1,
+                    )
+                    remapped[new_key] = value
+                    continue
             if self.enable_ctc_seq2seq_sharing and key.startswith('ctc_linear.'):
                 if key.startswith('ctc_linear.0.'):
                     key = key.replace('ctc_linear.0.', 'ctc_state_projector.linear_layer.', 1)
