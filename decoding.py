@@ -309,12 +309,19 @@ class CTCBeamSearchDecoder:
                     neural_state = hyp.neural_state
                     cold_bonus = 0.0
                     if self.cold_fusion_lm is not None and self.cold_fusion is not None:
-                        lm_log_prob, new_neural_state = self.cold_fusion_lm.score(
-                            hyp.neural_state, symbol
-                        )
-                        cold_bonus = self.cold_fusion.fusion_bonus(
-                            new_neural_state, lm_log_prob
-                        )
+                        if neural_state is None:
+                            neural_state = self.cold_fusion_lm.start()
+
+                        if 0 <= symbol < self.cold_fusion_lm.vocab_size:
+                            lm_log_prob, new_neural_state = self.cold_fusion_lm.score(
+                                neural_state, symbol
+                            )
+                            cold_bonus = self.cold_fusion.fusion_bonus(
+                                new_neural_state, lm_log_prob
+                            )
+                        else:
+                            lm_log_prob = None
+                            new_neural_state = neural_state
                     else:
                         lm_log_prob = None
                         new_neural_state = neural_state
