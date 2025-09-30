@@ -475,6 +475,9 @@ class ASRCNN(nn.Module):
             ctc_logit = self.ctc_linear(decoder_memory)
             outputs["ctc_logits"] = ctc_logit
 
+        if "logits_ctc" not in outputs and isinstance(outputs.get("ctc_logits"), torch.Tensor):
+            outputs["logits_ctc"] = outputs["ctc_logits"]
+
         outputs["encoder_features"] = decoder_memory
         if shared_states is not None:
             outputs["ctc_seq2seq_shared_states"] = shared_states
