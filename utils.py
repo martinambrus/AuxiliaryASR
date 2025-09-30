@@ -256,8 +256,12 @@ def build_dev_dataloader_from_config(
         if "spec_augment" in dataset_overrides:
             dataset_config["spec_augment_params"] = dataset_overrides["spec_augment"]
         for key, value in dataset_overrides.items():
-            if key in {"dict_path", "sr", "spect_params", "mel_params", "spec_augment"}:
+            if key in {"dict_path", "sr", "spect_params", "mel_params"}:
                 dataset_config[key] = value
+            elif key == "spec_augment":
+                # SpecAugment configuration is passed via the dedicated
+                # ``spec_augment_params`` argument expected by ``MelDataset``.
+                continue
             elif key not in dataset_config:
                 dataset_config[key] = value
 
