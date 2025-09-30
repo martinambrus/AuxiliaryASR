@@ -3,6 +3,7 @@ import os
 import os.path as osp
 import sys
 import time
+import warnings
 from collections import defaultdict
 
 import matplotlib
@@ -18,6 +19,10 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from decoding import build_decoder_from_config
+from meldataset import build_dataloader
+from models import build_model
+from phoneme_dictionary import load_phoneme_dictionary
+from token_map import build_token_map_from_data
 
 
 def select_logits_from_output(model_output, preferred_order=(
@@ -66,6 +71,225 @@ def select_logits_from_output(model_output, preferred_order=(
         "Expected model output to be a tensor or dict, got "
         f"{type(model_output)!r} instead"
     )
+
+
+def _cfg_get_nested(cfg: Dict, path, default=None, sep: str = "."):
+    """Retrieve a nested value from a dictionary.
+
+    Args:
+        cfg: Configuration dictionary to traverse.
+        path: Either a dot-separated string or a sequence with the keys that
+            should be followed.
+        default: Value returned when any of the keys is missing.
+        sep: Separator used when ``path`` is provided as a string.
+
+    Returns:
+        The resolved value or ``default`` when the path cannot be followed.
+    """
+
+    if isinstance(path, str):
+        keys = path.split(sep)
+    else:
+        keys = list(path)
+
+    current = cfg
+    for key in keys:
+        if isinstance(current, dict) and key in current:
+            current = current[key]
+        else:
+            return default
+    return current
+
+
+def load_asr_model_from_config(config: Dict, model_path: str, device: torch.device):
+    """Instantiate and load an ASR model using the training configuration.
+
+    The helper mirrors the logic used by the training entry-point so notebooks
+    can easily bootstrap a model for analysis without re-implementing the setup
+    steps.
+
+    Args:
+        config: Parsed configuration dictionary.
+        model_path: Filesystem path to the checkpoint that should be restored.
+        device: Target device where the model will be moved.
+
+    Returns:
+        Tuple ``(model, token_map)`` containing the loaded model in evaluation
+        mode together with the phoneme-to-index mapping used during training.
+    """
+
+    if not isinstance(config, dict):
+        raise TypeError("config must be a dictionary")
+
+    if not model_path:
+        raise ValueError("model_path must be provided")
+
+    checkpoint_path = Path(model_path)
+    if not checkpoint_path.is_file():
+        raise FileNotFoundError(f"Checkpoint file '{model_path}' not found")
+
+    dictionary_cfg = _cfg_get_nested(config, "phoneme_dictionary", {}) or {}
+    dictionary_path = _cfg_get_nested(config, "phoneme_maps_path", None)
+
+    if dictionary_path and Path(dictionary_path).is_file():
+        token_map = load_phoneme_dictionary(dictionary_path, config=dictionary_cfg)
+    else:
+        train_path = _cfg_get_nested(config, "train_data", None)
+        val_path = _cfg_get_nested(config, "val_data", None)
+        token_map = build_token_map_from_data(train_path, val_path)
+
+    if not token_map:
+        raise RuntimeError("Failed to build phoneme dictionary from configuration")
+
+    inferred_n_token = max(int(idx) for idx in token_map.values()) + 1
+
+    default_model_params = {
+        "input_dim": 80,
+        "hidden_dim": 256,
+        "token_embedding_dim": 512,
+        "n_layers": 5,
+        "location_kernel_size": 31,
+    }
+    model_params = dict(_cfg_get_nested(config, "model_params", default_model_params) or default_model_params)
+    model_params.setdefault("input_dim", default_model_params["input_dim"])
+    model_params.setdefault("hidden_dim", default_model_params["hidden_dim"])
+    model_params.setdefault("token_embedding_dim", default_model_params["token_embedding_dim"])
+    model_params.setdefault("n_layers", default_model_params["n_layers"])
+    model_params.setdefault("location_kernel_size", default_model_params["location_kernel_size"])
+
+    configured_tokens = int(model_params.get("n_token", inferred_n_token))
+    model_params["n_token"] = max(configured_tokens, inferred_n_token)
+
+    multi_task_config = dict(_cfg_get_nested(config, "multi_task", {}) or {})
+    frame_cfg = multi_task_config.get("frame_phoneme")
+    if isinstance(frame_cfg, dict) and frame_cfg.get("enabled", False):
+        classes = int(frame_cfg.get("num_classes", 0))
+        if classes <= 0:
+            frame_cfg = dict(frame_cfg)
+            frame_cfg["num_classes"] = model_params["n_token"]
+            multi_task_config["frame_phoneme"] = frame_cfg
+
+    model_params["multi_task_config"] = multi_task_config
+    model_params["stabilization_config"] = dict(_cfg_get_nested(config, "stabilization", {}) or {})
+    model_params["memory_optimization_config"] = dict(_cfg_get_nested(config, "memory_optimizations", {}) or {})
+
+    model = build_model(model_params=model_params)
+
+    checkpoint = torch.load(str(checkpoint_path), map_location="cpu")
+    state_dict = checkpoint.get("model") if isinstance(checkpoint, dict) else checkpoint
+    if not isinstance(state_dict, dict):
+        raise RuntimeError(f"Checkpoint at '{model_path}' does not contain a valid state dict")
+
+    missing_keys, unexpected_keys = model.load_state_dict(state_dict, strict=False)
+    if missing_keys:
+        warnings.warn(f"Missing parameters when loading the checkpoint: {missing_keys}")
+    if unexpected_keys:
+        warnings.warn(f"Unexpected parameters in checkpoint: {unexpected_keys}")
+
+    model.to(device)
+    model.eval()
+
+    return model, token_map
+
+
+def _parse_metadata_file(path: str) -> List[List[str]]:
+    entries: List[List[str]] = []
+    metadata_path = Path(path)
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"Validation metadata file '{path}' not found")
+
+    with metadata_path.open("r", encoding="utf-8") as handle:
+        for line_number, raw in enumerate(handle, 1):
+            cleaned = raw.rstrip("\n")
+            if not cleaned.strip():
+                continue
+
+            parts = cleaned.split("|")
+            if len(parts) < 2:
+                raise ValueError(f"Malformed metadata line {line_number} in '{path}': {cleaned!r}")
+
+            wave_path = parts[0].strip()
+            if len(parts) == 2:
+                text = parts[1]
+                speaker_id = ""
+            else:
+                text = "|".join(parts[1:-1])
+                speaker_id = parts[-1].strip()
+
+            entries.append([wave_path, text, speaker_id])
+
+    if not entries:
+        raise RuntimeError(f"No entries found in metadata file '{path}'")
+
+    return entries
+
+
+def build_dev_dataloader_from_config(
+    config: Dict,
+    device: torch.device,
+    batch_size: Optional[int] = None,
+    num_workers: Optional[int] = None,
+):
+    """Construct the validation dataloader using configuration defaults."""
+
+    if not isinstance(config, dict):
+        raise TypeError("config must be a dictionary")
+
+    val_metadata_path = _cfg_get_nested(config, "val_data", "Data/val_list.txt")
+    val_entries = _parse_metadata_file(val_metadata_path)
+
+    dataset_config = {
+        "dict_path": _cfg_get_nested(config, "phoneme_maps_path", "Data/word_index_dict.txt"),
+        "sr": int(_cfg_get_nested(config, "preprocess_params.sr", 24000)),
+        "spect_params": dict(_cfg_get_nested(config, "preprocess_params.spect_params", {
+            "n_fft": 1024,
+            "win_length": 1024,
+            "hop_length": 300,
+        }) or {}),
+        "mel_params": dict(_cfg_get_nested(config, "preprocess_params.mel_params", {"n_mels": 80}) or {}),
+        "phoneme_dictionary_config": _cfg_get_nested(config, "phoneme_dictionary", {}) or {},
+        "mel_cache": _cfg_get_nested(config, "mel_cache", {}) or {},
+    }
+
+    dataset_overrides = _cfg_get_nested(config, "dataset_params", {}) or {}
+    if isinstance(dataset_overrides, dict):
+        if "spec_augment" in dataset_overrides:
+            dataset_config["spec_augment_params"] = dataset_overrides["spec_augment"]
+        for key, value in dataset_overrides.items():
+            if key in {"dict_path", "sr", "spect_params", "mel_params", "spec_augment"}:
+                dataset_config[key] = value
+            elif key not in dataset_config:
+                dataset_config[key] = value
+
+    eval_batch_size = batch_size if batch_size is not None else int(
+        _cfg_get_nested(
+            config,
+            "eval_params.batch_size",
+            _cfg_get_nested(config, "batch_size", 1),
+        )
+    )
+
+    dataloader_params = _cfg_get_nested(config, "dataloader_params", {}) or {}
+    val_workers = num_workers if num_workers is not None else int(dataloader_params.get("val_num_workers", 2))
+
+    collate_config = {"return_speaker_ids": True}
+    device_str = str(device)
+    if isinstance(device, torch.device):
+        device_str = device.type
+
+    dataloader = build_dataloader(
+        val_entries,
+        batch_size=max(1, int(eval_batch_size)),
+        validation=True,
+        num_workers=max(0, int(val_workers)),
+        device=device_str,
+        dataset_config=dataset_config,
+        collate_config=collate_config,
+        dataset_name="val",
+    )
+
+    return dataloader, val_entries
+
 
 def calc_wer(target, pred, ignore_indexes=[0]):
     target_chars = drop_duplicated(list(filter(lambda x: x not in ignore_indexes, map(str, list(target)))))
