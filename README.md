@@ -101,6 +101,24 @@ loss_weights:
 
 Each augmentation block can be toggled on or off independently through `Configs/config.yml`, allowing you to combine time warping, adaptive masking, frame dropping, VTLP, noise/reverberation mixing (including MUSAN and room impulse responses), and phoneme-level dropout as needed.
 
+#### Keeping the CTC branch expressive
+
+When the auxiliary ASR is trained on only a few hours of speech, the CTC head can collapse into predicting mostly blanks, which hurts diagonal alignments and increases the skip/merge gap. The configuration offers two knobs that counteract this behaviour:
+
+```yaml
+ctc_loss:
+  blank_logit_bias: 1.5      # subtracts a constant from the blank logit before the softmax
+  logit_temperature: 1.1     # flattens the CTC posterior to discourage over-confidence
+
+regularization:
+  entropy:
+    targets:
+      ctc:
+        weight: 0.02         # maximise entropy to keep non-blank symbols active
+```
+
+Additionally, the diagonal attention prior now masks out padded timesteps and exposes a `diagonal_attention_prior_sigma` parameter so that you can tune how tightly the model should follow the diagonal on shorter utterances.
+
 Increasing the warm-up ratio (`optimizer_params.pct_start`) or reducing the batch size can also help when the number of training utterances is limited.
 
 ### Languages

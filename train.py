@@ -985,6 +985,14 @@ def main(config_path):
                 'ctc': {'blank': blank_index, 'reduction': 'none', 'zero_infinity': True},
         }, entropy_params=entropy_params, multi_task_config=multi_task_config)
 
+    ctc_loss_config = cfg_get_nested(config, 'ctc_loss', {}) or {}
+    if not isinstance(ctc_loss_config, dict):
+        ctc_loss_config = {}
+    ctc_blank_bias = float(ctc_loss_config.get('blank_logit_bias', 0.0))
+    ctc_logit_temperature = float(ctc_loss_config.get('logit_temperature', 1.0))
+    if ctc_logit_temperature <= 0:
+        ctc_logit_temperature = 1.0
+
     if enable_early_stopping:
         patience = max([3, int(math.floor(int(cfg_get_nested(config, 'save_freq', 10)) / 2))])
         early_stopping = EarlyStoppingWithNoLearningRate(patience=patience)
@@ -1055,11 +1063,15 @@ def main(config_path):
                     switch_sortagrad_dataset_epoch=cfg_get_nested(config, 'sortagrad_switch_to_shuffled_dataset_epoch', 10),
                     use_diagonal_attention_prior=(cfg_get_nested(config, 'use_diagonal_attention_prior', True) and use_s2s),
                     diagonal_attention_prior_weight=cfg_get_nested(config, 'diagonal_attention_prior_weight', 0.1),
+                    diagonal_attention_prior_sigma=cfg_get_nested(config, 'diagonal_attention_prior_sigma', 0.5),
                     ctc_weight=ctc_weight,
                     s2s_weight=s2s_weight,
                     frame_weight=frame_weight,
                     speaker_weight=speaker_weight,
                     pron_error_weight=pron_weight,
+                    ctc_blank_id=blank_index,
+                    ctc_logit_bias=ctc_blank_bias,
+                    ctc_logit_temperature=ctc_logit_temperature,
                     enable_frame_classifier=frame_cfg.get('enabled', False),
                     enable_speaker=speaker_cfg.get('enabled', False),
                     enable_pronunciation_error=pron_cfg.get('enabled', False),

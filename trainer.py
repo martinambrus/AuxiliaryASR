@@ -42,6 +42,7 @@ class Trainer(object):
                  switch_sortagrad_dataset_epoch = 10,
                  use_diagonal_attention_prior = True,
                  diagonal_attention_prior_weight = 0.1,
+                 diagonal_attention_prior_sigma = 0.5,
                  ctc_weight=1.0,
                  s2s_weight=1.0,
                  frame_weight=0.0,
@@ -50,6 +51,9 @@ class Trainer(object):
                  enable_frame_classifier=False,
                  enable_speaker=False,
                  enable_pronunciation_error=False,
+                 ctc_blank_id=0,
+                 ctc_logit_bias=0.0,
+                 ctc_logit_temperature=1.0,
                  mixspeech_config=None,
                  intermediate_ctc_config=None,
                  self_conditioned_ctc_config=None,
@@ -78,6 +82,8 @@ class Trainer(object):
         self.switch_sortagrad_dataset_epoch = switch_sortagrad_dataset_epoch
         self.use_diagonal_attention_prior = use_diagonal_attention_prior
         self.diagonal_attention_prior_weight = diagonal_attention_prior_weight
+        sigma = float(diagonal_attention_prior_sigma)
+        self.diagonal_attention_prior_sigma = sigma if sigma > 0 else 0.5
         self.maxm_mem_usage = 0
         self.steps_per_epoch = steps_per_epoch if steps_per_epoch is None else int(steps_per_epoch)
         self.ctc_weight = ctc_weight
@@ -88,6 +94,11 @@ class Trainer(object):
         self.enable_frame_classifier = enable_frame_classifier
         self.enable_speaker = enable_speaker
         self.enable_pronunciation_error = enable_pronunciation_error
+
+        self.ctc_blank_id = int(ctc_blank_id)
+        self.ctc_blank_logit_bias = float(ctc_logit_bias)
+        temperature = float(ctc_logit_temperature)
+        self.ctc_logit_temperature = temperature if temperature > 0 else 1.0
 
         self.mixspeech_config = mixspeech_config or {}
         self.mixspeech_enabled = bool(self.mixspeech_config.get('enabled', False))
@@ -196,6 +207,23 @@ class Trainer(object):
                 self.train_dataloader = self.shuffled_train_dataloader
             if self.shuffled_val_dataloader is not None:
                 self.val_dataloader = self.shuffled_val_dataloader
+
+    def _adjust_ctc_logits(self, logits):
+        """Apply optional blank bias and temperature scaling to CTC logits."""
+        if logits is None:
+            return logits
+
+        bias = self.ctc_blank_logit_bias
+        temperature = self.ctc_logit_temperature
+
+        adjusted = logits
+        if bias != 0.0 and 0 <= self.ctc_blank_id < logits.size(-1):
+            adjusted = logits.clone()
+            adjusted[..., self.ctc_blank_id] = adjusted[..., self.ctc_blank_id] - bias
+        if temperature != 1.0:
+            adjusted = adjusted / temperature
+
+        return adjusted
 
     def _get_target_model(self):
         """Return the underlying model, unwrapping accelerator/DDP wrappers."""
@@ -368,6 +396,9 @@ class Trainer(object):
         cfg = self._entropy_target_config(key)
         if cfg is None:
             return None
+
+        if key == 'ctc':
+            logits = self._adjust_ctc_logits(logits)
 
         logits = logits.float()
         probs = torch.softmax(logits, dim=-1)
@@ -734,6 +765,7 @@ class Trainer(object):
         return mixed, metadata
 
     def _compute_ctc_loss(self, logits, targets, input_lengths, target_lengths, mix_metadata=None):
+        logits = self._adjust_ctc_logits(logits)
         ctc = self.criterion['ctc']
         log_probs = logits.log_softmax(dim=2).transpose(0, 1)
         primary_loss = ctc(log_probs, targets, input_lengths, target_lengths)
@@ -961,7 +993,12 @@ class Trainer(object):
                 pron_loss = torch.zeros(1, device=self.device)
 
             if self.use_diagonal_attention_prior and s2s_attn is not None:
-                loss_diagonal = diagonal_attention_prior(s2s_attn, text_input_length, mel_input_length)
+                loss_diagonal = diagonal_attention_prior(
+                    s2s_attn,
+                    text_input_length,
+                    mel_input_length,
+                    sigma=self.diagonal_attention_prior_sigma,
+                )
                 total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
                 losses['diag_attn'] = loss_diagonal.item()
 

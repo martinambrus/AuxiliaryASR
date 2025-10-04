@@ -158,11 +158,16 @@ sortagrad_switch_to_shuffled_dataset_epoch: 10
 
 # make ASR learn to read phonemes from left to right, not randomly
 use_diagonal_attention_prior: True
-diagonal_attention_prior_weight: 0.1
+diagonal_attention_prior_weight: 0.3
+diagonal_attention_prior_sigma: 0.35
 
 # stabilizes ASR training for smaller datasets
 entropy_params:
   label_smoothing: 0.1
+
+ctc_loss:
+  blank_logit_bias: 1.5
+  logit_temperature: 1.1
 
 dataset_params:
   # SpecAugment parameters applied only on the training split.
@@ -271,7 +276,7 @@ loss_weights:
   frame_phoneme: 0.0
   speaker: 0.0
   pronunciation_error: 0.0
-  intermediate_ctc: 0.0
+  intermediate_ctc: 0.3
   # Weight applied to the auxiliary loss from the self-conditioned CTC predictor.
   self_conditioned_ctc: 0.0
 
@@ -286,7 +291,7 @@ regularization:
       # Entropy penalties can be enabled independently for each prediction head.
       ctc:
         enabled: true
-        weight: 0.0
+        weight: 0.02
         length_normalize: true
       s2s:
         enabled: true

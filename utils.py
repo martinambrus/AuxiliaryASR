@@ -400,19 +400,55 @@ def plot_image(image):
 
     return fig
 
-def diagonal_attention_prior(attn, text_lengths, mel_lengths, sigma=0.5):
-    """Calculate diagonal attention loss."""
-    B, T_text, T_mel = attn.size()  # usually [B, T_text, T_mel]
+def diagonal_attention_prior(attn, text_lengths, mel_lengths, sigma=0.5, eps=1.0e-6):
+    """Calculate diagonal attention loss with length-aware masking.
+
+    Args:
+        attn: Attention weights of shape ``[B, T_text, T_mel]``.
+        text_lengths: Tensor containing the valid number of text tokens per batch item.
+        mel_lengths: Tensor containing the valid number of mel frames per batch item.
+        sigma: Controls the width of the diagonal Gaussian prior.
+        eps: Numerical stability constant.
+    """
+
+    if attn is None:
+        raise ValueError("'attn' must be a tensor")
+
+    if sigma <= 0:
+        raise ValueError("'sigma' must be positive")
+
+    B, T_text, T_mel = attn.size()
     device = attn.device
 
-    # Normalize indices
-    text_pos = torch.arange(T_text, device=device).unsqueeze(1).float() / T_text
-    mel_pos = torch.arange(T_mel, device=device).unsqueeze(0).float() / T_mel
-    expected = torch.exp(-((text_pos - mel_pos) ** 2) / (2 * sigma ** 2))  # [T_text, T_mel]
-    expected = expected / expected.max()  # Normalize
+    text_lengths = text_lengths.to(device=device, dtype=torch.float32)
+    mel_lengths = mel_lengths.to(device=device, dtype=torch.float32)
 
-    expected = expected.unsqueeze(0).expand(B, -1, -1)  # [B, T_text, T_mel]
-    loss = torch.mean(attn * (1.0 - expected))  # Encourage attention mass to lie on the diagonal
+    text_positions = torch.arange(T_text, device=device, dtype=torch.float32).view(1, T_text, 1)
+    mel_positions = torch.arange(T_mel, device=device, dtype=torch.float32).view(1, 1, T_mel)
+
+    text_scale = torch.clamp(text_lengths.view(B, 1, 1) - 1.0, min=1.0)
+    mel_scale = torch.clamp(mel_lengths.view(B, 1, 1) - 1.0, min=1.0)
+
+    text_norm = torch.clamp(text_positions / text_scale, 0.0, 1.0)
+    mel_norm = torch.clamp(mel_positions / mel_scale, 0.0, 1.0)
+
+    # Broadcast to [B, T_text, T_mel]
+    text_norm = text_norm.expand(B, -1, -1)
+    mel_norm = mel_norm.expand(B, -1, -1)
+
+    expected = torch.exp(-((text_norm - mel_norm) ** 2) / (2 * sigma ** 2))
+    expected = expected / expected.amax(dim=(1, 2), keepdim=True).clamp_min(eps)
+
+    text_mask = (text_positions.long() < text_lengths.view(B, 1, 1).long()).expand(B, -1, T_mel)
+    mel_mask = (mel_positions.long() < mel_lengths.view(B, 1, 1).long()).expand(B, T_text, -1)
+    valid_mask = text_mask & mel_mask
+
+    mask = valid_mask.to(attn.dtype)
+    denom = mask.sum()
+    if denom.item() <= 0:
+        return torch.tensor(0.0, device=device, dtype=attn.dtype)
+
+    loss = (attn * (1.0 - expected) * mask).sum() / denom
     return loss
 
 
