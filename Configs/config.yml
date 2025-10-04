@@ -286,7 +286,7 @@ regularization:
       # Entropy penalties can be enabled independently for each prediction head.
       ctc:
         enabled: true
-        weight: 0.0
+        weight: 0.05
         length_normalize: true
       s2s:
         enabled: true
@@ -296,13 +296,15 @@ regularization:
 decoding:
   beam_search:
     enabled: true
-    beam_width: 10
+    beam_width: 20
     blank_id: 0
-    length_penalty: 0.0
+    length_penalty: 1.0
     prune_threshold: 1.0e-4
     log_probs_input: false
+    blank_penalty: 0.3
+    logit_temperature: 1.3
   shallow_fusion:
-    enabled: false
+    enabled: true
     lm_path: null  # path to whitespace-separated phoneme n-gram counts
     order: 3
     vocab_size: 40

@@ -225,6 +225,8 @@ class CTCBeamSearchDecoder:
         cold_fusion: Optional[ColdFusionCombiner] = None,
         length_penalty: float = 0.0,
         prune_threshold: float = 1e-6,
+        blank_penalty: float = 0.0,
+        logit_temperature: float = 1.0,
     ) -> None:
         self.beam_width = max(1, int(beam_width))
         self.blank_id = int(blank_id)
@@ -235,6 +237,10 @@ class CTCBeamSearchDecoder:
         self.cold_fusion = cold_fusion
         self.length_penalty = float(length_penalty)
         self.prune_threshold = float(prune_threshold)
+        self.blank_penalty = max(0.0, float(blank_penalty))
+        self.logit_temperature = float(logit_temperature)
+        if self.logit_temperature <= 0.0:
+            raise ValueError("logit_temperature must be positive")
 
     def _init_hypothesis(self) -> Hypothesis:
         shallow_state = self.shallow_fusion_lm.start() if self.shallow_fusion_lm else None
@@ -260,6 +266,8 @@ class CTCBeamSearchDecoder:
 
     def decode_single(self, logits: torch.Tensor, seq_len: int) -> List[int]:
         if not self.log_probs_input:
+            if self.logit_temperature != 1.0:
+                logits = logits / self.logit_temperature
             log_probs = F.log_softmax(logits, dim=-1)
         else:
             log_probs = logits
@@ -281,7 +289,7 @@ class CTCBeamSearchDecoder:
                 total_log_prob = hyp.score
 
                 # Extend with blank
-                blank_log_prob = frame[self.blank_id].item()
+                blank_log_prob = frame[self.blank_id].item() - self.blank_penalty
                 new_blank_prob = total_log_prob + blank_log_prob
                 updated = candidates.setdefault(hyp.prefix, Hypothesis(prefix=hyp.prefix))
                 updated.log_prob_blank = _log_sum_exp(updated.log_prob_blank, new_blank_prob)
@@ -429,6 +437,8 @@ def build_decoder_from_config(config: dict) -> Optional[CTCBeamSearchDecoder]:
         cold_fusion=cold_combiner,
         length_penalty=beam_cfg.get("length_penalty", 0.0),
         prune_threshold=beam_cfg.get("prune_threshold", 1e-6),
+        blank_penalty=beam_cfg.get("blank_penalty", 0.0),
+        logit_temperature=beam_cfg.get("logit_temperature", 1.0),
     )
     return decoder
 
