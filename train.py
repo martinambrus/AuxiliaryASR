@@ -992,6 +992,9 @@ def main(config_path):
     ctc_logit_temperature = float(ctc_loss_config.get('logit_temperature', 1.0))
     if ctc_logit_temperature <= 0:
         ctc_logit_temperature = 1.0
+    ctc_regularization_config = ctc_loss_config.get('regularization', {}) or {}
+    if not isinstance(ctc_regularization_config, dict):
+        ctc_regularization_config = {}
 
     if enable_early_stopping:
         patience = max([3, int(math.floor(int(cfg_get_nested(config, 'save_freq', 10)) / 2))])
@@ -1072,6 +1075,7 @@ def main(config_path):
                     ctc_blank_id=blank_index,
                     ctc_logit_bias=ctc_blank_bias,
                     ctc_logit_temperature=ctc_logit_temperature,
+                    ctc_regularization_config=ctc_regularization_config,
                     enable_frame_classifier=frame_cfg.get('enabled', False),
                     enable_speaker=speaker_cfg.get('enabled', False),
                     enable_pronunciation_error=pron_cfg.get('enabled', False),

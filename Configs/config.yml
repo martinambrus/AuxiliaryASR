@@ -166,8 +166,21 @@ entropy_params:
   label_smoothing: 0.1
 
 ctc_loss:
-  blank_logit_bias: 1.5
-  logit_temperature: 1.1
+  blank_logit_bias: 1.0
+  logit_temperature: 1.05
+  regularization:
+    blank_rate:
+      enabled: true
+      weight: 0.4
+      target: 0.64
+      tolerance: 0.04
+      warmup_epochs: 3
+    coverage:
+      enabled: true
+      weight: 0.3
+      min_ratio: 0.95
+      tolerance: 0.05
+      warmup_epochs: 3
 
 dataset_params:
   # SpecAugment parameters applied only on the training split.

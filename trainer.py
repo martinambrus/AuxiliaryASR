@@ -54,6 +54,7 @@ class Trainer(object):
                  ctc_blank_id=0,
                  ctc_logit_bias=0.0,
                  ctc_logit_temperature=1.0,
+                 ctc_regularization_config=None,
                  mixspeech_config=None,
                  intermediate_ctc_config=None,
                  self_conditioned_ctc_config=None,
@@ -99,6 +100,22 @@ class Trainer(object):
         self.ctc_blank_logit_bias = float(ctc_logit_bias)
         temperature = float(ctc_logit_temperature)
         self.ctc_logit_temperature = temperature if temperature > 0 else 1.0
+
+        ctc_reg_cfg = ctc_regularization_config or {}
+        if not isinstance(ctc_reg_cfg, dict):
+            ctc_reg_cfg = {}
+
+        blank_reg_cfg = ctc_reg_cfg.get('blank_rate', {}) or {}
+        if not isinstance(blank_reg_cfg, dict):
+            blank_reg_cfg = {}
+        self.ctc_blank_rate_regularization_enabled = bool(blank_reg_cfg.get('enabled', False))
+        self.ctc_blank_rate_regularization_config = blank_reg_cfg
+
+        coverage_reg_cfg = ctc_reg_cfg.get('coverage', {}) or {}
+        if not isinstance(coverage_reg_cfg, dict):
+            coverage_reg_cfg = {}
+        self.ctc_coverage_regularization_enabled = bool(coverage_reg_cfg.get('enabled', False))
+        self.ctc_coverage_regularization_config = coverage_reg_cfg
 
         self.mixspeech_config = mixspeech_config or {}
         self.mixspeech_enabled = bool(self.mixspeech_config.get('enabled', False))
@@ -224,6 +241,153 @@ class Trainer(object):
             adjusted = adjusted / temperature
 
         return adjusted
+
+    def _ctc_regularization_warmup_passed(self, cfg):
+        if cfg is None:
+            return False
+        warmup = int(cfg.get('warmup_epochs', 0))
+        if warmup <= 0:
+            return True
+        return self.epochs >= max(warmup, 0)
+
+    def _compute_ctc_alignment_regularization(self, logits, input_lengths, target_lengths):
+        if logits is None:
+            return {}, {}
+
+        enabled = self.ctc_blank_rate_regularization_enabled or self.ctc_coverage_regularization_enabled
+        if not enabled:
+            return {}, {}
+
+        adjusted = self._adjust_ctc_logits(logits)
+        probs = torch.softmax(adjusted.float(), dim=-1)
+
+        reg_losses = {}
+        reg_stats = {}
+
+        if self.ctc_blank_rate_regularization_enabled:
+            blank_cfg = self.ctc_blank_rate_regularization_config
+            if self._ctc_regularization_warmup_passed(blank_cfg):
+                blank_result = self._compute_ctc_blank_rate_regularization(probs, input_lengths, blank_cfg)
+                if blank_result is not None:
+                    loss_value, stats = blank_result
+                    reg_losses['ctc/blank_rate_reg'] = loss_value
+                    reg_stats.update(stats)
+
+        if self.ctc_coverage_regularization_enabled:
+            coverage_cfg = self.ctc_coverage_regularization_config
+            if self._ctc_regularization_warmup_passed(coverage_cfg):
+                coverage_result = self._compute_ctc_coverage_regularization(
+                    probs, input_lengths, target_lengths, coverage_cfg
+                )
+                if coverage_result is not None:
+                    loss_value, stats = coverage_result
+                    reg_losses['ctc/coverage_reg'] = loss_value
+                    reg_stats.update(stats)
+
+        return reg_losses, reg_stats
+
+    def _compute_ctc_blank_rate_regularization(self, probs, input_lengths, cfg):
+        blank_id = self.ctc_blank_id
+        if blank_id < 0 or blank_id >= probs.size(-1):
+            return None
+
+        weight = float(cfg.get('weight', 0.0))
+        if weight == 0.0:
+            return None
+
+        blank_probs = probs[..., blank_id]
+        if blank_probs.dim() != 2:
+            return None
+
+        mask = None
+        if input_lengths is not None:
+            if not torch.is_tensor(input_lengths):
+                input_lengths = torch.as_tensor(input_lengths, device=blank_probs.device)
+            input_lengths = input_lengths.to(device=blank_probs.device, dtype=torch.long)
+            max_len = blank_probs.size(1)
+            mask = torch.arange(max_len, device=blank_probs.device).unsqueeze(0)
+            mask = mask < input_lengths.unsqueeze(1)
+            mask = mask.to(blank_probs.dtype)
+
+        if mask is not None:
+            effective = mask.sum(dim=1).clamp_min(1.0)
+            blank_rate = (blank_probs * mask).sum(dim=1) / effective
+        else:
+            blank_rate = blank_probs.mean(dim=1)
+
+        target = float(cfg.get('target', cfg.get('target_blank_rate', 0.65)))
+        tolerance = float(cfg.get('tolerance', 0.0))
+        upper = min(max(target + tolerance, 0.0), 1.0)
+        lower = max(min(target - tolerance, 1.0), 0.0)
+
+        over_penalty = torch.clamp(blank_rate - upper, min=0.0)
+        if bool(cfg.get('penalize_low_blank', False)):
+            under_penalty = torch.clamp(lower - blank_rate, min=0.0)
+        else:
+            under_penalty = torch.zeros_like(over_penalty)
+
+        penalty = over_penalty + under_penalty
+        loss_value = penalty.mean() * weight
+
+        stats = {
+            'diagnostics/ctc_blank_rate': float(blank_rate.mean().detach().item()),
+        }
+        return loss_value, stats
+
+    def _compute_ctc_coverage_regularization(self, probs, input_lengths, target_lengths, cfg):
+        blank_id = self.ctc_blank_id
+        if blank_id < 0 or blank_id >= probs.size(-1):
+            return None
+
+        weight = float(cfg.get('weight', 0.0))
+        if weight == 0.0:
+            return None
+
+        if target_lengths is None:
+            return None
+        if not torch.is_tensor(target_lengths):
+            target_lengths = torch.as_tensor(target_lengths, device=probs.device)
+        target_lengths = target_lengths.to(device=probs.device, dtype=torch.float32)
+
+        non_blank = 1.0 - probs[..., blank_id]
+        if non_blank.dim() != 2:
+            return None
+
+        mask = None
+        if input_lengths is not None:
+            if not torch.is_tensor(input_lengths):
+                input_lengths = torch.as_tensor(input_lengths, device=non_blank.device)
+            input_lengths = input_lengths.to(device=non_blank.device, dtype=torch.long)
+            max_len = non_blank.size(1)
+            mask = torch.arange(max_len, device=non_blank.device).unsqueeze(0)
+            mask = mask < input_lengths.unsqueeze(1)
+            mask = mask.to(non_blank.dtype)
+
+        if mask is not None:
+            coverage_mass = (non_blank * mask).sum(dim=1)
+        else:
+            coverage_mass = non_blank.sum(dim=1)
+
+        denom = target_lengths.clamp_min(1.0)
+        coverage_ratio = coverage_mass / denom
+
+        min_ratio = float(cfg.get('min_ratio', 1.0))
+        tolerance = float(cfg.get('tolerance', 0.0))
+        lower_bound = max(min_ratio - tolerance, 0.0)
+        penalty = torch.clamp(lower_bound - coverage_ratio, min=0.0)
+
+        max_ratio = cfg.get('max_ratio', None)
+        if max_ratio is not None:
+            max_ratio = float(max_ratio)
+            upper_bound = max_ratio + max(0.0, tolerance)
+            penalty = penalty + torch.clamp(coverage_ratio - upper_bound, min=0.0)
+
+        loss_value = penalty.mean() * weight
+
+        stats = {
+            'diagnostics/ctc_coverage_ratio': float(coverage_ratio.mean().detach().item()),
+        }
+        return loss_value, stats
 
     def _get_target_model(self):
         """Return the underlying model, unwrapping accelerator/DDP wrappers."""
@@ -861,6 +1025,15 @@ class Trainer(object):
                 losses['ctc'] = loss_ctc.item()
             else:
                 loss_ctc = torch.zeros(1, device=self.device)
+
+            reg_losses, reg_stats = self._compute_ctc_alignment_regularization(
+                ppgs, mel_input_length, text_input_length
+            )
+            for key, value in reg_losses.items():
+                total_loss = total_loss + value
+                losses[key] = value.item() if torch.is_tensor(value) else float(value)
+            for key, value in reg_stats.items():
+                losses[key] = float(value)
 
             s2s_pred = model_outputs.get('s2s_logits')
             s2s_attn = model_outputs.get('s2s_attn')

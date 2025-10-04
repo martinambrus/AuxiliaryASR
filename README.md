@@ -103,12 +103,21 @@ Each augmentation block can be toggled on or off independently through `Configs/
 
 #### Keeping the CTC branch expressive
 
-When the auxiliary ASR is trained on only a few hours of speech, the CTC head can collapse into predicting mostly blanks, which hurts diagonal alignments and increases the skip/merge gap. The configuration offers two knobs that counteract this behaviour:
+When the auxiliary ASR is trained on only a few hours of speech, the CTC head can collapse into predicting mostly blanks, which hurts diagonal alignments and increases the skip/merge gap. The configuration offers a set of knobs that counteract this behaviour:
 
 ```yaml
 ctc_loss:
-  blank_logit_bias: 1.5      # subtracts a constant from the blank logit before the softmax
-  logit_temperature: 1.1     # flattens the CTC posterior to discourage over-confidence
+  blank_logit_bias: 1.0      # subtracts a constant from the blank logit before the softmax
+  logit_temperature: 1.05    # flattens the CTC posterior to discourage over-confidence
+  regularization:
+    blank_rate:
+      weight: 0.4            # penalise batches whose blank rate exceeds ~0.64
+      target: 0.64
+      tolerance: 0.04        # slack before the penalty ramps up
+    coverage:
+      weight: 0.3            # encourage enough non-blank mass to cover the transcript length
+      min_ratio: 0.95
+      tolerance: 0.05        # allows slight under-coverage before the loss activates
 
 regularization:
   entropy:
@@ -116,6 +125,8 @@ regularization:
       ctc:
         weight: 0.02         # maximise entropy to keep non-blank symbols active
 ```
+
+Both regularisers honour an optional `warmup_epochs` key (set to `3` in the default config) so you can delay their activation until the CTC alignment has roughly converged.
 
 Additionally, the diagonal attention prior now masks out padded timesteps and exposes a `diagonal_attention_prior_sigma` parameter so that you can tune how tightly the model should follow the diagonal on shorter utterances.
 
