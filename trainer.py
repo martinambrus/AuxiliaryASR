@@ -70,6 +70,10 @@ class Trainer(object):
         # assignment. This also provides backwards compatibility with older
         # call-sites that expect the attribute to exist unconditionally.
         self._resumed_from_checkpoint = bool(initial_epochs)
+        # Default SortaGrad state so callers can always rely on the attribute
+        # existing even if initialisation aborts before the full dataloader
+        # wiring runs.
+        self._sortagrad_active = False
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
