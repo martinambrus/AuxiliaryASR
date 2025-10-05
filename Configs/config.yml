@@ -1,7 +1,7 @@
 log_dir: "Checkpoint"
 save_freq: 10
 device: "cuda"
-epochs: 200
+epochs: 250
 batch_size: 64
 pretrained_model: true
 load_only_params: false
@@ -160,10 +160,11 @@ sortagrad_switch_to_shuffled_dataset_epoch: 10
 # make ASR learn to read phonemes from left to right, not randomly
 use_diagonal_attention_prior: True
 diagonal_attention_prior_weight:
-  initial: 0.3
-  target: 0.4
-  warmup_epochs: 40
-diagonal_attention_prior_sigma: 0.35
+  initial: 0.35
+  target: 0.65
+  warmup_epochs: 60
+  hold_epochs: 20
+diagonal_attention_prior_sigma: 0.32
 
 # stabilizes ASR training for smaller datasets
 entropy_params:
@@ -174,17 +175,26 @@ ctc_loss:
   logit_temperature: 1.0
   regularization:
     blank_rate:
-      enabled: false
-      weight: 0.4
-      target: 0.64
-      tolerance: 0.04
-      warmup_epochs: 3
-    coverage:
-      enabled: false
-      weight: 0.3
-      min_ratio: 0.95
+      enabled: true
+      weight: 0.25
+      target: 0.62
       tolerance: 0.05
-      warmup_epochs: 3
+      warmup_epochs: 5
+      penalize_low_blank: false
+    coverage:
+      enabled: true
+      weight: 0.12
+      min_ratio: 0.92
+      tolerance: 0.03
+      warmup_epochs: 5
+
+alignment_regularization:
+  attention_duration:
+    enabled: true
+    weight: 0.15
+    min_frames: 2.0
+    tolerance: 0.3
+    warmup_epochs: 8
 
 dataset_params:
   # SpecAugment parameters applied only on the training split.

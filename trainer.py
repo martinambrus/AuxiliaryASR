@@ -127,6 +127,18 @@ class Trainer(object):
         self.ctc_coverage_regularization_enabled = bool(coverage_reg_cfg.get('enabled', False))
         self.ctc_coverage_regularization_config = coverage_reg_cfg
 
+        alignment_reg_cfg = {}
+        if isinstance(self.config, dict):
+            alignment_reg_cfg = self.config.get('alignment_regularization', {}) or {}
+            if not isinstance(alignment_reg_cfg, dict):
+                alignment_reg_cfg = {}
+
+        attn_duration_cfg = alignment_reg_cfg.get('attention_duration', {}) or {}
+        if not isinstance(attn_duration_cfg, dict):
+            attn_duration_cfg = {}
+        self.attention_duration_regularization_enabled = bool(attn_duration_cfg.get('enabled', False))
+        self.attention_duration_regularization_config = attn_duration_cfg
+
         self.mixspeech_config = mixspeech_config or {}
         self.mixspeech_enabled = bool(self.mixspeech_config.get('enabled', False))
         self.mixspeech_prob = float(self.mixspeech_config.get('prob', 0.5))
@@ -337,6 +349,14 @@ class Trainer(object):
             return True
         return self.epochs >= max(warmup, 0)
 
+    def _alignment_regularization_warmup_passed(self, cfg):
+        if cfg is None:
+            return False
+        warmup = int(cfg.get('warmup_epochs', 0))
+        if warmup <= 0:
+            return True
+        return self.epochs >= max(warmup, 0)
+
     def _compute_ctc_alignment_regularization(self, logits, input_lengths, target_lengths):
         if logits is None:
             return {}, {}
@@ -474,6 +494,67 @@ class Trainer(object):
         stats = {
             'diagnostics/ctc_coverage_ratio': float(coverage_ratio.mean().detach().item()),
         }
+        return loss_value, stats
+
+    def _compute_attention_duration_regularization(self, attn, text_lengths, mel_lengths):
+        if not self.attention_duration_regularization_enabled:
+            return None
+
+        cfg = self.attention_duration_regularization_config or {}
+        if not self._alignment_regularization_warmup_passed(cfg):
+            return None
+
+        weight = float(cfg.get('weight', 0.0))
+        if weight == 0.0:
+            return None
+
+        min_frames = float(cfg.get('min_frames', 0.0))
+        tolerance = float(cfg.get('tolerance', 0.0))
+        max_frames = float(cfg.get('max_frames', 0.0))
+
+        device = attn.device
+        text_lengths = text_lengths.to(device=device, dtype=torch.long)
+        mel_lengths = mel_lengths.to(device=device, dtype=torch.long)
+
+        B, T_text, T_mel = attn.size()
+        text_positions = torch.arange(T_text, device=device).view(1, T_text)
+        mel_positions = torch.arange(T_mel, device=device).view(1, T_mel)
+
+        text_mask = (text_positions < text_lengths.view(B, 1)).to(attn.dtype)
+        mel_mask = (mel_positions < mel_lengths.view(B, 1)).to(attn.dtype)
+
+        masked_attn = attn * mel_mask.view(B, 1, T_mel)
+        durations = masked_attn.sum(dim=2)
+
+        denom = text_mask.sum().clamp_min(1.0)
+
+        lower_bound = max(0.0, min_frames - tolerance)
+        penalty = torch.clamp(lower_bound - durations, min=0.0)
+
+        if max_frames > 0.0:
+            upper_bound = max_frames + max(0.0, tolerance)
+            penalty = penalty + torch.clamp(durations - upper_bound, min=0.0)
+
+        penalty = penalty * text_mask
+        average_penalty = penalty.sum() / denom
+
+        loss_value = weight * average_penalty
+
+        stats = {}
+        durations_masked = (durations * text_mask).detach()
+        valid_mask = text_mask.bool()
+        valid_durations = durations_masked[valid_mask]
+        if valid_durations.numel() > 0:
+            stats['diagnostics/attn_duration_mean'] = float(valid_durations.mean().item())
+            stats['diagnostics/attn_duration_min'] = float(valid_durations.min().item())
+            stats['diagnostics/attn_duration_max'] = float(valid_durations.max().item())
+            for quantile, name in ((0.1, 'p10'), (0.5, 'p50'), (0.9, 'p90')):
+                stats[f'diagnostics/attn_duration_{name}'] = float(torch.quantile(valid_durations, quantile).item())
+
+            short_mask = (penalty.detach() * text_mask) > 0
+            short_ratio = short_mask.float().sum() / denom
+            stats['diagnostics/attn_duration_short_ratio'] = float(short_ratio.item())
+
         return loss_value, stats
 
     def _get_target_model(self):
@@ -1265,6 +1346,16 @@ class Trainer(object):
             else:
                 pron_loss = torch.zeros(1, device=self.device)
 
+            if s2s_attn is not None:
+                duration_reg = self._compute_attention_duration_regularization(
+                    s2s_attn, text_input_length, mel_input_length
+                )
+                if duration_reg is not None:
+                    duration_loss, duration_stats = duration_reg
+                    total_loss = total_loss + duration_loss
+                    losses['attn_duration_reg'] = duration_loss.item()
+                    losses.update(duration_stats)
+
             if self.use_diagonal_attention_prior and s2s_attn is not None:
                 diag_weight = self._get_active_diagonal_attention_weight()
                 if diag_weight > 0.0:
@@ -1534,6 +1625,16 @@ class Trainer(object):
                     pron_pred = torch.argmax(pron_logits, dim=2)
                     pron_acc = self._sequence_accuracy(pron_pred, pron_targets)
                     eval_losses['eval/pronunciation_error_acc'].append(self._reduce_scalar(pron_acc))
+
+            if s2s_attn is not None:
+                duration_eval = self._compute_attention_duration_regularization(
+                    s2s_attn, text_input_length, mel_input_length
+                )
+                if duration_eval is not None:
+                    duration_loss, duration_stats = duration_eval
+                    eval_losses.setdefault('eval/attn_duration_reg', []).append(self._reduce_scalar(duration_loss.item()))
+                    for stat_key, stat_value in duration_stats.items():
+                        eval_losses.setdefault(stat_key, []).append(stat_value)
 
             eval_losses["eval/loss"].append(self._reduce_scalar(total_eval_loss.item()))
 
