@@ -10,6 +10,8 @@ validation split, and prints notebook-style summaries for quick reporting.
 from __future__ import annotations
 
 import argparse
+import concurrent.futures
+import copy
 import math
 import warnings
 from pathlib import Path
@@ -50,6 +52,63 @@ def _collect_epoch_checkpoints(path: Path) -> List[Tuple[int, Path]]:
 
     epoch_files.sort(key=lambda item: item[0])
     return epoch_files
+
+
+def _evaluate_epoch_checkpoint(
+    epoch_idx: int,
+    checkpoint_path: str,
+    config: Dict,
+    device_str: str,
+    band: float,
+    max_align_batches: Optional[int],
+) -> Dict[str, float]:
+    """Evaluate a single epoch checkpoint and return its aggregated metrics."""
+
+    config_copy = copy.deepcopy(config)
+    device = torch.device(device_str)
+
+    dev_loader, _ = build_dev_dataloader_from_config(config_copy, device)
+    model, token_map = load_asr_model_from_config(config_copy, checkpoint_path, device)
+
+    if " " not in token_map:
+        raise KeyError("The vocabulary does not contain the blank symbol ' '.")
+    blank_id = int(token_map[" "])
+
+    entropy_stats = compute_ctc_entropy(model, dev_loader, device, blank_id)
+    mean_diag, _ = diagonal_attention_score(
+        model,
+        dev_loader,
+        device,
+        band=band,
+        max_batches=max_align_batches,
+    )
+    dur_stats = duration_stats(model, dev_loader, device, blank_id)
+    skip_stats = skip_merge_flags(model, dev_loader, device, blank_id)
+    per_stats = compute_phoneme_error_rate(model, dev_loader, device, blank_id)
+
+    p50_for_penalty = (
+        dur_stats["p50"] if math.isfinite(dur_stats["p50"]) else 0.0
+    )
+    joint_score = (
+        per_stats["per"]
+        + 0.25 * (1.0 - mean_diag)
+        + 0.20 * max(0.0, entropy_stats["mean_blank_rate"] - 0.62)
+        + 0.20 * max(0.0, (-skip_stats["mean_len_diff"] - 6.0) / 20.0)
+        + 0.15 * max(0.0, 2.0 - p50_for_penalty)
+    )
+
+    del model
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
+
+    return {
+        "joint_score": joint_score,
+        "per": per_stats["per"],
+        "diagonal": mean_diag,
+        "blank_rate": entropy_stats["mean_blank_rate"],
+        "len_diff": skip_stats["mean_len_diff"],
+        "p50": dur_stats["p50"],
+    }
 
 
 def _resolve_checkpoint_path(path: Path) -> Path:
@@ -529,6 +588,15 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         default=None,
         help="Limit the number of batches when computing the diagonal score.",
     )
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        default=4,
+        help=(
+            "Number of parallel processes to use when evaluating epoch checkpoints "
+            "(default: 4)."
+        ),
+    )
     args = parser.parse_args(argv)
 
     checkpoint_arg = Path(args.checkpoint)
@@ -543,78 +611,53 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     config = _load_config(config_path)
 
     if args.device:
-        device = torch.device(args.device)
+        device_str = args.device
     else:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    dev_loader, _ = build_dev_dataloader_from_config(config, device)
+        device_str = "cuda" if torch.cuda.is_available() else "cpu"
+    device = torch.device(device_str)
 
     if epoch_checkpoints:
-        results: List[Tuple[int, Dict[str, float]]] = []
-        for epoch_idx, checkpoint_file in epoch_checkpoints:
-            print(f"=== Evaluating epoch {epoch_idx} ({checkpoint_file.name}) ===")
-            model, token_map = load_asr_model_from_config(
-                config, str(checkpoint_file), device
-            )
-            if " " not in token_map:
-                raise KeyError("The vocabulary does not contain the blank symbol ' '.")
-            blank_id = int(token_map[" "])
+        max_workers = max(1, int(args.num_workers))
+        metrics_by_epoch: Dict[int, Dict[str, float]] = {}
 
-            entropy_stats = compute_ctc_entropy(model, dev_loader, device, blank_id)
-            mean_diag, _ = diagonal_attention_score(
-                model,
-                dev_loader,
-                device,
-                band=args.band,
-                max_batches=args.max_align_batches,
-            )
-            dur_stats = duration_stats(model, dev_loader, device, blank_id)
-            skip_stats = skip_merge_flags(model, dev_loader, device, blank_id)
-            per_stats = compute_phoneme_error_rate(model, dev_loader, device, blank_id)
-
-            p50_for_penalty = (
-                dur_stats["p50"]
-                if math.isfinite(dur_stats["p50"])
-                else 0.0
-            )
-            joint_score = (
-                per_stats["per"]
-                + 0.25 * (1.0 - mean_diag)
-                + 0.20 * max(0.0, entropy_stats["mean_blank_rate"] - 0.62)
-                + 0.20 * max(0.0, (-skip_stats["mean_len_diff"] - 6.0) / 20.0)
-                + 0.15 * max(0.0, 2.0 - p50_for_penalty)
-            )
-
-            results.append(
-                (
+        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+            future_to_epoch = {
+                executor.submit(
+                    _evaluate_epoch_checkpoint,
                     epoch_idx,
-                    {
-                        "joint_score": joint_score,
-                        "per": per_stats["per"],
-                        "diagonal": mean_diag,
-                        "blank_rate": entropy_stats["mean_blank_rate"],
-                        "len_diff": skip_stats["mean_len_diff"],
-                        "p50": dur_stats["p50"],
-                    },
-                )
-            )
+                    str(checkpoint_file),
+                    config,
+                    device_str,
+                    args.band,
+                    args.max_align_batches,
+                ): epoch_idx
+                for epoch_idx, checkpoint_file in epoch_checkpoints
+            }
 
+            for future in concurrent.futures.as_completed(future_to_epoch):
+                epoch_idx = future_to_epoch[future]
+                metrics_by_epoch[epoch_idx] = future.result()
+
+        results: List[Tuple[int, Dict[str, float]]] = [
+            (epoch_idx, metrics_by_epoch[epoch_idx])
+            for epoch_idx, _ in epoch_checkpoints
+        ]
+
+        for epoch_idx, checkpoint_file in epoch_checkpoints:
+            metrics = metrics_by_epoch[epoch_idx]
+            print(f"=== Evaluating epoch {epoch_idx} ({checkpoint_file.name}) ===")
             print(
                 "  PER: {per:.4f} | diagonal: {diag:.4f} | blank: {blank:.4f} | "
                 "len_diff: {len_diff:.4f} | p50: {p50:.4f} | J: {joint:.4f}".format(
-                    per=per_stats["per"],
-                    diag=mean_diag,
-                    blank=entropy_stats["mean_blank_rate"],
-                    len_diff=skip_stats["mean_len_diff"],
-                    p50=dur_stats["p50"],
-                    joint=joint_score,
+                    per=metrics["per"],
+                    diag=metrics["diagonal"],
+                    blank=metrics["blank_rate"],
+                    len_diff=metrics["len_diff"],
+                    p50=metrics["p50"],
+                    joint=metrics["joint_score"],
                 )
             )
             print()
-
-            del model
-            if device.type == "cuda":
-                torch.cuda.empty_cache()
 
         results.sort(key=lambda item: item[1]["joint_score"])
         top_results = results[:5]
@@ -628,6 +671,8 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             )
 
         return
+
+    dev_loader, _ = build_dev_dataloader_from_config(copy.deepcopy(config), device)
 
     checkpoint_file = _resolve_checkpoint_path(checkpoint_arg)
     model, token_map = load_asr_model_from_config(config, str(checkpoint_file), device)
