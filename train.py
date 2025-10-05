@@ -1090,6 +1090,14 @@ def main(config_path):
     current_train_batch_size = int(initial_batch_size)
     current_samples_per_rank = int(train_samples_per_rank)
 
+    checkpoint_selection_cfg = cfg_get_nested(config, 'checkpoint_selection', {}) or {}
+    joint_selection_enabled = bool(checkpoint_selection_cfg.get('enabled', False))
+    joint_lambda_diag = float(checkpoint_selection_cfg.get('lambda_diag', 0.0))
+    joint_lambda_length = float(checkpoint_selection_cfg.get('lambda_length', 0.0))
+    joint_target_len_diff = float(checkpoint_selection_cfg.get('target_length_diff', 0.0))
+    best_joint_score = None
+    best_checkpoint_path = None
+
     def _ensure_curriculum_for_epoch(epoch):
         nonlocal sorted_train_dataloader
         nonlocal shuffled_train_dataloader
@@ -1186,6 +1194,30 @@ def main(config_path):
 
         results = train_results.copy()
         results.update(eval_results)
+
+        joint_score = None
+        length_penalty = None
+        is_best = False
+        if joint_selection_enabled:
+            per_metric = results.get('eval/wer')
+            diag_metric = results.get('eval/diag_coherence')
+            len_diff_norm = results.get('eval/ctc_len_diff_norm')
+            if per_metric is not None and diag_metric is not None and len_diff_norm is not None:
+                length_penalty = max(0.0, joint_target_len_diff - len_diff_norm)
+                joint_score = per_metric + joint_lambda_diag * (1.0 - diag_metric) + joint_lambda_length * length_penalty
+                results['eval/joint_score'] = joint_score
+                results['eval/length_penalty'] = length_penalty
+                tolerance = 1.0e-6
+                if best_joint_score is None or joint_score < best_joint_score - tolerance:
+                    is_best = True
+
+        if joint_selection_enabled:
+            display_best = best_joint_score
+            if is_best and joint_score is not None:
+                display_best = joint_score
+            if display_best is not None:
+                results['eval/best_joint_score'] = display_best
+
         if accelerator.is_main_process:
             logger.info('--- epoch %d ---' % epoch)
             for key, value in results.items():
@@ -1196,12 +1228,33 @@ def main(config_path):
                     for v in value:
                         writer.add_figure('eval_attn', plot_image(v), epoch)
 
-        if (epoch % save_freq) == 0 or (early_stopping is not None and early_stopping(learning_rate)):
-            if accelerator.is_main_process:
-                trainer.save_checkpoint(osp.join(log_dir, 'epoch_%05d.pth' % epoch))
-            accelerator.wait_for_everyone()
+        should_trigger_early_stop = False
+        if early_stopping is not None:
+            should_trigger_early_stop = early_stopping(learning_rate)
 
-        if early_stopping is not None and early_stopping(learning_rate):
+        save_checkpoint = (epoch % save_freq) == 0 or should_trigger_early_stop or is_best
+        checkpoint_path = None
+        if save_checkpoint and accelerator.is_main_process:
+            checkpoint_path = osp.join(log_dir, 'epoch_%05d.pth' % epoch)
+            trainer.save_checkpoint(checkpoint_path)
+        accelerator.wait_for_everyone()
+
+        if joint_selection_enabled and is_best and joint_score is not None:
+            best_joint_score = joint_score
+            if accelerator.is_main_process and checkpoint_path is not None:
+                best_checkpoint_path = checkpoint_path
+                best_symlink = osp.join(log_dir, 'best_joint.pth')
+                try:
+                    if os.path.islink(best_symlink) or os.path.exists(best_symlink):
+                        os.remove(best_symlink)
+                    os.symlink(os.path.basename(checkpoint_path), best_symlink)
+                except OSError:
+                    shutil.copyfile(checkpoint_path, best_symlink)
+
+        if joint_selection_enabled and best_joint_score is not None:
+            results['eval/best_joint_score'] = best_joint_score
+
+        if should_trigger_early_stop:
             if accelerator.is_main_process:
                 logger.info(f"Early stopping triggered at epoch {epoch}, learning_rate: {learning_rate:.5f}")
             break

@@ -225,6 +225,9 @@ class CTCBeamSearchDecoder:
         cold_fusion: Optional[ColdFusionCombiner] = None,
         length_penalty: float = 0.0,
         prune_threshold: float = 1e-6,
+        logit_temperature: float = 1.0,
+        blank_penalty: float = 0.0,
+        insertion_bonus: float = 0.0,
     ) -> None:
         self.beam_width = max(1, int(beam_width))
         self.blank_id = int(blank_id)
@@ -235,6 +238,9 @@ class CTCBeamSearchDecoder:
         self.cold_fusion = cold_fusion
         self.length_penalty = float(length_penalty)
         self.prune_threshold = float(prune_threshold)
+        self.logit_temperature = max(1.0e-6, float(logit_temperature))
+        self.blank_penalty = float(blank_penalty)
+        self.insertion_bonus = float(insertion_bonus)
 
     def _init_hypothesis(self) -> Hypothesis:
         shallow_state = self.shallow_fusion_lm.start() if self.shallow_fusion_lm else None
@@ -264,6 +270,10 @@ class CTCBeamSearchDecoder:
         else:
             log_probs = logits
 
+        if self.logit_temperature != 1.0:
+            log_probs = log_probs / self.logit_temperature
+            log_probs = log_probs - torch.logsumexp(log_probs, dim=-1, keepdim=True)
+
         beams: Dict[Tuple[int, ...], Hypothesis] = {
             tuple(): self._init_hypothesis()
         }
@@ -281,7 +291,7 @@ class CTCBeamSearchDecoder:
                 total_log_prob = hyp.score
 
                 # Extend with blank
-                blank_log_prob = frame[self.blank_id].item()
+                blank_log_prob = frame[self.blank_id].item() - self.blank_penalty
                 new_blank_prob = total_log_prob + blank_log_prob
                 updated = candidates.setdefault(hyp.prefix, Hypothesis(prefix=hyp.prefix))
                 updated.log_prob_blank = _log_sum_exp(updated.log_prob_blank, new_blank_prob)
@@ -294,7 +304,7 @@ class CTCBeamSearchDecoder:
                     if symbol == self.blank_id:
                         continue
 
-                    symbol_log_prob = frame[symbol].item()
+                    symbol_log_prob = frame[symbol].item() + self.insertion_bonus
                     prev_symbol = hyp.prefix[-1] if hyp.prefix else None
 
                     shallow_state = hyp.shallow_state
@@ -429,6 +439,9 @@ def build_decoder_from_config(config: dict) -> Optional[CTCBeamSearchDecoder]:
         cold_fusion=cold_combiner,
         length_penalty=beam_cfg.get("length_penalty", 0.0),
         prune_threshold=beam_cfg.get("prune_threshold", 1e-6),
+        logit_temperature=beam_cfg.get("logit_temperature", 1.0),
+        blank_penalty=beam_cfg.get("blank_penalty", 0.0),
+        insertion_bonus=beam_cfg.get("insertion_bonus", 0.0),
     )
     return decoder
 

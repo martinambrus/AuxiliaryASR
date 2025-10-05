@@ -147,6 +147,7 @@ class ASRCNN(nn.Module):
                  n_layers=6,
                  token_embedding_dim=256,
                  location_kernel_size=63,
+                 attention_dropout=0.0,
                  multi_task_config=None,
                  stabilization_config=None,
                  memory_optimization_config=None,
@@ -270,7 +271,8 @@ class ASRCNN(nn.Module):
             embedding_dim=token_embedding_dim,
             hidden_dim=hidden_dim//2,
             n_token=n_token,
-            location_kernel_size=location_kernel_size)
+            location_kernel_size=location_kernel_size,
+            attention_dropout=attention_dropout)
 
         frame_cfg = self.multi_task_config.get('frame_phoneme', {}) or {}
         self.enable_frame_classifier = bool(frame_cfg.get('enabled', False))
@@ -685,7 +687,8 @@ class ASRS2S(nn.Module):
                  hidden_dim=512,
                  n_location_filters=32,
                  location_kernel_size=63,
-                 n_token=40):
+                 n_token=40,
+                 attention_dropout=0.0):
         super(ASRS2S, self).__init__()
         self.embedding = nn.Embedding(n_token, embedding_dim)
         val_range = math.sqrt(6 / hidden_dim)
@@ -698,7 +701,8 @@ class ASRS2S(nn.Module):
             hidden_dim,
             hidden_dim,
             n_location_filters,
-            location_kernel_size
+            location_kernel_size,
+            attention_dropout=attention_dropout
         )
         self.decoder_rnn = nn.LSTMCell(self.decoder_rnn_dim + embedding_dim, self.decoder_rnn_dim)
         self.project_to_hidden = nn.Sequential(

@@ -452,6 +452,48 @@ def diagonal_attention_prior(attn, text_lengths, mel_lengths, sigma=0.5, eps=1.0
     return loss
 
 
+def diagonal_attention_coherence(attn, text_lengths, mel_lengths, sigma=0.5, eps=1.0e-6):
+    """Return the per-sample diagonal alignment score in ``[0, 1]``."""
+
+    if attn is None:
+        raise ValueError("'attn' must be a tensor")
+
+    if sigma <= 0:
+        raise ValueError("'sigma' must be positive")
+
+    if not torch.is_tensor(text_lengths):
+        text_lengths = torch.as_tensor(text_lengths, device=attn.device)
+    if not torch.is_tensor(mel_lengths):
+        mel_lengths = torch.as_tensor(mel_lengths, device=attn.device)
+
+    B, T_text, T_mel = attn.size()
+    device = attn.device
+
+    text_lengths = text_lengths.to(device=device, dtype=torch.float32)
+    mel_lengths = mel_lengths.to(device=device, dtype=torch.float32)
+
+    text_positions = torch.arange(T_text, device=device, dtype=torch.float32).view(1, T_text, 1)
+    mel_positions = torch.arange(T_mel, device=device, dtype=torch.float32).view(1, 1, T_mel)
+
+    text_scale = torch.clamp(text_lengths.view(B, 1, 1) - 1.0, min=1.0)
+    mel_scale = torch.clamp(mel_lengths.view(B, 1, 1) - 1.0, min=1.0)
+
+    text_norm = torch.clamp(text_positions / text_scale, 0.0, 1.0).expand(B, -1, -1)
+    mel_norm = torch.clamp(mel_positions / mel_scale, 0.0, 1.0).expand(B, -1, -1)
+
+    expected = torch.exp(-((text_norm - mel_norm) ** 2) / (2 * sigma ** 2))
+    expected = expected / expected.amax(dim=(1, 2), keepdim=True).clamp_min(eps)
+
+    text_mask = (text_positions.long() < text_lengths.view(B, 1, 1).long()).expand(B, -1, T_mel)
+    mel_mask = (mel_positions.long() < mel_lengths.view(B, 1, 1).long()).expand(B, T_text, -1)
+    mask = (text_mask & mel_mask).to(attn.dtype)
+
+    expected_mass = (expected * mask).sum(dim=(1, 2)).clamp_min(eps)
+    alignment_mass = (attn * expected * mask).sum(dim=(1, 2))
+
+    return alignment_mass / expected_mass
+
+
 class BatchSizeScheduler:
     """Utility to manage curriculum batch-size schedules.
 

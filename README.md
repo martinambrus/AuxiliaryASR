@@ -103,18 +103,20 @@ Each augmentation block can be toggled on or off independently through `Configs/
 
 #### Keeping the CTC branch expressive
 
-When the auxiliary ASR is trained on only a few hours of speech, the CTC head can collapse into predicting mostly blanks, which hurts diagonal alignments and increases the skip/merge gap. The configuration offers a set of knobs that counteract this behaviour:
+When the auxiliary ASR is trained on only a few hours of speech, the CTC head can collapse into predicting mostly blanks, which hurts diagonal alignments and increases the skip/merge gap. The default configuration keeps the training logits unbiased while exposing optional knobs that you can enable when you notice blank over-confidence:
 
 ```yaml
 ctc_loss:
-  blank_logit_bias: 1.0      # subtracts a constant from the blank logit before the softmax
-  logit_temperature: 1.05    # flattens the CTC posterior to discourage over-confidence
+  blank_logit_bias: 0.0      # subtracts a constant from the blank logit before the softmax (kept neutral by default)
+  logit_temperature: 1.0     # flattens the CTC posterior to discourage over-confidence
   regularization:
     blank_rate:
+      enabled: false         # toggle on once alignments have stabilised if blanks dominate
       weight: 0.4            # penalise batches whose blank rate exceeds ~0.64
       target: 0.64
       tolerance: 0.04        # slack before the penalty ramps up
     coverage:
+      enabled: false         # optional coverage regulariser to avoid extreme deletions
       weight: 0.3            # encourage enough non-blank mass to cover the transcript length
       min_ratio: 0.95
       tolerance: 0.05        # allows slight under-coverage before the loss activates
@@ -126,9 +128,23 @@ regularization:
         weight: 0.02         # maximise entropy to keep non-blank symbols active
 ```
 
-Both regularisers honour an optional `warmup_epochs` key (set to `3` in the default config) so you can delay their activation until the CTC alignment has roughly converged.
+Both regularisers honour an optional `warmup_epochs` key (set to `3` in the example above) so you can delay their activation until the CTC alignment has roughly converged.
 
-Additionally, the diagonal attention prior now masks out padded timesteps and exposes a `diagonal_attention_prior_sigma` parameter so that you can tune how tightly the model should follow the diagonal on shorter utterances.
+Decoding-time safeguards provide gentler blank suppression without distorting training. The beam-search configuration supports a temperature, blank penalty, insertion bonus, and lightweight length normalisation:
+
+```yaml
+decoding:
+  beam_search:
+    beam_width: 16
+    length_penalty: 0.7
+    logit_temperature: 1.1  # applied only during decoding
+    blank_penalty: 0.05     # subtract from blank log-probabilities to reduce deletions
+    insertion_bonus: 0.05   # encourages emitting non-blank symbols when hypotheses compete
+```
+
+Additionally, the diagonal attention prior now masks out padded timesteps, applies a light dropout (configurable through `model_params.attention_dropout`), and can be scheduled via `diagonal_attention_prior_weight` to ramp the guidance weight from the warm-up phase towards a stronger late-epoch value.
+
+To avoid choosing checkpoints that only excel at PER while misaligning attention or dropping symbols, training now logs a joint selection score that blends PER, diagonal coherence, and the normalised CTC length gap. The configuration exposes the coefficients under `checkpoint_selection` and the trainer will keep a `best_joint.pth` symlink pointing at the most alignment-friendly checkpoint observed so far.
 
 Increasing the warm-up ratio (`optimizer_params.pct_start`) or reducing the batch size can also help when the number of training utterances is limited.
 

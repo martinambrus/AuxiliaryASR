@@ -82,7 +82,7 @@ class Trainer(object):
         self.fp16_run = False
         self.switch_sortagrad_dataset_epoch = switch_sortagrad_dataset_epoch
         self.use_diagonal_attention_prior = use_diagonal_attention_prior
-        self.diagonal_attention_prior_weight = diagonal_attention_prior_weight
+        self._configure_diagonal_attention_weight(diagonal_attention_prior_weight)
         sigma = float(diagonal_attention_prior_sigma)
         self.diagonal_attention_prior_sigma = sigma if sigma > 0 else 0.5
         self.maxm_mem_usage = 0
@@ -158,6 +158,63 @@ class Trainer(object):
             precision_cfg = self.config.get('precision', {}) or {}
             if not isinstance(precision_cfg, dict):
                 precision_cfg = {}
+
+    def _configure_diagonal_attention_weight(self, weight_config):
+        schedule = None
+        base_weight = float(weight_config) if weight_config is not None else 0.0
+        if isinstance(weight_config, dict):
+            initial = float(weight_config.get('initial', weight_config.get('base', weight_config.get('start', 0.0))))
+            target = float(weight_config.get('target', weight_config.get('final', initial)))
+            warmup = int(weight_config.get('warmup_epochs', weight_config.get('ramp_epochs', 0)))
+            hold = int(weight_config.get('hold_epochs', 0))
+            schedule = {
+                'initial': initial,
+                'target': target,
+                'warmup': max(0, warmup),
+                'hold': max(0, hold),
+            }
+            base_weight = initial
+        self.diagonal_attention_prior_weight = float(base_weight)
+        self.diagonal_attention_weight_schedule = schedule
+        self._active_diagonal_attention_weight = float(base_weight)
+
+    def _current_diagonal_attention_weight(self, epoch_index: int) -> float:
+        schedule = self.diagonal_attention_weight_schedule
+        if not schedule:
+            return float(self.diagonal_attention_prior_weight)
+
+        epoch = max(1, int(epoch_index))
+        initial = float(schedule['initial'])
+        target = float(schedule['target'])
+        warmup = int(schedule['warmup'])
+        hold = int(schedule['hold'])
+
+        if warmup <= 0:
+            weight = target
+        else:
+            progress = min(1.0, max(0.0, (epoch - 1) / float(max(1, warmup))))
+            weight = initial + (target - initial) * progress
+
+        if epoch > warmup + hold:
+            weight = target
+
+        return float(weight)
+
+    def _set_active_diagonal_attention_weight(self, training: bool) -> None:
+        if not self.use_diagonal_attention_prior:
+            self._active_diagonal_attention_weight = 0.0
+            return
+
+        if training:
+            epoch_index = self.epochs + 1
+        else:
+            epoch_index = max(1, self.epochs)
+
+        weight = self._current_diagonal_attention_weight(epoch_index)
+        self._active_diagonal_attention_weight = weight
+
+    def _get_active_diagonal_attention_weight(self) -> float:
+        return float(getattr(self, '_active_diagonal_attention_weight', self.diagonal_attention_prior_weight))
         mp_cfg = precision_cfg.get('mixed_precision', {}) if isinstance(precision_cfg, dict) else {}
         if not isinstance(mp_cfg, dict):
             mp_cfg = {}
@@ -525,6 +582,19 @@ class Trainer(object):
                 'reduction': str(cfg.get('reduction', 'mean')).lower(),
             }
         return parsed
+
+    @staticmethod
+    def _collapse_tokens(tokens, ignore_indexes=None):
+        if ignore_indexes is None:
+            ignore_indexes = []
+        filtered = [int(tok) for tok in tokens if int(tok) not in ignore_indexes]
+        if not filtered:
+            return []
+        collapsed = [filtered[0]]
+        for tok in filtered[1:]:
+            if tok != collapsed[-1]:
+                collapsed.append(tok)
+        return collapsed
 
     def _entropy_target_config(self, key):
         if not self.entropy_regularization_enabled:
@@ -1166,14 +1236,17 @@ class Trainer(object):
                 pron_loss = torch.zeros(1, device=self.device)
 
             if self.use_diagonal_attention_prior and s2s_attn is not None:
-                loss_diagonal = diagonal_attention_prior(
-                    s2s_attn,
-                    text_input_length,
-                    mel_input_length,
-                    sigma=self.diagonal_attention_prior_sigma,
-                )
-                total_loss = total_loss + self.diagonal_attention_prior_weight * loss_diagonal
-                losses['diag_attn'] = loss_diagonal.item()
+                diag_weight = self._get_active_diagonal_attention_weight()
+                if diag_weight > 0.0:
+                    loss_diagonal = diagonal_attention_prior(
+                        s2s_attn,
+                        text_input_length,
+                        mel_input_length,
+                        sigma=self.diagonal_attention_prior_sigma,
+                    )
+                    total_loss = total_loss + diag_weight * loss_diagonal
+                    losses['diag_attn'] = loss_diagonal.item()
+                    losses['diag_attn_weight'] = float(diag_weight)
 
             loss = total_loss
 
@@ -1240,6 +1313,7 @@ class Trainer(object):
 
         train_losses = defaultdict(list)
         self.model.train()
+        self._set_active_diagonal_attention_weight(training=True)
         if self.accelerator is not None and not self.accelerator.is_local_main_process:
             data_iterator = self.train_dataloader
         else:
@@ -1274,6 +1348,7 @@ class Trainer(object):
     @torch.no_grad()
     def _eval_epoch(self):
         self.model.eval()
+        self._set_active_diagonal_attention_weight(training=False)
         eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
         if self.accelerator is not None and not self.accelerator.is_local_main_process:
@@ -1434,13 +1509,38 @@ class Trainer(object):
 
             if ppgs is not None:
                 _, amax_ppgs = torch.max(ppgs, dim=2)
-                wers = [calc_wer(target[:text_length],
-                                 pred[:mel_length],
-                                 ignore_indexes=list(range(5))) \
-                        for target, pred, text_length, mel_length in zip(
-                                text_input.cpu(), amax_ppgs.cpu(), text_input_length.cpu(), mel_input_length.cpu())]
+                wers = []
+                len_diffs = []
+                len_diff_norms = []
+                ignore_indexes = list(range(5))
+                for target, pred, text_length, mel_length in zip(
+                    text_input.cpu(),
+                    amax_ppgs.cpu(),
+                    text_input_length.cpu(),
+                    mel_input_length.cpu(),
+                ):
+                    target_seq = target[:text_length]
+                    pred_seq = pred[:mel_length]
+                    wers.append(
+                        calc_wer(
+                            target_seq,
+                            pred_seq,
+                            ignore_indexes=ignore_indexes,
+                        )
+                    )
+                    collapsed_target = self._collapse_tokens(target_seq.tolist(), ignore_indexes)
+                    collapsed_pred = self._collapse_tokens(pred_seq.tolist(), ignore_indexes)
+                    diff = float(len(collapsed_pred) - len(collapsed_target))
+                    len_diffs.append(diff)
+                    ref_len = max(1.0, float(len(collapsed_target)))
+                    len_diff_norms.append(diff / ref_len)
+
                 wers = self._gather_metric_list(wers)
+                len_diffs = self._gather_metric_list(len_diffs)
+                len_diff_norms = self._gather_metric_list(len_diff_norms)
                 eval_losses["eval/wer"].extend(wers)
+                eval_losses["eval/ctc_len_diff"].extend(len_diffs)
+                eval_losses["eval/ctc_len_diff_norm"].extend(len_diff_norms)
 
             if s2s_pred is not None:
                 _, amax_s2s = torch.max(s2s_pred, dim=2)
@@ -1449,12 +1549,25 @@ class Trainer(object):
                 acc = self._gather_metric_list(acc)
                 eval_losses["eval/acc"].extend(acc)
 
-            if s2s_attn is not None and eval_steps_per_epoch <= 2:
-                if self.accelerator is None or self.accelerator.is_main_process:
-                    eval_images["eval/image"].append(
-                        self.get_image([s2s_attn[0].cpu().numpy()]))
+            if s2s_attn is not None:
+                diag_scores = diagonal_attention_coherence(
+                    s2s_attn,
+                    text_input_length,
+                    mel_input_length,
+                    sigma=self.diagonal_attention_prior_sigma,
+                )
+                if isinstance(diag_scores, torch.Tensor):
+                    diag_scores = diag_scores.detach().cpu().tolist()
+                diag_scores = self._gather_metric_list(diag_scores)
+                eval_losses["eval/diag_coherence"].extend(diag_scores)
+
+                if eval_steps_per_epoch <= 2:
+                    if self.accelerator is None or self.accelerator.is_main_process:
+                        eval_images["eval/image"].append(
+                            self.get_image([s2s_attn[0].cpu().numpy()]))
 
         eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
+        eval_losses.setdefault('eval/diag_weight', self._get_active_diagonal_attention_weight())
         eval_losses.update(eval_images)
         for key in list(eval_losses.keys()):
             if key.startswith('eval/image'):
