@@ -161,7 +161,6 @@ class Trainer(object):
 
     def _configure_diagonal_attention_weight(self, weight_config):
         schedule = None
-        base_weight = float(weight_config) if weight_config is not None else 0.0
         if isinstance(weight_config, dict):
             initial = float(weight_config.get('initial', weight_config.get('base', weight_config.get('start', 0.0))))
             target = float(weight_config.get('target', weight_config.get('final', initial)))
@@ -174,6 +173,9 @@ class Trainer(object):
                 'hold': max(0, hold),
             }
             base_weight = initial
+        else:
+            base_weight = float(weight_config) if weight_config is not None else 0.0
+
         self.diagonal_attention_prior_weight = float(base_weight)
         self.diagonal_attention_weight_schedule = schedule
         self._active_diagonal_attention_weight = float(base_weight)
