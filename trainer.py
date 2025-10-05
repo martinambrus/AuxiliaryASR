@@ -64,6 +64,12 @@ class Trainer(object):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
+        # Track whether the trainer is resuming from an existing checkpoint as
+        # early as possible so downstream logic can safely query the flag even
+        # if initialisation is interrupted before reaching the later
+        # assignment. This also provides backwards compatibility with older
+        # call-sites that expect the attribute to exist unconditionally.
+        self._resumed_from_checkpoint = bool(initial_epochs)
         self.model = model
         self.criterion = criterion
         self.optimizer = optimizer
@@ -268,7 +274,6 @@ class Trainer(object):
         else:
             self.grad_scaler = None
 
-        self._resumed_from_checkpoint = bool(initial_epochs)
         self._scheduler_aligned = False
         self._optimizer_step_count = self._get_optimizer_step_count()
         self._sortagrad_active = bool(

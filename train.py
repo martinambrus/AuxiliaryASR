@@ -1177,7 +1177,7 @@ def main(config_path):
         start_epoch = 1
 
     _ensure_curriculum_for_epoch(start_epoch)
-    if trainer._resumed_from_checkpoint:
+    if getattr(trainer, "_resumed_from_checkpoint", False):
         trainer.handle_sortagrad_after_resume()
         completed_steps = _curriculum_completed_steps(trainer.epochs)
         trainer.sync_scheduler_to_progress(completed_steps=completed_steps)
