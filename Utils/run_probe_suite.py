@@ -31,6 +31,25 @@ from utils import (  # noqa: E402
 )
 
 
+def _collect_epoch_checkpoints(path: Path) -> List[Tuple[int, Path]]:
+    """Return sorted ``(epoch, path)`` tuples for ``epoch_*.pth`` files."""
+
+    epoch_files: List[Tuple[int, Path]] = []
+    if not path.is_dir():
+        return epoch_files
+
+    for file in path.glob("epoch_*.pth"):
+        parts = file.stem.split("_")
+        try:
+            epoch = int(parts[-1])
+        except (ValueError, IndexError):
+            continue
+        epoch_files.append((epoch, file))
+
+    epoch_files.sort(key=lambda item: item[0])
+    return epoch_files
+
+
 def _resolve_checkpoint_path(path: Path) -> Path:
     """Return the checkpoint file that should be evaluated."""
 
@@ -51,21 +70,12 @@ def _resolve_checkpoint_path(path: Path) -> Path:
         if candidate.exists():
             return candidate
 
-    epoch_files: List[Tuple[int, Path]] = []
-    for file in path.glob("epoch_*.pth"):
-        parts = file.stem.split("_")
-        try:
-            epoch = int(parts[-1])
-        except (ValueError, IndexError):
-            continue
-        epoch_files.append((epoch, file))
-
+    epoch_files = _collect_epoch_checkpoints(path)
     if not epoch_files:
         raise FileNotFoundError(
             f"Could not find any epoch checkpoints inside '{path}'."
         )
 
-    epoch_files.sort(key=lambda item: item[0])
     return epoch_files[-1][1]
 
 
@@ -111,6 +121,35 @@ def _extract_ctc_logits(output) -> torch.Tensor:
     return tensor
 
 
+def _levenshtein_distance(reference: Sequence[int], hypothesis: Sequence[int]) -> int:
+    """Return the edit distance between two token sequences."""
+
+    if not reference:
+        return len(hypothesis)
+    if not hypothesis:
+        return len(reference)
+
+    # Ensure that the dynamic programming buffer tracks the shorter sequence.
+    if len(reference) < len(hypothesis):
+        reference, hypothesis = hypothesis, reference
+
+    previous = list(range(len(hypothesis) + 1))
+    for i, ref_token in enumerate(reference, 1):
+        current = [i]
+        for j, hyp_token in enumerate(hypothesis, 1):
+            substitution_cost = 0 if ref_token == hyp_token else 1
+            current.append(
+                min(
+                    previous[j] + 1,  # deletion
+                    current[j - 1] + 1,  # insertion
+                    previous[j - 1] + substitution_cost,  # substitution
+                )
+            )
+        previous = current
+
+    return previous[-1]
+
+
 @torch.no_grad()
 def compute_ctc_entropy(model: torch.nn.Module, dev_loader, device, blank_id: int) -> Dict[str, float]:
     model.eval()
@@ -149,6 +188,58 @@ def compute_ctc_entropy(model: torch.nn.Module, dev_loader, device, blank_id: in
         "mean_entropy": float(torch.tensor(entropies).mean()),
         "mean_maxprob": float(torch.tensor(max_probs).mean()),
         "mean_blank_rate": float(torch.tensor(blank_rates).mean()),
+    }
+
+
+@torch.no_grad()
+def compute_phoneme_error_rate(
+    model: torch.nn.Module,
+    dev_loader,
+    device: torch.device,
+    blank_id: int,
+) -> Dict[str, float]:
+    """Return corpus-level phoneme error statistics using greedy CTC decoding."""
+
+    model.eval()
+    total_distance = 0
+    total_reference = 0
+    downsample_factor = 2 ** getattr(model, "n_down", 1)
+
+    for batch in dev_loader:
+        texts, text_lens, mels, mel_lens = batch[:4]
+        mels = mels.to(device)
+        mel_lens = mel_lens.to(torch.long)
+        text_lens = text_lens.to(torch.long)
+
+        outputs = model(mels)
+        logits = _extract_ctc_logits(outputs).detach().cpu()
+        logit_lens = torch.clamp(
+            mel_lens // downsample_factor,
+            min=1,
+            max=logits.size(1),
+        ).cpu()
+
+        collapsed_ids, _ = best_path_durations(logits, logit_lens, blank_id)
+        text_lens_list = text_lens.cpu().tolist()
+
+        for pred_ids, target_tensor, tgt_len in zip(
+            collapsed_ids,
+            texts,
+            text_lens_list,
+        ):
+            reference = target_tensor[: int(tgt_len)].tolist()
+            distance = _levenshtein_distance(reference, pred_ids)
+            total_distance += distance
+            total_reference += len(reference)
+
+    if total_reference == 0:
+        raise RuntimeError("No reference tokens found while computing PER")
+
+    per = float(total_distance) / float(total_reference)
+    return {
+        "per": per,
+        "total_distance": float(total_distance),
+        "total_reference": float(total_reference),
     }
 
 
@@ -433,7 +524,10 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     args = parser.parse_args(argv)
 
     checkpoint_arg = Path(args.checkpoint)
-    checkpoint_file = _resolve_checkpoint_path(checkpoint_arg)
+    epoch_checkpoints: List[Tuple[int, Path]] = []
+    if checkpoint_arg.is_dir():
+        epoch_checkpoints = _collect_epoch_checkpoints(checkpoint_arg)
+
     config_path = _infer_config_path(
         checkpoint_arg, Path(args.config) if args.config else None
     )
@@ -445,8 +539,85 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     else:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    model, token_map = load_asr_model_from_config(config, str(checkpoint_file), device)
     dev_loader, _ = build_dev_dataloader_from_config(config, device)
+
+    if epoch_checkpoints:
+        results: List[Tuple[int, Dict[str, float]]] = []
+        for epoch_idx, checkpoint_file in epoch_checkpoints:
+            print(f"=== Evaluating epoch {epoch_idx} ({checkpoint_file.name}) ===")
+            model, token_map = load_asr_model_from_config(
+                config, str(checkpoint_file), device
+            )
+            if " " not in token_map:
+                raise KeyError("The vocabulary does not contain the blank symbol ' '.")
+            blank_id = int(token_map[" "])
+
+            entropy_stats = compute_ctc_entropy(model, dev_loader, device, blank_id)
+            mean_diag, _ = diagonal_attention_score(
+                model,
+                dev_loader,
+                device,
+                band=args.band,
+                max_batches=args.max_align_batches,
+            )
+            dur_stats = duration_stats(model, dev_loader, device, blank_id)
+            skip_stats = skip_merge_flags(model, dev_loader, device, blank_id)
+            per_stats = compute_phoneme_error_rate(model, dev_loader, device, blank_id)
+
+            joint_score = (
+                per_stats["per"]
+                + 0.25 * (1.0 - mean_diag)
+                + 0.20 * max(0.0, entropy_stats["mean_blank_rate"] - 0.62)
+                + 0.20 * max(0.0, (-skip_stats["mean_len_diff"] - 6.0) / 20.0)
+                + 0.15 * max(0.0, 2.0 - dur_stats["p50"])
+            )
+
+            results.append(
+                (
+                    epoch_idx,
+                    {
+                        "joint_score": joint_score,
+                        "per": per_stats["per"],
+                        "diagonal": mean_diag,
+                        "blank_rate": entropy_stats["mean_blank_rate"],
+                        "len_diff": skip_stats["mean_len_diff"],
+                        "p50": dur_stats["p50"],
+                    },
+                )
+            )
+
+            print(
+                "  PER: {per:.4f} | diagonal: {diag:.4f} | blank: {blank:.4f} | "
+                "len_diff: {len_diff:.4f} | p50: {p50:.4f} | J: {joint:.4f}".format(
+                    per=per_stats["per"],
+                    diag=mean_diag,
+                    blank=entropy_stats["mean_blank_rate"],
+                    len_diff=skip_stats["mean_len_diff"],
+                    p50=dur_stats["p50"],
+                    joint=joint_score,
+                )
+            )
+            print()
+
+            del model
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        results.sort(key=lambda item: item[1]["joint_score"])
+        top_results = results[:5]
+
+        print("=== Top 5 checkpoints by J (lower is better) ===")
+        for epoch_label, metrics in top_results:
+            print(
+                f"epoch {epoch_label}: J={metrics['joint_score']:.4f}, PER={metrics['per']:.4f}, "
+                f"diag={metrics['diagonal']:.4f}, blank={metrics['blank_rate']:.4f}, "
+                f"len_diff={metrics['len_diff']:.4f}, p50={metrics['p50']:.4f}"
+            )
+
+        return
+
+    checkpoint_file = _resolve_checkpoint_path(checkpoint_arg)
+    model, token_map = load_asr_model_from_config(config, str(checkpoint_file), device)
 
     if " " not in token_map:
         raise KeyError("The vocabulary does not contain the blank symbol ' '.")
@@ -493,6 +664,22 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     skip_stats = skip_merge_flags(model, dev_loader, device, blank_id)
     for key, value in skip_stats.items():
         print(f"{key}: {value:.6f}")
+
+    print()
+    print("=== AuxiliaryASR_Phoneme_Error_Rate ===")
+    per_stats = compute_phoneme_error_rate(model, dev_loader, device, blank_id)
+    for key, value in per_stats.items():
+        print(f"{key}: {value:.6f}")
+
+    joint_score = (
+        per_stats["per"]
+        + 0.25 * (1.0 - mean_diag)
+        + 0.20 * max(0.0, entropy_stats["mean_blank_rate"] - 0.62)
+        + 0.20 * max(0.0, (-skip_stats["mean_len_diff"] - 6.0) / 20.0)
+        + 0.15 * max(0.0, 2.0 - dur_stats["p50"])
+    )
+    print()
+    print(f"Combined score J: {joint_score:.6f}")
 
 
 if __name__ == "__main__":
