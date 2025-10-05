@@ -169,6 +169,61 @@ class Trainer(object):
             if not isinstance(precision_cfg, dict):
                 precision_cfg = {}
 
+        mp_cfg = precision_cfg.get('mixed_precision', {}) if isinstance(precision_cfg, dict) else {}
+        if not isinstance(mp_cfg, dict):
+            mp_cfg = {}
+
+        dtype_map = {
+            'float16': torch.float16,
+            'fp16': torch.float16,
+            'half': torch.float16,
+            'bfloat16': torch.bfloat16,
+            'bf16': torch.bfloat16,
+        }
+        dtype_key = str(mp_cfg.get('dtype', 'float16')).lower()
+        self.mixed_precision_dtype = dtype_map.get(dtype_key, torch.float16)
+
+        autocast_requested = bool(mp_cfg.get('enabled', False))
+        device_type = self.device.type if isinstance(self.device, torch.device) else str(self.device)
+        if not isinstance(device_type, str):
+            device_type = str(device_type)
+        device_type = device_type.lower()
+        is_cuda_device = device_type.startswith('cuda')
+        cuda_available = torch.cuda.is_available()
+
+        self.autocast_device_type = 'cuda' if is_cuda_device else device_type or 'cuda'
+        self.autocast_enabled = autocast_requested and is_cuda_device and cuda_available
+
+        grad_scaler_cfg = mp_cfg.get('grad_scaler', {}) if isinstance(mp_cfg, dict) else {}
+        if not isinstance(grad_scaler_cfg, dict):
+            grad_scaler_cfg = {}
+
+        scaler_enabled = bool(grad_scaler_cfg.get('enabled', True)) and self.autocast_enabled
+        if scaler_enabled:
+            init_scale = float(grad_scaler_cfg.get('init_scale', 65536.0))
+            growth_factor = float(grad_scaler_cfg.get('growth_factor', 2.0))
+            backoff_factor = float(grad_scaler_cfg.get('backoff_factor', 0.5))
+            growth_interval = int(grad_scaler_cfg.get('growth_interval', 2000))
+            scaler_kwargs = dict(
+                enabled=True,
+                init_scale=init_scale,
+                growth_factor=growth_factor,
+                backoff_factor=backoff_factor,
+                growth_interval=growth_interval,
+            )
+
+            try:
+                scaler_params = inspect.signature(amp.GradScaler.__init__).parameters
+            except (ValueError, TypeError):
+                scaler_params = {}
+
+            if 'device_type' in scaler_params:
+                scaler_kwargs['device_type'] = self.autocast_device_type
+
+            self.grad_scaler = amp.GradScaler(**scaler_kwargs)
+        else:
+            self.grad_scaler = None
+
     def _configure_diagonal_attention_weight(self, weight_config):
         schedule = None
         if isinstance(weight_config, dict):
@@ -227,56 +282,6 @@ class Trainer(object):
 
     def _get_active_diagonal_attention_weight(self) -> float:
         return float(getattr(self, '_active_diagonal_attention_weight', self.diagonal_attention_prior_weight))
-        mp_cfg = precision_cfg.get('mixed_precision', {}) if isinstance(precision_cfg, dict) else {}
-        if not isinstance(mp_cfg, dict):
-            mp_cfg = {}
-        dtype_map = {
-            'float16': torch.float16,
-            'fp16': torch.float16,
-            'half': torch.float16,
-            'bfloat16': torch.bfloat16,
-            'bf16': torch.bfloat16,
-        }
-        dtype_key = str(mp_cfg.get('dtype', 'float16')).lower()
-        self.mixed_precision_dtype = dtype_map.get(dtype_key, torch.float16)
-        autocast_enabled = bool(mp_cfg.get('enabled', False))
-        device_type = self.device.type if isinstance(self.device, torch.device) else str(self.device)
-        self.autocast_enabled = (
-            autocast_enabled
-            and torch.cuda.is_available()
-            and isinstance(device_type, str)
-            and device_type.startswith('cuda')
-        )
-        self.autocast_device_type = 'cuda'
-
-        grad_scaler_cfg = mp_cfg.get('grad_scaler', {}) if isinstance(mp_cfg, dict) else {}
-        if not isinstance(grad_scaler_cfg, dict):
-            grad_scaler_cfg = {}
-        scaler_enabled = bool(grad_scaler_cfg.get('enabled', True)) and self.autocast_enabled
-        if scaler_enabled:
-            init_scale = float(grad_scaler_cfg.get('init_scale', 65536.0))
-            growth_factor = float(grad_scaler_cfg.get('growth_factor', 2.0))
-            backoff_factor = float(grad_scaler_cfg.get('backoff_factor', 0.5))
-            growth_interval = int(grad_scaler_cfg.get('growth_interval', 2000))
-            scaler_kwargs = dict(
-                enabled=True,
-                init_scale=init_scale,
-                growth_factor=growth_factor,
-                backoff_factor=backoff_factor,
-                growth_interval=growth_interval,
-            )
-
-            try:
-                scaler_params = inspect.signature(amp.GradScaler.__init__).parameters
-            except (ValueError, TypeError):
-                scaler_params = {}
-
-            if 'device_type' in scaler_params:
-                scaler_kwargs['device_type'] = self.autocast_device_type
-
-            self.grad_scaler = amp.GradScaler(**scaler_kwargs)
-        else:
-            self.grad_scaler = None
 
         self._scheduler_aligned = False
         self._optimizer_step_count = self._get_optimizer_step_count()
