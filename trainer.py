@@ -224,6 +224,35 @@ class Trainer(object):
         else:
             self.grad_scaler = None
 
+        # Scheduler/step bookkeeping: align with whatever the optimiser already
+        # recorded so resumed runs don't double-step, and ensure the attribute
+        # always exists before training starts.
+        self._scheduler_aligned = False
+        self._optimizer_step_count = self._get_optimizer_step_count()
+
+        # Work out whether SortaGrad should remain active after initialisation
+        # now that dataloaders are wired up. We seeded the attribute early so
+        # that partially constructed trainers expose it, but the final decision
+        # depends on the availability of both sorted and shuffled loaders.
+        sortagrad_possible = (
+            self.sorted_train_dataloader is not None
+            and self.shuffled_train_dataloader is not None
+            and self.switch_sortagrad_dataset_epoch is not None
+            and self.switch_sortagrad_dataset_epoch > 0
+        )
+
+        if sortagrad_possible:
+            self._sortagrad_active = True
+            self.train_dataloader = self.sorted_train_dataloader
+            if self.sorted_val_dataloader is not None:
+                self.val_dataloader = self.sorted_val_dataloader
+        else:
+            self._sortagrad_active = False
+            if self.shuffled_train_dataloader is not None:
+                self.train_dataloader = self.shuffled_train_dataloader
+            if self.shuffled_val_dataloader is not None:
+                self.val_dataloader = self.shuffled_val_dataloader
+
     def _configure_diagonal_attention_weight(self, weight_config):
         schedule = None
         if isinstance(weight_config, dict):
@@ -282,21 +311,6 @@ class Trainer(object):
 
     def _get_active_diagonal_attention_weight(self) -> float:
         return float(getattr(self, '_active_diagonal_attention_weight', self.diagonal_attention_prior_weight))
-
-        self._scheduler_aligned = False
-        self._optimizer_step_count = self._get_optimizer_step_count()
-        self._sortagrad_active = bool(
-            self.sorted_train_dataloader
-            and self.shuffled_train_dataloader
-            and self.switch_sortagrad_dataset_epoch is not None
-            and self.switch_sortagrad_dataset_epoch > 0
-        )
-
-        if not self._sortagrad_active:
-            if self.shuffled_train_dataloader is not None:
-                self.train_dataloader = self.shuffled_train_dataloader
-            if self.shuffled_val_dataloader is not None:
-                self.val_dataloader = self.shuffled_val_dataloader
 
     def _adjust_ctc_logits(self, logits):
         """Apply optional blank bias and temperature scaling to CTC logits."""
