@@ -10,6 +10,8 @@ validation split, and prints notebook-style summaries for quick reporting.
 from __future__ import annotations
 
 import argparse
+import math
+import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
@@ -430,9 +432,15 @@ def duration_stats(
             all_durs.extend(dur)
 
     if not all_durs:
-        raise RuntimeError(
-            "No non-blank token durations collected; check the model outputs."
+        warnings.warn(
+            "No non-blank token durations collected; returning NaN-filled duration stats."
         )
+        return {
+            "mean_dur_frames": float("nan"),
+            "p50": float("nan"),
+            "p90": float("nan"),
+            "frames_per_token_mean": float("nan"),
+        }
 
     all_durs_np = np.array(all_durs, dtype=np.float32)
     ratios_np = np.array(ratios, dtype=np.float32)
@@ -564,12 +572,17 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
             skip_stats = skip_merge_flags(model, dev_loader, device, blank_id)
             per_stats = compute_phoneme_error_rate(model, dev_loader, device, blank_id)
 
+            p50_for_penalty = (
+                dur_stats["p50"]
+                if math.isfinite(dur_stats["p50"])
+                else 0.0
+            )
             joint_score = (
                 per_stats["per"]
                 + 0.25 * (1.0 - mean_diag)
                 + 0.20 * max(0.0, entropy_stats["mean_blank_rate"] - 0.62)
                 + 0.20 * max(0.0, (-skip_stats["mean_len_diff"] - 6.0) / 20.0)
-                + 0.15 * max(0.0, 2.0 - dur_stats["p50"])
+                + 0.15 * max(0.0, 2.0 - p50_for_penalty)
             )
 
             results.append(
@@ -671,12 +684,13 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
     for key, value in per_stats.items():
         print(f"{key}: {value:.6f}")
 
+    p50_for_penalty = dur_stats["p50"] if math.isfinite(dur_stats["p50"]) else 0.0
     joint_score = (
         per_stats["per"]
         + 0.25 * (1.0 - mean_diag)
         + 0.20 * max(0.0, entropy_stats["mean_blank_rate"] - 0.62)
         + 0.20 * max(0.0, (-skip_stats["mean_len_diff"] - 6.0) / 20.0)
-        + 0.15 * max(0.0, 2.0 - dur_stats["p50"])
+        + 0.15 * max(0.0, 2.0 - p50_for_penalty)
     )
     print()
     print(f"Combined score J: {joint_score:.6f}")
