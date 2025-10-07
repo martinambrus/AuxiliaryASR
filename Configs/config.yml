@@ -187,6 +187,22 @@ ctc_loss:
       min_ratio: 0.92
       tolerance: 0.03
       warmup_epochs: 5
+    min_duration:
+      enabled: true
+      weight_initial: 1.0
+      weight_target: 1.5
+      ramp_pct: 0.3
+      min_frames: 2.0
+      warmup_epochs: 5
+    temporal_smoothing:
+      enabled: true
+      weight: 0.3
+      warmup_epochs: 5
+    blank_run:
+      enabled: true
+      weight: 0.2
+      max_run: 3.0
+      warmup_epochs: 5
 
 alignment_regularization:
   attention_duration:

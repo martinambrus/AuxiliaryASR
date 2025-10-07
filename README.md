@@ -103,7 +103,7 @@ Each augmentation block can be toggled on or off independently through `Configs/
 
 #### Keeping the CTC branch expressive
 
-When the auxiliary ASR is trained on only a few hours of speech, the CTC head can collapse into predicting mostly blanks, which hurts diagonal alignments and increases the skip/merge gap. The default configuration now enables gentle blank-rate and coverage regularisers so deletions are discouraged without overwhelming the core losses:
+When the auxiliary ASR is trained on only a few hours of speech, the CTC head can collapse into predicting mostly blanks, which hurts diagonal alignments and increases the skip/merge gap. The default configuration now enables a richer set of regularisers so deletions are discouraged without overwhelming the core losses:
 
 ```yaml
 ctc_loss:
@@ -120,6 +120,19 @@ ctc_loss:
       weight: 0.12
       min_ratio: 0.92
       tolerance: 0.03        # allows slight under-coverage before the loss activates
+    min_duration:
+      enabled: true          # forward–backward posterior mass per token must exceed 2 frames
+      weight_initial: 1.0
+      weight_target: 1.5
+      ramp_pct: 0.3          # ramp the weight over the first 30% of training epochs
+      min_frames: 2.0
+    temporal_smoothing:
+      enabled: true          # total-variation penalty on consecutive non-blank posterior slices
+      weight: 0.3
+    blank_run:
+      enabled: true          # discourages blank streaks longer than ~3 frames
+      weight: 0.2
+      max_run: 3.0
 
 alignment_regularization:
   attention_duration:
@@ -135,7 +148,7 @@ regularization:
         weight: 0.02         # maximise entropy to keep non-blank symbols active
 ```
 
-All of the auxiliary losses honour a `warmup_epochs` key (`5` for the CTC penalties and `8` for the duration term in the default config) so you can delay their activation until the alignment has roughly converged.
+All of the auxiliary losses honour a `warmup_epochs` key (`5` for the CTC penalties and `8` for the attention-duration term in the default config) so you can delay their activation until the alignment has roughly converged.
 
 Decoding-time safeguards provide gentler blank suppression without distorting training. The beam-search configuration supports a temperature, blank penalty, insertion bonus, and lightweight length normalisation:
 

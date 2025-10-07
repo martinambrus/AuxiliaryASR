@@ -127,6 +127,24 @@ class Trainer(object):
         self.ctc_coverage_regularization_enabled = bool(coverage_reg_cfg.get('enabled', False))
         self.ctc_coverage_regularization_config = coverage_reg_cfg
 
+        min_dur_cfg = ctc_reg_cfg.get('min_duration', {}) or {}
+        if not isinstance(min_dur_cfg, dict):
+            min_dur_cfg = {}
+        self.ctc_min_duration_regularization_enabled = bool(min_dur_cfg.get('enabled', False))
+        self.ctc_min_duration_regularization_config = min_dur_cfg
+
+        tv_cfg = ctc_reg_cfg.get('temporal_smoothing', {}) or {}
+        if not isinstance(tv_cfg, dict):
+            tv_cfg = {}
+        self.ctc_temporal_smoothing_regularization_enabled = bool(tv_cfg.get('enabled', False))
+        self.ctc_temporal_smoothing_regularization_config = tv_cfg
+
+        blank_run_cfg = ctc_reg_cfg.get('blank_run', {}) or {}
+        if not isinstance(blank_run_cfg, dict):
+            blank_run_cfg = {}
+        self.ctc_blank_run_regularization_enabled = bool(blank_run_cfg.get('enabled', False))
+        self.ctc_blank_run_regularization_config = blank_run_cfg
+
         alignment_reg_cfg = {}
         if isinstance(self.config, dict):
             alignment_reg_cfg = self.config.get('alignment_regularization', {}) or {}
@@ -357,11 +375,17 @@ class Trainer(object):
             return True
         return self.epochs >= max(warmup, 0)
 
-    def _compute_ctc_alignment_regularization(self, logits, input_lengths, target_lengths):
+    def _compute_ctc_alignment_regularization(self, logits, input_lengths, target_lengths, targets):
         if logits is None:
             return {}, {}
 
-        enabled = self.ctc_blank_rate_regularization_enabled or self.ctc_coverage_regularization_enabled
+        enabled = (
+            self.ctc_blank_rate_regularization_enabled
+            or self.ctc_coverage_regularization_enabled
+            or self.ctc_min_duration_regularization_enabled
+            or self.ctc_temporal_smoothing_regularization_enabled
+            or self.ctc_blank_run_regularization_enabled
+        )
         if not enabled:
             return {}, {}
 
@@ -389,6 +413,39 @@ class Trainer(object):
                 if coverage_result is not None:
                     loss_value, stats = coverage_result
                     reg_losses['ctc/coverage_reg'] = loss_value
+                    reg_stats.update(stats)
+
+        if self.ctc_min_duration_regularization_enabled:
+            duration_cfg = self.ctc_min_duration_regularization_config
+            if self._ctc_regularization_warmup_passed(duration_cfg):
+                duration_result = self._compute_ctc_min_duration_regularization(
+                    probs, input_lengths, targets, target_lengths, duration_cfg
+                )
+                if duration_result is not None:
+                    loss_value, stats = duration_result
+                    reg_losses['ctc/min_duration_reg'] = loss_value
+                    reg_stats.update(stats)
+
+        if self.ctc_temporal_smoothing_regularization_enabled:
+            tv_cfg = self.ctc_temporal_smoothing_regularization_config
+            if self._ctc_regularization_warmup_passed(tv_cfg):
+                tv_result = self._compute_ctc_temporal_smoothing_regularization(
+                    probs, input_lengths, tv_cfg
+                )
+                if tv_result is not None:
+                    loss_value, stats = tv_result
+                    reg_losses['ctc/temporal_smoothing_reg'] = loss_value
+                    reg_stats.update(stats)
+
+        if self.ctc_blank_run_regularization_enabled:
+            blank_run_cfg = self.ctc_blank_run_regularization_config
+            if self._ctc_regularization_warmup_passed(blank_run_cfg):
+                blank_run_result = self._compute_ctc_blank_run_regularization(
+                    probs, input_lengths, blank_run_cfg
+                )
+                if blank_run_result is not None:
+                    loss_value, stats = blank_run_result
+                    reg_losses['ctc/blank_run_reg'] = loss_value
                     reg_stats.update(stats)
 
         return reg_losses, reg_stats
@@ -493,6 +550,250 @@ class Trainer(object):
 
         stats = {
             'diagnostics/ctc_coverage_ratio': float(coverage_ratio.mean().detach().item()),
+        }
+        return loss_value, stats
+
+    def _ctc_training_progress(self):
+        total_epochs = 0
+        if isinstance(self.config, dict):
+            try:
+                total_epochs = int(self.config.get('epochs', 0) or 0)
+            except (TypeError, ValueError):
+                total_epochs = 0
+        if total_epochs <= 0:
+            return 0.0
+        progress = float(self.epochs) / float(max(total_epochs, 1))
+        return min(max(progress, 0.0), 1.0)
+
+    def _compute_ctc_min_duration_regularization(self, probs, input_lengths, targets, target_lengths, cfg):
+        blank_id = self.ctc_blank_id
+        if blank_id < 0 or blank_id >= probs.size(-1):
+            return None
+
+        if targets is None or target_lengths is None:
+            return None
+
+        weight_initial = float(cfg.get('weight_initial', cfg.get('weight', 0.0)))
+        weight_target = float(cfg.get('weight_target', weight_initial))
+        if weight_initial == 0.0 and weight_target == 0.0:
+            return None
+
+        ramp_pct = float(cfg.get('ramp_pct', 0.0))
+        if ramp_pct > 0.0 and weight_target != weight_initial:
+            progress = self._ctc_training_progress()
+            ramp_progress = min(progress / max(ramp_pct, 1e-6), 1.0)
+            weight = weight_initial + (weight_target - weight_initial) * ramp_progress
+        else:
+            weight = weight_target if weight_target != weight_initial else weight_initial
+
+        if weight == 0.0:
+            return None
+
+        if not torch.is_tensor(input_lengths):
+            input_lengths = torch.as_tensor(input_lengths, device=probs.device)
+        if not torch.is_tensor(target_lengths):
+            target_lengths = torch.as_tensor(target_lengths, device=probs.device)
+        input_lengths = input_lengths.to(device=probs.device, dtype=torch.long)
+        target_lengths = target_lengths.to(device=probs.device, dtype=torch.long)
+
+        device = probs.device
+        dtype = probs.dtype
+
+        log_probs = torch.log(probs.clamp_min(1.0e-12))
+        batch_penalties = []
+        all_durations = []
+        min_frames = float(cfg.get('min_frames', cfg.get('d_min', 2.0)))
+
+        for batch_idx in range(probs.size(0)):
+            T = int(input_lengths[batch_idx].item())
+            U = int(target_lengths[batch_idx].item())
+            if T <= 0 or U <= 0:
+                continue
+            seq_log_probs = log_probs[batch_idx, :T]
+            seq_targets = targets[batch_idx, :U]
+            expected = self._ctc_expected_token_durations(seq_log_probs, seq_targets, blank_id)
+            if expected is None or expected.numel() == 0:
+                continue
+            hinge = torch.clamp(min_frames - expected, min=0.0)
+            penalty = hinge.mean()
+            batch_penalties.append(penalty)
+            all_durations.append(expected.detach())
+
+        if not batch_penalties:
+            return None
+
+        penalties = torch.stack(batch_penalties)
+        loss_value = penalties.mean() * weight
+
+        stats = {}
+        concatenated = torch.cat(all_durations) if all_durations else None
+        if concatenated is not None and concatenated.numel() > 0:
+            stats['diagnostics/ctc_expected_duration_mean'] = float(concatenated.mean().item())
+            stats['diagnostics/ctc_expected_duration_min'] = float(concatenated.min().item())
+            stats['diagnostics/ctc_expected_duration_max'] = float(concatenated.max().item())
+            short_mask = concatenated < min_frames
+            stats['diagnostics/ctc_expected_duration_short_ratio'] = float(short_mask.float().mean().item())
+
+        return loss_value, stats
+
+    def _ctc_expected_token_durations(self, log_probs, targets, blank_id):
+        T, V = log_probs.shape
+        device = log_probs.device
+        dtype = log_probs.dtype
+
+        extended = torch.full((targets.size(0) * 2 + 1,), blank_id, device=device, dtype=torch.long)
+        extended[1::2] = targets
+        S = extended.size(0)
+        if S == 0:
+            return None
+
+        neg_inf = torch.finfo(dtype).min
+        alpha = log_probs.new_full((T, S), neg_inf)
+        beta = log_probs.new_full((T, S), neg_inf)
+
+        alpha[0, 0] = log_probs[0, blank_id]
+        if S > 1:
+            alpha[0, 1] = log_probs[0, extended[1]]
+
+        for t in range(1, T):
+            prev = alpha[t - 1]
+            emit = log_probs[t]
+            for s in range(S):
+                label = extended[s]
+                candidates = [prev[s]]
+                if s - 1 >= 0:
+                    candidates.append(prev[s - 1])
+                if s - 2 >= 0 and label != blank_id and label != extended[s - 2]:
+                    candidates.append(prev[s - 2])
+                alpha[t, s] = torch.logsumexp(torch.stack(candidates), dim=0) + emit[label]
+
+        beta[-1, S - 1] = 0.0
+        if S > 1:
+            beta[-1, S - 2] = 0.0
+
+        for t in range(T - 2, -1, -1):
+            nxt = beta[t + 1]
+            emit_next = log_probs[t + 1]
+            for s in range(S):
+                label = extended[s]
+                candidates = [nxt[s] + emit_next[label]]
+                if s + 1 < S:
+                    next_label = extended[s + 1]
+                    candidates.append(nxt[s + 1] + emit_next[next_label])
+                if (
+                    s + 2 < S
+                    and label != blank_id
+                    and extended[s + 2] != label
+                ):
+                    skip_label = extended[s + 2]
+                    candidates.append(nxt[s + 2] + emit_next[skip_label])
+                beta[t, s] = torch.logsumexp(torch.stack(candidates), dim=0)
+
+        final_terms = [alpha[-1, S - 1]]
+        if S > 1:
+            final_terms.append(alpha[-1, S - 2])
+        log_z = torch.logsumexp(torch.stack(final_terms), dim=0)
+
+        log_gamma = alpha + beta
+        log_gamma = log_gamma - log_z
+        gamma = torch.exp(log_gamma)
+
+        token_indices = torch.arange(1, S, 2, device=device)
+        durations = gamma[:, token_indices].sum(dim=0)
+        return durations
+
+    def _compute_ctc_temporal_smoothing_regularization(self, probs, input_lengths, cfg):
+        blank_id = self.ctc_blank_id
+        if blank_id < 0 or blank_id >= probs.size(-1):
+            return None
+
+        weight = float(cfg.get('weight', 0.0))
+        if weight == 0.0:
+            return None
+
+        non_blank = torch.cat(
+            [
+                probs[..., :blank_id],
+                probs[..., blank_id + 1 :],
+            ],
+            dim=-1,
+        ) if probs.size(-1) > 1 else probs.new_zeros(probs.shape[:-1] + (0,))
+
+        if non_blank.size(-1) == 0:
+            return None
+
+        diffs = torch.abs(non_blank[:, 1:, :] - non_blank[:, :-1, :]).sum(dim=-1)
+
+        if not torch.is_tensor(input_lengths):
+            input_lengths = torch.as_tensor(input_lengths, device=probs.device)
+        lengths = input_lengths.to(device=probs.device, dtype=torch.long)
+        max_steps = diffs.size(1)
+        transition_mask = torch.arange(max_steps, device=diffs.device).unsqueeze(0)
+        transition_mask = transition_mask < (lengths.view(-1, 1) - 1).clamp_min(0)
+        transition_mask = transition_mask.to(diffs.dtype)
+
+        masked_diffs = diffs * transition_mask
+        denom = transition_mask.sum(dim=1).clamp_min(1.0)
+        tv = masked_diffs.sum(dim=1) / denom
+
+        loss_value = tv.mean() * weight
+        stats = {
+            'diagnostics/ctc_temporal_variation': float(tv.mean().detach().item()),
+        }
+        return loss_value, stats
+
+    def _compute_ctc_blank_run_regularization(self, probs, input_lengths, cfg):
+        blank_id = self.ctc_blank_id
+        if blank_id < 0 or blank_id >= probs.size(-1):
+            return None
+
+        weight = float(cfg.get('weight', 0.0))
+        if weight == 0.0:
+            return None
+
+        if not torch.is_tensor(input_lengths):
+            input_lengths = torch.as_tensor(input_lengths, device=probs.device)
+        lengths = input_lengths.to(device=probs.device, dtype=torch.long)
+
+        blank_probs = probs[..., blank_id]
+        threshold = float(cfg.get('max_run', cfg.get('threshold', 3.0)))
+
+        penalties = []
+        for batch_idx in range(blank_probs.size(0)):
+            L = int(lengths[batch_idx].item())
+            if L <= 0:
+                continue
+            seq = blank_probs[batch_idx, :L]
+            run_prev = seq.new_zeros(())
+            prev_excess = seq.new_zeros(())
+            prev_blank = seq.new_zeros(())
+            penalty_acc = seq.new_zeros(())
+            run_starts = seq.new_zeros(())
+
+            for t in range(L):
+                prob_blank = seq[t]
+                start_prob = prob_blank * (1.0 - prev_blank)
+                run_starts = run_starts + start_prob
+
+                run_curr = prob_blank * (run_prev + 1.0)
+                excess = torch.relu(run_curr - threshold)
+                increment = torch.relu(excess - prev_excess)
+                penalty_acc = penalty_acc + increment
+
+                prev_blank = prob_blank
+                prev_excess = excess
+                run_prev = run_curr
+
+            run_starts = torch.clamp(run_starts, min=1.0)
+            penalties.append(penalty_acc / run_starts)
+
+        if not penalties:
+            return None
+
+        penalty_tensor = torch.stack(penalties)
+        loss_value = penalty_tensor.mean() * weight
+        stats = {
+            'diagnostics/ctc_blank_run_penalty': float(penalty_tensor.mean().detach().item()),
         }
         return loss_value, stats
 
@@ -1208,7 +1509,7 @@ class Trainer(object):
                 loss_ctc = torch.zeros(1, device=self.device)
 
             reg_losses, reg_stats = self._compute_ctc_alignment_regularization(
-                ppgs, mel_input_length, text_input_length
+                ppgs, mel_input_length, text_input_length, text_input
             )
             for key, value in reg_losses.items():
                 total_loss = total_loss + value
