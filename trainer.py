@@ -283,14 +283,26 @@ class Trainer(object):
         if isinstance(weight_config, dict):
             initial = float(weight_config.get('initial', weight_config.get('base', weight_config.get('start', 0.0))))
             target = float(weight_config.get('target', weight_config.get('final', initial)))
-            warmup = int(weight_config.get('warmup_epochs', weight_config.get('ramp_epochs', 0)))
-            hold = int(weight_config.get('hold_epochs', 0))
+            warmup_epochs = int(weight_config.get('warmup_epochs', weight_config.get('ramp_epochs', 0)))
+            hold_epochs = int(weight_config.get('hold_epochs', 0))
+            warmup_steps = int(weight_config.get('warmup_steps', weight_config.get('ramp_steps', 0)))
+            hold_steps = int(weight_config.get('hold_steps', weight_config.get('initial_steps', 0)))
+
             schedule = {
                 'initial': initial,
                 'target': target,
-                'warmup': max(0, warmup),
-                'hold': max(0, hold),
+                'warmup_epochs': max(0, warmup_epochs),
+                'hold_epochs': max(0, hold_epochs),
+                'warmup_steps': max(0, warmup_steps),
+                'hold_steps': max(0, hold_steps),
             }
+
+            # Default to a step-based schedule if any step-related parameter is set.
+            if schedule['warmup_steps'] > 0 or schedule['hold_steps'] > 0:
+                schedule['mode'] = 'step'
+            else:
+                schedule['mode'] = 'epoch'
+
             base_weight = initial
         else:
             base_weight = float(weight_config) if weight_config is not None else 0.0
@@ -299,24 +311,47 @@ class Trainer(object):
         self.diagonal_attention_weight_schedule = schedule
         self._active_diagonal_attention_weight = float(base_weight)
 
-    def _current_diagonal_attention_weight(self, epoch_index: int) -> float:
+    def _current_diagonal_attention_weight(self, training: bool) -> float:
         schedule = self.diagonal_attention_weight_schedule
         if not schedule:
             return float(self.diagonal_attention_prior_weight)
 
-        epoch = max(1, int(epoch_index))
         initial = float(schedule['initial'])
         target = float(schedule['target'])
-        warmup = int(schedule['warmup'])
-        hold = int(schedule['hold'])
+        mode = schedule.get('mode', 'epoch')
 
-        if warmup <= 0:
+        if mode == 'step':
+            if training:
+                step_index = self._optimizer_step_count + 1
+            else:
+                step_index = max(1, self._optimizer_step_count)
+
+            hold_steps = int(schedule.get('hold_steps', 0))
+            warmup_steps = int(schedule.get('warmup_steps', 0))
+
+            if hold_steps > 0 and step_index <= hold_steps:
+                weight = initial
+            else:
+                if warmup_steps <= 0:
+                    weight = target
+                else:
+                    progress_steps = max(0, step_index - hold_steps)
+                    progress = min(1.0, progress_steps / float(max(1, warmup_steps)))
+                    weight = initial + (target - initial) * progress
+
+            return float(weight)
+
+        epoch_index = self.epochs + 1 if training else max(1, self.epochs)
+        warmup_epochs = int(schedule.get('warmup_epochs', 0))
+        hold_epochs = int(schedule.get('hold_epochs', 0))
+
+        if warmup_epochs <= 0:
             weight = target
         else:
-            progress = min(1.0, max(0.0, (epoch - 1) / float(max(1, warmup))))
+            progress = min(1.0, max(0.0, (epoch_index - 1) / float(max(1, warmup_epochs))))
             weight = initial + (target - initial) * progress
 
-        if epoch > warmup + hold:
+        if epoch_index > warmup_epochs + hold_epochs:
             weight = target
 
         return float(weight)
@@ -326,12 +361,7 @@ class Trainer(object):
             self._active_diagonal_attention_weight = 0.0
             return
 
-        if training:
-            epoch_index = self.epochs + 1
-        else:
-            epoch_index = max(1, self.epochs)
-
-        weight = self._current_diagonal_attention_weight(epoch_index)
+        weight = self._current_diagonal_attention_weight(training=training)
         self._active_diagonal_attention_weight = weight
 
     def _get_active_diagonal_attention_weight(self) -> float:
@@ -1624,6 +1654,7 @@ class Trainer(object):
                     losses.update(duration_stats)
 
             if self.use_diagonal_attention_prior and s2s_attn is not None:
+                self._set_active_diagonal_attention_weight(training=self.model.training)
                 diag_weight = self._get_active_diagonal_attention_weight()
                 if diag_weight > 0.0:
                     loss_diagonal = diagonal_attention_prior(
