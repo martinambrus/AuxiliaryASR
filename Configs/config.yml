@@ -88,6 +88,8 @@ model_params:
    n_layers: 5
    location_kernel_size: 31
    attention_dropout: 0.1
+   attention_type: monotonic_chunkwise
+   attention_chunk_size: 4
 
 multi_task:
   use_ctc: true
@@ -160,9 +162,9 @@ sortagrad_switch_to_shuffled_dataset_epoch: 10
 # make ASR learn to read phonemes from left to right, not randomly
 use_diagonal_attention_prior: True
 diagonal_attention_prior_weight:
-  initial: 0.35
-  target: 0.65
-  warmup_epochs: 60
+  initial: 1.2
+  target: 0.25
+  warmup_epochs: 100
   hold_epochs: 20
 diagonal_attention_prior_sigma: 0.32
 

@@ -152,7 +152,9 @@ class LocationLayer(nn.Module):
 class Attention(nn.Module):
     def __init__(self, attention_rnn_dim, embedding_dim, attention_dim,
                  attention_location_n_filters, attention_location_kernel_size,
-                 attention_dropout=0.0):
+                 attention_dropout=0.0,
+                 use_monotonic_chunkwise: bool = False,
+                 monotonic_chunk_size: int = 0):
         super(Attention, self).__init__()
         self.query_layer = LinearNorm(attention_rnn_dim, attention_dim,
                                       bias=False, w_init_gain='tanh')
@@ -165,6 +167,9 @@ class Attention(nn.Module):
         self.score_mask_value = -float("inf")
         self.attention_dropout_p = max(0.0, float(attention_dropout))
         self._attention_dropout = nn.Dropout(p=self.attention_dropout_p) if self.attention_dropout_p > 0.0 else None
+        chunk_size = int(monotonic_chunk_size or 0)
+        self.monotonic_chunk_size = max(0, chunk_size)
+        self.use_monotonic_chunkwise = bool(use_monotonic_chunkwise and self.monotonic_chunk_size > 0)
 
     def get_alignment_energies(self, query, processed_memory,
                                attention_weights_cat):
@@ -187,6 +192,23 @@ class Attention(nn.Module):
         energies = energies.squeeze(-1)
         return energies
 
+    def _compute_monotonic_chunk_mask(self, attention_weights_cat: torch.Tensor, max_time: int) -> torch.Tensor:
+        if not self.use_monotonic_chunkwise or max_time <= 0:
+            return None
+
+        prev_weights = attention_weights_cat[:, 0, :]
+        # Determine if any attention has been emitted previously for each batch.
+        has_history = prev_weights.sum(dim=1, keepdim=True) > 0
+        # Default to the first timestep when no history is available yet.
+        start_index = torch.argmax(prev_weights, dim=1, keepdim=True)
+        start_index = torch.where(has_history, start_index, torch.zeros_like(start_index))
+        start_index = torch.clamp(start_index, max=max_time - 1)
+        end_index = torch.clamp(start_index + self.monotonic_chunk_size, max=max_time)
+
+        positions = torch.arange(max_time, device=attention_weights_cat.device).unsqueeze(0)
+        mask = (positions < start_index) | (positions >= end_index)
+        return mask
+
     def forward(self, attention_hidden_state, memory, processed_memory,
                 attention_weights_cat, mask):
         """
@@ -200,6 +222,13 @@ class Attention(nn.Module):
         """
         alignment = self.get_alignment_energies(
             attention_hidden_state, processed_memory, attention_weights_cat)
+
+        chunk_mask = self._compute_monotonic_chunk_mask(attention_weights_cat, alignment.size(1))
+        if chunk_mask is not None:
+            if mask is None:
+                mask = chunk_mask
+            else:
+                mask = mask | chunk_mask
 
         if mask is not None:
             alignment.data.masked_fill_(mask, self.score_mask_value)

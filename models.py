@@ -148,6 +148,8 @@ class ASRCNN(nn.Module):
                  token_embedding_dim=256,
                  location_kernel_size=63,
                  attention_dropout=0.0,
+                 attention_type: str = "location",
+                 attention_chunk_size: int = 0,
                  multi_task_config=None,
                  stabilization_config=None,
                  memory_optimization_config=None,
@@ -267,12 +269,17 @@ class ASRCNN(nn.Module):
         else:
             self.ctc_linear = None
 
+        self.attention_type = str(attention_type or "location").lower()
+        self.attention_chunk_size = int(attention_chunk_size or 0)
+
         self.asr_s2s = ASRS2S(
             embedding_dim=token_embedding_dim,
             hidden_dim=hidden_dim//2,
             n_token=n_token,
             location_kernel_size=location_kernel_size,
-            attention_dropout=attention_dropout)
+            attention_dropout=attention_dropout,
+            attention_type=self.attention_type,
+            attention_chunk_size=self.attention_chunk_size)
 
         frame_cfg = self.multi_task_config.get('frame_phoneme', {}) or {}
         self.enable_frame_classifier = bool(frame_cfg.get('enabled', False))
@@ -688,7 +695,9 @@ class ASRS2S(nn.Module):
                  n_location_filters=32,
                  location_kernel_size=63,
                  n_token=40,
-                 attention_dropout=0.0):
+                 attention_dropout=0.0,
+                 attention_type: str = "location",
+                 attention_chunk_size: int = 0):
         super(ASRS2S, self).__init__()
         self.embedding = nn.Embedding(n_token, embedding_dim)
         val_range = math.sqrt(6 / hidden_dim)
@@ -696,13 +705,18 @@ class ASRS2S(nn.Module):
 
         self.decoder_rnn_dim = hidden_dim
         self.project_to_n_symbols = nn.Linear(self.decoder_rnn_dim, n_token)
+        attn_type = str(attention_type or "location").lower()
+        chunk_size = int(attention_chunk_size or 0)
+        use_monotonic_chunkwise = attn_type in ("monotonic_chunkwise", "mocha", "monotonic_chunk", "chunkwise")
         self.attention_layer = Attention(
             self.decoder_rnn_dim,
             hidden_dim,
             hidden_dim,
             n_location_filters,
             location_kernel_size,
-            attention_dropout=attention_dropout
+            attention_dropout=attention_dropout,
+            use_monotonic_chunkwise=use_monotonic_chunkwise,
+            monotonic_chunk_size=chunk_size if use_monotonic_chunkwise else 0
         )
         self.decoder_rnn = nn.LSTMCell(self.decoder_rnn_dim + embedding_dim, self.decoder_rnn_dim)
         self.project_to_hidden = nn.Sequential(
