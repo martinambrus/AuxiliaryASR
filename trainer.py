@@ -471,27 +471,22 @@ class Trainer(object):
             mask = mask.to(non_blank.dtype)
 
         if mask is not None:
-            coverage_mass = (non_blank * mask).sum(dim=1)
+            expected_non_blank = (non_blank * mask).sum(dim=1)
         else:
-            coverage_mass = non_blank.sum(dim=1)
+            expected_non_blank = non_blank.sum(dim=1)
+
+        margin = float(cfg.get('margin', cfg.get('delta', 4.0)))
+        margin = max(margin, 0.0)
+
+        penalty = torch.clamp((target_lengths - expected_non_blank) - margin, min=0.0)
 
         denom = target_lengths.clamp_min(1.0)
-        coverage_ratio = coverage_mass / denom
-
-        min_ratio = float(cfg.get('min_ratio', 1.0))
-        tolerance = float(cfg.get('tolerance', 0.0))
-        lower_bound = max(min_ratio - tolerance, 0.0)
-        penalty = torch.clamp(lower_bound - coverage_ratio, min=0.0)
-
-        max_ratio = cfg.get('max_ratio', None)
-        if max_ratio is not None:
-            max_ratio = float(max_ratio)
-            upper_bound = max_ratio + max(0.0, tolerance)
-            penalty = penalty + torch.clamp(coverage_ratio - upper_bound, min=0.0)
+        coverage_ratio = expected_non_blank / denom
 
         loss_value = penalty.mean() * weight
 
         stats = {
+            'diagnostics/ctc_expected_non_blank': float(expected_non_blank.mean().detach().item()),
             'diagnostics/ctc_coverage_ratio': float(coverage_ratio.mean().detach().item()),
         }
         return loss_value, stats

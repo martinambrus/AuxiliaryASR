@@ -184,8 +184,7 @@ ctc_loss:
     coverage:
       enabled: true
       weight: 0.12
-      min_ratio: 0.92
-      tolerance: 0.03
+      margin: 4.0
       warmup_epochs: 5
 
 alignment_regularization:
@@ -360,5 +359,5 @@ decoding:
 checkpoint_selection:
   enabled: true
   lambda_diag: 0.3
-  lambda_length: 0.2
+  lambda_length: 0.3
   target_length_diff: 0.0

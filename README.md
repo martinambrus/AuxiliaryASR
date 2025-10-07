@@ -118,8 +118,7 @@ ctc_loss:
     coverage:
       enabled: true          # encourages enough non-blank mass to cover the transcript length
       weight: 0.12
-      min_ratio: 0.92
-      tolerance: 0.03        # allows slight under-coverage before the loss activates
+      margin: 4.0            # allows up to ~4 frames of under-coverage before the loss activates
 
 alignment_regularization:
   attention_duration:
