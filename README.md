@@ -127,6 +127,9 @@ ctc_loss:
       enabled: true          # encourages enough non-blank mass to cover the transcript length
       weight: 0.12
       margin: 4.0            # allows up to ~4 frames of under-coverage before the loss activates
+      locked_weight: 0.25    # gentler overshoot damping once coverage has caught up
+      locked_margin: 0.0     # optional extra slack before the overshoot term activates
+      locked_softness: 1.0   # smooth the overshoot branch for softer gradients
 
 alignment_regularization:
   attention_duration:
@@ -159,6 +162,24 @@ decoding:
 Additionally, the diagonal attention prior now masks out padded timesteps, applies a light dropout (configurable through `model_params.attention_dropout`), and is scheduled via `diagonal_attention_prior_weight` so it ramps from a moderate early weight to a stronger late-epoch value. Coupled with the duration regulariser above, this keeps alignments monotonic while ensuring each phoneme retains a multi-frame footprint.
 
 To avoid choosing checkpoints that only excel at PER while misaligning attention or dropping symbols, training now logs a joint selection score that blends PER, diagonal coherence, and the normalised CTC length gap. The configuration exposes the coefficients under `checkpoint_selection` and the trainer will keep a `best_joint.pth` symlink pointing at the most alignment-friendly checkpoint observed so far.
+
+```yaml
+checkpoint_selection:
+  enabled: true
+  lambda_diag: 0.3
+  lambda_length: 0.3
+  target_length_diff: 4.0
+  length_penalty_mode: absolute        # hinge on |len_diff| beyond the allowed delta
+  lambda_length_grid: [0.2, 0.25, 0.3] # optional micro-grid of coverage weights to track
+  target_length_diff_grid: [3, 4, 5]   # paired deltas for the micro-grid sweep
+  lambda_length_decay:
+    enabled: true
+    target: 2.0                # trigger decay once the median attention duration settles near 2 frames
+    tolerance: 0.05            # acceptable wobble before the trigger resets
+    confirmations: 2           # validations that must satisfy the target before decaying
+    target_ratio: 0.6          # cosine decay from the current λ_len down to 60%
+    span_fraction: 0.12        # roll out the decay over ~12% of the planned optimiser steps
+```
 
 Increasing the warm-up ratio (`optimizer_params.pct_start`) or reducing the batch size can also help when the number of training utterances is limited.
 
