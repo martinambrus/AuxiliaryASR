@@ -995,6 +995,9 @@ def main(config_path):
     ctc_regularization_config = ctc_loss_config.get('regularization', {}) or {}
     if not isinstance(ctc_regularization_config, dict):
         ctc_regularization_config = {}
+    ctc_blank_scale_config = ctc_loss_config.get('blank_scale', None)
+    if isinstance(ctc_blank_scale_config, dict) and not ctc_blank_scale_config:
+        ctc_blank_scale_config = None
 
     if enable_early_stopping:
         patience = max([3, int(math.floor(int(cfg_get_nested(config, 'save_freq', 10)) / 2))])
@@ -1076,6 +1079,7 @@ def main(config_path):
                     ctc_logit_bias=ctc_blank_bias,
                     ctc_logit_temperature=ctc_logit_temperature,
                     ctc_regularization_config=ctc_regularization_config,
+                    ctc_blank_scale_config=ctc_blank_scale_config,
                     enable_frame_classifier=frame_cfg.get('enabled', False),
                     enable_speaker=speaker_cfg.get('enabled', False),
                     enable_pronunciation_error=pron_cfg.get('enabled', False),
@@ -1084,7 +1088,8 @@ def main(config_path):
                     self_conditioned_ctc_config=self_conditioned_ctc_config,
                     entropy_regularization_config=entropy_regularization_config,
                     memory_optimization_config=memory_optimization_config,
-                    steps_per_epoch=steps_per_epoch
+                    steps_per_epoch=steps_per_epoch,
+                    total_epochs=epochs
                     )
 
     current_train_batch_size = int(initial_batch_size)
