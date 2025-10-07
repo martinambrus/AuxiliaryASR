@@ -138,6 +138,11 @@ class Trainer(object):
         self.ctc_coverage_regularization_enabled = bool(coverage_reg_cfg.get('enabled', False))
         self.ctc_coverage_regularization_config = coverage_reg_cfg
 
+        # Encourage temporal smoothness in the non-blank posterior mass to
+        # suppress single-frame spikes without altering durations. Enabled by
+        # default with a light weight so it does not require configuration.
+        self.ctc_non_blank_tv_weight = 0.1
+
         alignment_reg_cfg = {}
         if isinstance(self.config, dict):
             alignment_reg_cfg = self.config.get('alignment_regularization', {}) or {}
@@ -579,6 +584,13 @@ class Trainer(object):
                     reg_losses['ctc/coverage_reg'] = loss_value
                     reg_stats.update(stats)
 
+        if self.ctc_non_blank_tv_weight > 0.0:
+            tv_result = self._compute_ctc_non_blank_tv_regularization(probs, input_lengths)
+            if tv_result is not None:
+                loss_value, stats = tv_result
+                reg_losses['ctc/non_blank_tv_reg'] = loss_value
+                reg_stats.update(stats)
+
         return reg_losses, reg_stats
 
     def _compute_ctc_blank_rate_regularization(self, probs, input_lengths, cfg):
@@ -626,6 +638,47 @@ class Trainer(object):
 
         stats = {
             'diagnostics/ctc_blank_rate': float(blank_rate.mean().detach().item()),
+        }
+        return loss_value, stats
+
+    def _compute_ctc_non_blank_tv_regularization(self, probs, input_lengths):
+        blank_id = self.ctc_blank_id
+        if blank_id < 0 or blank_id >= probs.size(-1):
+            return None
+
+        weight = float(self.ctc_non_blank_tv_weight)
+        if weight == 0.0:
+            return None
+
+        non_blank = 1.0 - probs[..., blank_id]
+        if non_blank.dim() != 2 or non_blank.size(1) <= 1:
+            return None
+
+        mask = None
+        if input_lengths is not None:
+            if not torch.is_tensor(input_lengths):
+                input_lengths = torch.as_tensor(input_lengths, device=non_blank.device)
+            input_lengths = input_lengths.to(device=non_blank.device, dtype=torch.long)
+            max_len = non_blank.size(1)
+            mask = torch.arange(max_len, device=non_blank.device).unsqueeze(0)
+            mask = mask < input_lengths.unsqueeze(1)
+            mask = mask.to(non_blank.dtype)
+
+        diffs = non_blank[:, 1:] - non_blank[:, :-1]
+        diffs = diffs.abs()
+
+        if mask is not None:
+            pair_mask = mask[:, 1:] * mask[:, :-1]
+            diffs = diffs * pair_mask
+            denom = pair_mask.sum(dim=1).clamp_min(1.0)
+        else:
+            denom = diffs.new_full((diffs.size(0),), diffs.size(1))
+
+        tv = diffs.sum(dim=1) / denom
+        loss_value = tv.mean() * weight
+
+        stats = {
+            'diagnostics/ctc_non_blank_tv': float(tv.mean().detach().item()),
         }
         return loss_value, stats
 
