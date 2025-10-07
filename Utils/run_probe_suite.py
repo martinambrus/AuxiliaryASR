@@ -13,6 +13,7 @@ import argparse
 import concurrent.futures
 import copy
 import math
+import multiprocessing as mp
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -620,7 +621,11 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         max_workers = max(1, int(args.num_workers))
         metrics_by_epoch: Dict[int, Dict[str, float]] = {}
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
+        executor_kwargs = {"max_workers": max_workers}
+        if device.type == "cuda":
+            executor_kwargs["mp_context"] = mp.get_context("spawn")
+
+        with concurrent.futures.ProcessPoolExecutor(**executor_kwargs) as executor:
             future_to_epoch = {
                 executor.submit(
                     _evaluate_epoch_checkpoint,
