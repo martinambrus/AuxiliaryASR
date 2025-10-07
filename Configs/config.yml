@@ -160,11 +160,11 @@ sortagrad_switch_to_shuffled_dataset_epoch: 10
 # make ASR learn to read phonemes from left to right, not randomly
 use_diagonal_attention_prior: True
 diagonal_attention_prior_weight:
-  initial: 0.35
-  target: 0.65
-  warmup_epochs: 60
+  initial: 1.2
+  target: 0.25
+  warmup_epochs: 100  # ~40% of the 250 scheduled epochs
   hold_epochs: 20
-diagonal_attention_prior_sigma: 0.32
+diagonal_attention_prior_sigma: 0.3
 
 # stabilizes ASR training for smaller datasets
 entropy_params:
