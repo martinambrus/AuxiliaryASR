@@ -274,6 +274,14 @@ class ASRCNN(nn.Module):
             location_kernel_size=location_kernel_size,
             attention_dropout=attention_dropout)
 
+        duration_hidden = max(4, hidden_dim // 16)
+        self.duration_predictor = nn.Sequential(
+            nn.Embedding(n_token, duration_hidden),
+            nn.ReLU(),
+            nn.Linear(duration_hidden, 1),
+            nn.Softplus(),
+        )
+
         frame_cfg = self.multi_task_config.get('frame_phoneme', {}) or {}
         self.enable_frame_classifier = bool(frame_cfg.get('enabled', False))
         if self.enable_frame_classifier:
@@ -496,6 +504,10 @@ class ASRCNN(nn.Module):
             speaker_logits = self.speaker_classifier(speaker_embedding)
             outputs["speaker_embeddings"] = speaker_embedding
             outputs["speaker_logits"] = speaker_logits
+
+        if text_input is not None:
+            duration_prediction = self.duration_predictor(text_input.long())
+            outputs["duration_predictions"] = duration_prediction
 
         if text_input is not None and self.use_seq2seq:
             hidden_outputs, s2s_logit, s2s_attn = self.asr_s2s(decoder_memory, src_key_padding_mask, text_input)
