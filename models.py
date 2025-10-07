@@ -147,7 +147,7 @@ class ASRCNN(nn.Module):
                  n_layers=6,
                  token_embedding_dim=256,
                  location_kernel_size=63,
-                 attention_dropout=0.0,
+                 attention_dropout=0.1,
                  multi_task_config=None,
                  stabilization_config=None,
                  memory_optimization_config=None,
@@ -688,7 +688,7 @@ class ASRS2S(nn.Module):
                  n_location_filters=32,
                  location_kernel_size=63,
                  n_token=40,
-                 attention_dropout=0.0):
+                 attention_dropout=0.1):
         super(ASRS2S, self).__init__()
         self.embedding = nn.Embedding(n_token, embedding_dim)
         val_range = math.sqrt(6 / hidden_dim)
