@@ -165,6 +165,8 @@ class Trainer(object):
         self.self_conditioned_ctc_weight = float(sctc_cfg.get('loss_weight', 0.0))
         self.self_conditioned_ctc_layer_weights = self._parse_intermediate_layer_weights(sctc_cfg.get('layers'))
 
+        self.duration_aux_weight = 0.2
+
         entropy_cfg = entropy_regularization_config or {}
         self.entropy_regularization_enabled = bool(entropy_cfg.get('enabled', False))
         mode = str(entropy_cfg.get('mode', 'minimize')).lower()
@@ -706,6 +708,60 @@ class Trainer(object):
             stats['diagnostics/attn_duration_short_ratio'] = float(short_ratio.item())
 
         return loss_value, stats
+
+    def _compute_ctc_expected_durations(self, logits, input_lengths, tokens, token_lengths):
+        if logits is None or tokens is None:
+            return None
+
+        with torch.no_grad():
+            adjusted = self._adjust_ctc_logits(logits.detach())
+            probs = adjusted.float().softmax(dim=2)
+
+            if input_lengths is not None:
+                if not torch.is_tensor(input_lengths):
+                    input_lengths = torch.as_tensor(input_lengths, device=probs.device)
+                input_lengths = input_lengths.to(device=probs.device, dtype=torch.long)
+                time_mask = torch.arange(probs.size(1), device=probs.device).unsqueeze(0)
+                time_mask = time_mask < input_lengths.unsqueeze(1)
+                probs = probs * time_mask.unsqueeze(2).to(probs.dtype)
+            else:
+                input_lengths = torch.full((probs.size(0),), probs.size(1), device=probs.device, dtype=torch.long)
+
+            if token_lengths is not None:
+                if not torch.is_tensor(token_lengths):
+                    token_lengths = torch.as_tensor(token_lengths, device=tokens.device)
+                token_lengths = token_lengths.to(device=tokens.device, dtype=torch.long)
+            else:
+                token_lengths = torch.full((tokens.size(0),), tokens.size(1), device=tokens.device, dtype=torch.long)
+
+            vocab_size = probs.size(-1)
+            expected = torch.zeros(tokens.size(0), tokens.size(1), device=probs.device, dtype=probs.dtype)
+
+            for batch_idx in range(probs.size(0)):
+                seq_len = int(token_lengths[batch_idx].item())
+                if seq_len <= 0:
+                    continue
+
+                token_seq = tokens[batch_idx, :seq_len]
+                valid_mask = token_seq > 0
+                if not torch.any(valid_mask):
+                    continue
+
+                active_tokens = token_seq[valid_mask]
+                if active_tokens.numel() == 0:
+                    continue
+
+                time_len = int(input_lengths[batch_idx].item())
+                token_mass = probs[batch_idx, :time_len].sum(dim=0)
+                counts = torch.bincount(active_tokens, minlength=vocab_size).to(token_mass.dtype)
+                occ = counts.gather(0, active_tokens).clamp_min(1.0)
+                per_token = token_mass.gather(0, active_tokens) / occ
+
+                target_slice = expected[batch_idx, :seq_len]
+                target_slice[valid_mask] = per_token
+                expected[batch_idx, :seq_len] = target_slice
+
+        return expected
 
     def _get_target_model(self):
         """Return the underlying model, unwrapping accelerator/DDP wrappers."""
@@ -1366,6 +1422,35 @@ class Trainer(object):
             for key, value in reg_stats.items():
                 losses[key] = float(value)
 
+            duration_predictions = model_outputs.get('duration_predictions')
+            if (
+                self.duration_aux_weight > 0.0
+                and isinstance(duration_predictions, torch.Tensor)
+                and isinstance(ppgs, torch.Tensor)
+            ):
+                duration_targets = self._compute_ctc_expected_durations(
+                    ppgs,
+                    mel_input_length,
+                    text_input,
+                    text_input_length,
+                )
+                if duration_targets is not None:
+                    if duration_predictions.dim() == 3 and duration_predictions.size(-1) == 1:
+                        duration_predictions = duration_predictions.squeeze(-1)
+                    duration_predictions = duration_predictions.to(duration_targets.dtype)
+
+                    max_len = duration_targets.size(1)
+                    seq_mask = torch.arange(max_len, device=self.device).unsqueeze(0)
+                    seq_mask = seq_mask < text_input_length.unsqueeze(1)
+                    seq_mask = seq_mask & (text_input > 0)
+
+                    if torch.any(seq_mask):
+                        mask = seq_mask.to(duration_targets.dtype)
+                        mse = (duration_predictions - duration_targets) ** 2
+                        mse = (mse * mask).sum() / mask.sum().clamp_min(1.0)
+                        total_loss = total_loss + self.duration_aux_weight * mse
+                        losses['ctc_duration_aux'] = mse.item()
+
             s2s_pred = model_outputs.get('s2s_logits')
             s2s_attn = model_outputs.get('s2s_attn')
             if self.s2s_weight > 0 and s2s_pred is not None:
@@ -1671,6 +1756,35 @@ class Trainer(object):
             else:
                 loss_ctc = torch.zeros(1, device=self.device)
 
+            duration_predictions = model_outputs.get('duration_predictions')
+            duration_aux_loss = torch.zeros(1, device=self.device)
+            if (
+                self.duration_aux_weight > 0.0
+                and isinstance(duration_predictions, torch.Tensor)
+                and isinstance(ppgs, torch.Tensor)
+            ):
+                duration_targets = self._compute_ctc_expected_durations(
+                    ppgs,
+                    mel_input_length,
+                    text_input,
+                    text_input_length,
+                )
+                if duration_targets is not None:
+                    if duration_predictions.dim() == 3 and duration_predictions.size(-1) == 1:
+                        duration_predictions = duration_predictions.squeeze(-1)
+                    duration_predictions = duration_predictions.to(duration_targets.dtype)
+
+                    max_len = duration_targets.size(1)
+                    seq_mask = torch.arange(max_len, device=self.device).unsqueeze(0)
+                    seq_mask = seq_mask < text_input_length.unsqueeze(1)
+                    seq_mask = seq_mask & (text_input > 0)
+
+                    if torch.any(seq_mask):
+                        mask = seq_mask.to(duration_targets.dtype)
+                        mse = (duration_predictions - duration_targets) ** 2
+                        duration_aux_loss = (mse * mask).sum() / mask.sum().clamp_min(1.0)
+                        eval_losses.setdefault('eval/ctc_duration_aux', []).append(self._reduce_scalar(duration_aux_loss.item()))
+
             if self.s2s_weight > 0 and s2s_pred is not None:
                 loss_s2s = 0
                 for _s2s_pred, _text_input, _text_length in zip(s2s_pred, text_input, text_input_length):
@@ -1685,6 +1799,8 @@ class Trainer(object):
                 total_eval_loss = total_eval_loss + self.ctc_weight * loss_ctc
             if self.s2s_weight > 0:
                 total_eval_loss = total_eval_loss + self.s2s_weight * loss_s2s
+            if self.duration_aux_weight > 0.0 and duration_aux_loss is not None:
+                total_eval_loss = total_eval_loss + self.duration_aux_weight * duration_aux_loss
 
             if self.entropy_regularization_enabled:
                 if ppgs is not None:
