@@ -648,54 +648,72 @@ class Trainer(object):
             return None
 
         neg_inf = torch.finfo(dtype).min
-        alpha = log_probs.new_full((T, S), neg_inf)
-        beta = log_probs.new_full((T, S), neg_inf)
+        neg_inf_row = torch.full((S,), neg_inf, device=device, dtype=dtype)
+        emissions = log_probs.index_select(dim=1, index=extended)
 
-        alpha[0, 0] = log_probs[0, blank_id]
+        # Pre-compute which transitions are permitted when skipping the blank.
+        skip_into_mask = torch.zeros(S, dtype=torch.bool, device=device)
+        if S > 2:
+            skip_into_mask[2:] = (extended[2:] != blank_id) & (extended[2:] != extended[:-2])
+
+        skip_out_mask = torch.zeros(S, dtype=torch.bool, device=device)
+        if S > 2:
+            skip_out_mask[:-2] = (extended[:-2] != blank_id) & (extended[:-2] != extended[2:])
+
+        # Forward probabilities (alpha).
+        alpha_rows = []
+        initial_mask = torch.zeros(S, dtype=torch.bool, device=device)
+        initial_mask[0] = True
         if S > 1:
-            alpha[0, 1] = log_probs[0, extended[1]]
+            initial_mask[1] = True
+        alpha_prev = torch.where(initial_mask, emissions[0], neg_inf_row)
+        alpha_rows.append(alpha_prev)
 
         for t in range(1, T):
-            prev = alpha[t - 1]
-            emit = log_probs[t]
-            for s in range(S):
-                label = extended[s]
-                candidates = [prev[s]]
-                if s - 1 >= 0:
-                    candidates.append(prev[s - 1])
-                if s - 2 >= 0 and label != blank_id and label != extended[s - 2]:
-                    candidates.append(prev[s - 2])
-                alpha[t, s] = torch.logsumexp(torch.stack(candidates), dim=0) + emit[label]
+            prev = alpha_prev
 
-        beta[-1, S - 1] = 0.0
+            stay = prev
+            advance = torch.cat([neg_inf_row[:1], prev[:-1]])
+            skip_candidate = torch.cat([neg_inf_row[:2], prev[:-2]])
+            skip = torch.where(skip_into_mask, skip_candidate, neg_inf_row)
+
+            combined = torch.logaddexp(torch.logaddexp(stay, advance), skip)
+            alpha_prev = combined + emissions[t]
+            alpha_rows.append(alpha_prev)
+
+        alpha = torch.stack(alpha_rows, dim=0)
+
+        # Backward probabilities (beta).
+        beta_rows = [None] * T
+        terminal_mask = torch.zeros(S, dtype=torch.bool, device=device)
+        terminal_mask[-1] = True
         if S > 1:
-            beta[-1, S - 2] = 0.0
+            terminal_mask[-2] = True
+        beta_next = torch.where(terminal_mask, torch.zeros_like(neg_inf_row), neg_inf_row)
+        beta_rows[T - 1] = beta_next
 
         for t in range(T - 2, -1, -1):
-            nxt = beta[t + 1]
-            emit_next = log_probs[t + 1]
-            for s in range(S):
-                label = extended[s]
-                candidates = [nxt[s] + emit_next[label]]
-                if s + 1 < S:
-                    next_label = extended[s + 1]
-                    candidates.append(nxt[s + 1] + emit_next[next_label])
-                if (
-                    s + 2 < S
-                    and label != blank_id
-                    and extended[s + 2] != label
-                ):
-                    skip_label = extended[s + 2]
-                    candidates.append(nxt[s + 2] + emit_next[skip_label])
-                beta[t, s] = torch.logsumexp(torch.stack(candidates), dim=0)
+            nxt = beta_next
+            emit_next = emissions[t + 1]
 
-        final_terms = [alpha[-1, S - 1]]
+            stay = nxt + emit_next
+            advance = torch.cat([nxt[1:] + emit_next[1:], neg_inf_row[:1]])
+            skip_candidate = torch.cat([nxt[2:] + emit_next[2:], neg_inf_row[:2]])
+            skip = torch.where(skip_out_mask, skip_candidate, neg_inf_row)
+
+            beta_curr = torch.logaddexp(torch.logaddexp(stay, advance), skip)
+            beta_rows[t] = beta_curr
+            beta_next = beta_curr
+
+        beta = torch.stack(beta_rows, dim=0)
+
+        # Normalise and collect expected token durations.
         if S > 1:
-            final_terms.append(alpha[-1, S - 2])
-        log_z = torch.logsumexp(torch.stack(final_terms), dim=0)
+            log_z = torch.logaddexp(alpha[-1, -1], alpha[-1, -2])
+        else:
+            log_z = alpha[-1, -1]
 
-        log_gamma = alpha + beta
-        log_gamma = log_gamma - log_z
+        log_gamma = alpha + beta - log_z
         gamma = torch.exp(log_gamma)
 
         token_indices = torch.arange(1, S, 2, device=device)
