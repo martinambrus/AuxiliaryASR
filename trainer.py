@@ -12,6 +12,7 @@ import inspect
 import numpy as np
 import torch
 from torch import amp, nn
+import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
 
@@ -635,7 +636,28 @@ class Trainer(object):
         margin = float(cfg.get('margin', cfg.get('delta', 4.0)))
         margin = max(margin, 0.0)
 
-        penalty = torch.clamp((target_lengths - expected_non_blank) - margin, min=0.0)
+        shortfall = torch.clamp((target_lengths - expected_non_blank) - margin, min=0.0)
+
+        locked_weight = float(cfg.get('locked_weight', cfg.get('asym_weight', 0.25)))
+        locked_weight = max(0.0, locked_weight)
+        locked_margin = float(cfg.get('locked_margin', 0.0))
+        locked_margin = max(0.0, locked_margin)
+        locked_softness = float(cfg.get('locked_softness', 1.0))
+        locked_softness = max(0.0, locked_softness)
+
+        overshoot = torch.clamp(
+            expected_non_blank - (target_lengths + locked_margin),
+            min=0.0,
+        )
+        if locked_softness > 0.0:
+            scaled = overshoot / locked_softness
+            softened = F.softplus(scaled) * locked_softness
+            baseline = math.log(2.0) * locked_softness
+            overshoot = (softened - baseline).clamp_min(0.0)
+
+        penalty = shortfall
+        if locked_weight > 0.0:
+            penalty = penalty + locked_weight * overshoot
 
         denom = target_lengths.clamp_min(1.0)
         coverage_ratio = expected_non_blank / denom
@@ -646,6 +668,16 @@ class Trainer(object):
             'diagnostics/ctc_expected_non_blank': float(expected_non_blank.mean().detach().item()),
             'diagnostics/ctc_coverage_ratio': float(coverage_ratio.mean().detach().item()),
         }
+        with torch.no_grad():
+            short_mask = shortfall > 0
+            overshoot_mask = overshoot > 0
+            stats['diagnostics/ctc_coverage_short_ratio'] = float(
+                short_mask.float().mean().detach().item()
+            )
+            if locked_weight > 0.0:
+                stats['diagnostics/ctc_coverage_locked_ratio'] = float(
+                    overshoot_mask.float().mean().detach().item()
+                )
         return loss_value, stats
 
     def _compute_attention_duration_regularization(self, attn, text_lengths, mel_lengths):

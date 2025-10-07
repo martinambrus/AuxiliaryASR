@@ -5,6 +5,7 @@ from models import build_model
 from trainer import Trainer
 
 import copy
+import itertools
 import os
 import os.path as osp
 import math
@@ -1100,6 +1101,137 @@ def main(config_path):
     joint_lambda_diag = float(checkpoint_selection_cfg.get('lambda_diag', 0.0))
     joint_lambda_length = float(checkpoint_selection_cfg.get('lambda_length', 0.0))
     joint_target_len_diff = float(checkpoint_selection_cfg.get('target_length_diff', 0.0))
+
+    length_penalty_mode = str(
+        checkpoint_selection_cfg.get('length_penalty_mode', 'signed_normalized')
+    ).lower()
+    if length_penalty_mode not in {
+        'signed_normalized',
+        'absolute',
+        'absolute_normalized',
+    }:
+        length_penalty_mode = 'signed_normalized'
+
+    lambda_length_decay_cfg = checkpoint_selection_cfg.get('lambda_length_decay', {}) or {}
+    if not isinstance(lambda_length_decay_cfg, dict):
+        lambda_length_decay_cfg = {}
+
+    lambda_length_decay_enabled = bool(
+        lambda_length_decay_cfg.get('enabled', True)
+    ) and joint_lambda_length > 0.0
+    lambda_length_decay_target = float(lambda_length_decay_cfg.get('target', 2.0))
+    lambda_length_decay_tolerance = float(lambda_length_decay_cfg.get('tolerance', 0.05))
+    lambda_length_decay_confirmations = max(
+        1, int(lambda_length_decay_cfg.get('confirmations', 2))
+    )
+    lambda_length_decay_ratio = float(lambda_length_decay_cfg.get('target_ratio', 0.6))
+    lambda_length_decay_ratio = min(max(lambda_length_decay_ratio, 0.0), 1.0)
+    lambda_length_decay_span = float(lambda_length_decay_cfg.get('span_fraction', 0.12))
+    lambda_length_decay_span = min(max(lambda_length_decay_span, 0.0), 1.0)
+    lambda_length_min_value = float(lambda_length_decay_cfg.get('min_value', 0.0))
+    lambda_length_allow_retrigger = bool(lambda_length_decay_cfg.get('allow_retrigger', False))
+
+    lambda_length_state = {
+        'enabled': lambda_length_decay_enabled,
+        'confirmations': 0,
+        'triggered': False,
+        'completed': False,
+        'start_step': 0,
+        'end_step': 0,
+        'start_value': joint_lambda_length,
+        'target_value': joint_lambda_length * lambda_length_decay_ratio,
+        'current_value': joint_lambda_length,
+    }
+
+    grid_lambda_values = checkpoint_selection_cfg.get('lambda_length_grid', []) or []
+    grid_delta_values = checkpoint_selection_cfg.get('target_length_diff_grid', []) or []
+    if not isinstance(grid_lambda_values, (list, tuple)):
+        grid_lambda_values = []
+    if not isinstance(grid_delta_values, (list, tuple)):
+        grid_delta_values = []
+
+    grid_lambda_values = sorted({float(value) for value in grid_lambda_values})
+    grid_delta_values = sorted({float(value) for value in grid_delta_values})
+    grid_enabled = joint_selection_enabled and grid_lambda_values and grid_delta_values
+    grid_best_scores = {}
+    grid_best_paths = {}
+
+    def _compute_length_penalty_value(len_diff, len_diff_norm, delta, mode):
+        if delta is None:
+            return None
+        try:
+            delta_value = float(delta)
+        except (TypeError, ValueError):
+            return None
+
+        if mode == 'absolute':
+            if len_diff is None:
+                return None
+            return max(0.0, abs(float(len_diff)) - delta_value)
+        if mode == 'absolute_normalized':
+            if len_diff_norm is None:
+                return None
+            return max(0.0, abs(float(len_diff_norm)) - delta_value)
+
+        if len_diff_norm is None:
+            return None
+        return max(0.0, delta_value - float(len_diff_norm))
+
+    def _maybe_update_lambda_length(metric_value, current_step):
+        nonlocal joint_lambda_length
+        if not lambda_length_state['enabled']:
+            return False
+
+        if lambda_length_state['completed'] and not lambda_length_allow_retrigger:
+            return False
+
+        updated = False
+
+        if lambda_length_state['triggered']:
+            span = max(1, lambda_length_state['end_step'] - lambda_length_state['start_step'])
+            progress = (current_step - lambda_length_state['start_step']) / float(span)
+            progress = min(max(progress, 0.0), 1.0)
+            start = lambda_length_state['start_value']
+            target = lambda_length_state['target_value']
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            value = target + (start - target) * cosine
+            value = max(lambda_length_min_value, float(value))
+            lambda_length_state['current_value'] = value
+            joint_lambda_length = value
+            updated = True
+            if progress >= 1.0 - 1e-6:
+                lambda_length_state['triggered'] = False
+                lambda_length_state['completed'] = True
+            return updated
+
+        if metric_value is None or not math.isfinite(metric_value):
+            lambda_length_state['confirmations'] = 0
+            return updated
+
+        if abs(metric_value - lambda_length_decay_target) <= lambda_length_decay_tolerance:
+            lambda_length_state['confirmations'] += 1
+        else:
+            lambda_length_state['confirmations'] = 0
+
+        if lambda_length_state['confirmations'] < lambda_length_decay_confirmations:
+            return updated
+
+        lambda_length_state['confirmations'] = 0
+        lambda_length_state['triggered'] = True
+        lambda_length_state['start_step'] = current_step
+        total_steps = max(1, int(scheduler_params.get('total_steps', 0)))
+        if total_steps <= 0:
+            total_steps = max(1, trainer._get_optimizer_step_count())
+        span_steps = max(1, int(round(lambda_length_decay_span * total_steps)))
+        lambda_length_state['end_step'] = current_step + span_steps
+        lambda_length_state['start_value'] = lambda_length_state['current_value']
+        lambda_length_state['target_value'] = max(
+            lambda_length_min_value,
+            lambda_length_state['start_value'] * lambda_length_decay_ratio,
+        )
+        updated = True
+        return updated
+
     best_joint_score = None
     best_checkpoint_path = None
 
@@ -1200,21 +1332,92 @@ def main(config_path):
         results = train_results.copy()
         results.update(eval_results)
 
+        p50_metric = results.get('diagnostics/attn_duration_p50')
+        current_optimizer_step = trainer._get_optimizer_step_count()
+        lambda_updated = _maybe_update_lambda_length(p50_metric, current_optimizer_step)
+        if lambda_updated or lambda_length_state['triggered']:
+            joint_lambda_length = lambda_length_state['current_value']
+        results['eval/checkpoint_lambda_length'] = joint_lambda_length
+        results['eval/checkpoint_lambda_length_decay_active'] = float(
+            1.0 if lambda_length_state['triggered'] else 0.0
+        )
+        results['eval/checkpoint_lambda_length_completed'] = float(
+            1.0 if lambda_length_state['completed'] else 0.0
+        )
+        if lambda_length_state['triggered']:
+            span = max(1, lambda_length_state['end_step'] - lambda_length_state['start_step'])
+            decay_progress = (
+                current_optimizer_step - lambda_length_state['start_step']
+            ) / float(span)
+        elif lambda_length_state['completed']:
+            decay_progress = 1.0
+        else:
+            decay_progress = 0.0
+        decay_progress = min(max(decay_progress, 0.0), 1.0)
+        results['eval/checkpoint_lambda_length_decay_progress'] = decay_progress
+
         joint_score = None
         length_penalty = None
         is_best = False
+        grid_improved_keys = []
+        grid_scores = {}
+
         if joint_selection_enabled:
             per_metric = results.get('eval/wer')
             diag_metric = results.get('eval/diag_coherence')
-            len_diff_norm = results.get('eval/ctc_len_diff_norm')
-            if per_metric is not None and diag_metric is not None and len_diff_norm is not None:
-                length_penalty = max(0.0, joint_target_len_diff - len_diff_norm)
-                joint_score = per_metric + joint_lambda_diag * (1.0 - diag_metric) + joint_lambda_length * length_penalty
+            len_diff_norm_metric = results.get('eval/ctc_len_diff_norm')
+            len_diff_metric = results.get('eval/ctc_len_diff')
+            if per_metric is not None and diag_metric is not None:
+                length_penalty = _compute_length_penalty_value(
+                    len_diff=len_diff_metric,
+                    len_diff_norm=len_diff_norm_metric,
+                    delta=joint_target_len_diff,
+                    mode=length_penalty_mode,
+                )
+                if length_penalty is None:
+                    length_penalty = 0.0
+                joint_score = (
+                    per_metric
+                    + joint_lambda_diag * (1.0 - diag_metric)
+                    + joint_lambda_length * length_penalty
+                )
                 results['eval/joint_score'] = joint_score
                 results['eval/length_penalty'] = length_penalty
                 tolerance = 1.0e-6
                 if best_joint_score is None or joint_score < best_joint_score - tolerance:
                     is_best = True
+
+                if grid_enabled:
+                    penalties_by_delta = {}
+                    for delta in grid_delta_values:
+                        penalties_by_delta[delta] = _compute_length_penalty_value(
+                            len_diff=len_diff_metric,
+                            len_diff_norm=len_diff_norm_metric,
+                            delta=delta,
+                            mode=length_penalty_mode,
+                        )
+
+                    for lam, delta in itertools.product(grid_lambda_values, grid_delta_values):
+                        penalty_value = penalties_by_delta.get(delta)
+                        if penalty_value is None:
+                            continue
+                        score = per_metric + joint_lambda_diag * (1.0 - diag_metric) + lam * penalty_value
+                        key = (lam, delta)
+                        grid_scores[key] = score
+                        results[
+                            f'eval/joint_score_grid/lambda_{lam:.3f}_delta_{delta:.3f}'
+                        ] = score
+                        best_score = grid_best_scores.get(key)
+                        if best_score is None or score < best_score - tolerance:
+                            grid_best_scores[key] = score
+                            grid_improved_keys.append(key)
+
+                    for lam, delta in itertools.product(grid_lambda_values, grid_delta_values):
+                        key = (lam, delta)
+                        if key in grid_best_scores:
+                            results[
+                                f'eval/joint_score_best/lambda_{lam:.3f}_delta_{delta:.3f}'
+                            ] = grid_best_scores[key]
 
         if joint_selection_enabled:
             display_best = best_joint_score
@@ -1237,11 +1440,29 @@ def main(config_path):
         if early_stopping is not None:
             should_trigger_early_stop = early_stopping(learning_rate)
 
-        save_checkpoint = (epoch % save_freq) == 0 or should_trigger_early_stop or is_best
+        grid_force_save = False
+        if grid_enabled:
+            results['eval/joint_score_grid_improved'] = float(1.0 if grid_improved_keys else 0.0)
+            if grid_improved_keys:
+                grid_force_save = bool(
+                    checkpoint_selection_cfg.get('save_grid_checkpoints', True)
+                )
+        else:
+            results['eval/joint_score_grid_improved'] = 0.0
+
+        save_checkpoint = (
+            (epoch % save_freq) == 0
+            or should_trigger_early_stop
+            or is_best
+            or grid_force_save
+        )
         checkpoint_path = None
         if save_checkpoint and accelerator.is_main_process:
             checkpoint_path = osp.join(log_dir, 'epoch_%05d.pth' % epoch)
             trainer.save_checkpoint(checkpoint_path)
+            if grid_enabled and grid_improved_keys:
+                for key in grid_improved_keys:
+                    grid_best_paths[key] = checkpoint_path
         accelerator.wait_for_everyone()
 
         if joint_selection_enabled and is_best and joint_score is not None:
