@@ -13,6 +13,7 @@ import argparse
 import concurrent.futures
 import copy
 import math
+import multiprocessing as mp
 import warnings
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -620,19 +621,28 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
         max_workers = max(1, int(args.num_workers))
         metrics_by_epoch: Dict[int, Dict[str, float]] = {}
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=max_workers) as executor:
-            future_to_epoch = {
-                executor.submit(
-                    _evaluate_epoch_checkpoint,
-                    epoch_idx,
-                    str(checkpoint_file),
-                    config,
-                    device_str,
-                    args.band,
-                    args.max_align_batches,
-                ): epoch_idx
-                for epoch_idx, checkpoint_file in epoch_checkpoints
-            }
+        executor_kwargs = {"max_workers": max_workers}
+        if device.type == "cuda":
+            executor_kwargs["mp_context"] = mp.get_context("spawn")
+
+        with concurrent.futures.ProcessPoolExecutor(**executor_kwargs) as executor:
+            future_to_epoch = {}
+            for epoch_idx, checkpoint_file in epoch_checkpoints:
+                print(
+                    f"[AuxiliaryASR] dispatching evaluation for epoch {epoch_idx} "
+                    f"({checkpoint_file.name})"
+                )
+                future_to_epoch[
+                    executor.submit(
+                        _evaluate_epoch_checkpoint,
+                        epoch_idx,
+                        str(checkpoint_file),
+                        config,
+                        device_str,
+                        args.band,
+                        args.max_align_batches,
+                    )
+                ] = epoch_idx
 
             for future in concurrent.futures.as_completed(future_to_epoch):
                 epoch_idx = future_to_epoch[future]
@@ -645,7 +655,7 @@ def main(argv: Optional[Sequence[str]] = None) -> None:
 
         for epoch_idx, checkpoint_file in epoch_checkpoints:
             metrics = metrics_by_epoch[epoch_idx]
-            print(f"=== Evaluating epoch {epoch_idx} ({checkpoint_file.name}) ===")
+            print(f"=== Results for epoch {epoch_idx} ({checkpoint_file.name}) ===")
             print(
                 "  PER: {per:.4f} | diagonal: {diag:.4f} | blank: {blank:.4f} | "
                 "len_diff: {len_diff:.4f} | p50: {p50:.4f} | J: {joint:.4f}".format(
