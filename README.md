@@ -126,7 +126,7 @@ ctc_loss:
     coverage:
       enabled: true          # encourages enough non-blank mass to cover the transcript length
       weight: 0.12
-      margin: 4.0            # allows up to ~4 frames of under-coverage before the loss activates
+      margin: 3.0            # allows up to ~3 frames of under-coverage before the loss activates
       locked_weight: 0.25    # gentler overshoot damping once coverage has caught up
       locked_margin: 0.0     # optional extra slack before the overshoot term activates
       locked_softness: 1.0   # smooth the overshoot branch for softer gradients
@@ -177,8 +177,8 @@ checkpoint_selection:
     target: 2.0                # trigger decay once the median attention duration settles near 2 frames
     tolerance: 0.05            # acceptable wobble before the trigger resets
     confirmations: 2           # validations that must satisfy the target before decaying
-    target_ratio: 0.6          # cosine decay from the current λ_len down to 60%
-    span_fraction: 0.12        # roll out the decay over ~12% of the planned optimiser steps
+    target_ratio: 0.7          # cosine decay from the current λ_len down to 70%
+    span_fraction: 0.10        # roll out the decay over ~10% of the planned optimiser steps
 ```
 
 Increasing the warm-up ratio (`optimizer_params.pct_start`) or reducing the batch size can also help when the number of training utterances is limited.

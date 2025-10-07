@@ -192,7 +192,7 @@ ctc_loss:
     coverage:
       enabled: true
       weight: 0.12
-      margin: 4.0
+      margin: 3.0
       locked_weight: 0.25
       locked_margin: 0.0
       locked_softness: 1.0
@@ -380,6 +380,6 @@ checkpoint_selection:
     target: 2.0
     tolerance: 0.05
     confirmations: 2
-    target_ratio: 0.6
-    span_fraction: 0.12
+    target_ratio: 0.7
+    span_fraction: 0.1
     min_value: 0.0
