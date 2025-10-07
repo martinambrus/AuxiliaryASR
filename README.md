@@ -109,6 +109,14 @@ When the auxiliary ASR is trained on only a few hours of speech, the CTC head ca
 ctc_loss:
   blank_logit_bias: 0.0      # subtracts a constant from the blank logit before the softmax (kept neutral by default)
   logit_temperature: 1.0     # flattens the CTC posterior to discourage over-confidence
+  blank_scale:
+    enabled: true            # multiply the blank posterior by a scheduled down-weighting factor
+    base: 0.7                # start at 0.7 and ramp downwards while the curriculum stabilises
+    schedule:
+      - pct: 0.3             # first, descend to 0.6 by 30% of training
+        value: 0.6
+      - pct: 0.7             # then relax back up to 0.85 by 70% and hold it steady
+        value: 0.85
   regularization:
     blank_rate:
       enabled: true          # applies a mild hinge penalty when the blank posterior dominates

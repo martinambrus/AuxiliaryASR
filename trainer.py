@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 
+import math
 import os
 import os.path as osp
 import sys
@@ -55,12 +56,14 @@ class Trainer(object):
                  ctc_logit_bias=0.0,
                  ctc_logit_temperature=1.0,
                  ctc_regularization_config=None,
+                 ctc_blank_scale_config=None,
                  mixspeech_config=None,
                  intermediate_ctc_config=None,
                  self_conditioned_ctc_config=None,
                  entropy_regularization_config=None,
                  memory_optimization_config=None,
-                 steps_per_epoch=None):
+                 steps_per_epoch=None,
+                 total_epochs=None):
 
         self.steps = initial_steps
         self.epochs = initial_epochs
@@ -97,6 +100,11 @@ class Trainer(object):
         self.diagonal_attention_prior_sigma = sigma if sigma > 0 else 0.5
         self.maxm_mem_usage = 0
         self.steps_per_epoch = steps_per_epoch if steps_per_epoch is None else int(steps_per_epoch)
+        try:
+            parsed_total_epochs = int(total_epochs) if total_epochs is not None else None
+        except (TypeError, ValueError):
+            parsed_total_epochs = None
+        self.total_epochs = parsed_total_epochs if parsed_total_epochs and parsed_total_epochs > 0 else None
         self.ctc_weight = ctc_weight
         self.s2s_weight = s2s_weight
         self.frame_weight = frame_weight
@@ -110,6 +118,8 @@ class Trainer(object):
         self.ctc_blank_logit_bias = float(ctc_logit_bias)
         temperature = float(ctc_logit_temperature)
         self.ctc_logit_temperature = temperature if temperature > 0 else 1.0
+
+        self._configure_ctc_blank_scale(ctc_blank_scale_config)
 
         ctc_reg_cfg = ctc_regularization_config or {}
         if not isinstance(ctc_reg_cfg, dict):
@@ -324,6 +334,146 @@ class Trainer(object):
     def _get_active_diagonal_attention_weight(self) -> float:
         return float(getattr(self, '_active_diagonal_attention_weight', self.diagonal_attention_prior_weight))
 
+    def _configure_ctc_blank_scale(self, scale_config) -> None:
+        self._ctc_blank_scale_enabled = True
+        base_scale = 1.0
+        schedule = None
+
+        if isinstance(scale_config, (int, float)):
+            base_scale = float(scale_config)
+        elif isinstance(scale_config, dict):
+            enabled = scale_config.get('enabled', True)
+            if not enabled:
+                self._ctc_blank_scale_enabled = False
+                base_scale = 1.0
+            else:
+                base_scale = float(
+                    scale_config.get(
+                        'base',
+                        scale_config.get(
+                            'initial',
+                            scale_config.get('value', scale_config.get('scale', 1.0)),
+                        ),
+                    )
+                )
+
+                raw_schedule = scale_config.get('schedule', None)
+                if isinstance(raw_schedule, dict):
+                    raw_schedule = [raw_schedule]
+
+                points = []
+                if isinstance(raw_schedule, (list, tuple)):
+                    for entry in raw_schedule:
+                        if not isinstance(entry, dict):
+                            continue
+
+                        value = entry.get('value', entry.get('scale', entry.get('beta', None)))
+                        if value is None:
+                            continue
+
+                        progress = None
+                        for key in (
+                            'pct',
+                            'percent',
+                            'progress',
+                            'epoch_pct',
+                            'epoch_percent',
+                        ):
+                            if key in entry:
+                                progress = float(entry[key])
+                                if progress > 1.0:
+                                    progress = progress / 100.0
+                                break
+
+                        if progress is None:
+                            for key in ('epoch', 'epochs', 'epoch_index'):
+                                if key in entry:
+                                    epoch_value = float(entry[key])
+                                    if self.total_epochs and self.total_epochs > 1:
+                                        denom = float(max(1, self.total_epochs - 1))
+                                        progress = (max(1.0, epoch_value) - 1.0) / denom
+                                    elif self.total_epochs and self.total_epochs > 0:
+                                        progress = (max(1.0, epoch_value) - 1.0) / float(self.total_epochs)
+                                    else:
+                                        progress = None
+                                    break
+
+                        if progress is None:
+                            continue
+
+                        progress = float(np.clip(progress, 0.0, 1.0))
+                        points.append((progress, float(value)))
+
+                if points:
+                    # Ensure the initial point at progress 0.0 reflects the base scale
+                    points.append((0.0, base_scale))
+                    points.sort(key=lambda item: item[0])
+
+                    deduped = []
+                    for prog, val in points:
+                        val = float(max(1.0e-6, val))
+                        if deduped and abs(prog - deduped[-1][0]) < 1.0e-6:
+                            deduped[-1] = (prog, val)
+                        else:
+                            deduped.append((prog, val))
+
+                    if len(deduped) >= 2:
+                        schedule = deduped
+
+        base_scale = float(max(1.0e-6, base_scale))
+        self.ctc_blank_scale_base = base_scale
+        self.ctc_blank_scale_schedule = schedule
+        self._active_ctc_blank_scale = base_scale if self._ctc_blank_scale_enabled else 1.0
+
+    def _current_ctc_blank_scale(self, epoch_index: int) -> float:
+        if not self._ctc_blank_scale_enabled:
+            return 1.0
+
+        schedule = self.ctc_blank_scale_schedule
+        if not schedule:
+            return self.ctc_blank_scale_base
+
+        try:
+            epoch_index = int(epoch_index)
+        except (TypeError, ValueError):
+            epoch_index = 1
+
+        if self.total_epochs and self.total_epochs > 1:
+            denom = float(max(1, self.total_epochs - 1))
+            progress = (max(1, epoch_index) - 1) / denom
+        elif self.total_epochs and self.total_epochs > 0:
+            progress = (max(1, epoch_index) - 1) / float(self.total_epochs)
+        else:
+            progress = float(max(0, epoch_index - 1))
+
+        progress = float(np.clip(progress, 0.0, 1.0))
+
+        prev_prog, prev_val = schedule[0]
+        if progress <= prev_prog:
+            return float(prev_val)
+
+        for prog, val in schedule[1:]:
+            if progress <= prog:
+                span = prog - prev_prog
+                if span <= 0:
+                    return float(val)
+                ratio = (progress - prev_prog) / span
+                return float(prev_val + (val - prev_val) * ratio)
+            prev_prog, prev_val = prog, val
+
+        return float(schedule[-1][1])
+
+    def _set_active_ctc_blank_scale(self, training: bool) -> None:
+        if not self._ctc_blank_scale_enabled:
+            self._active_ctc_blank_scale = 1.0
+            return
+
+        epoch_index = self.epochs + 1 if training else max(1, self.epochs)
+        self._active_ctc_blank_scale = self._current_ctc_blank_scale(epoch_index)
+
+    def _get_active_ctc_blank_scale(self) -> float:
+        return float(getattr(self, '_active_ctc_blank_scale', self.ctc_blank_scale_base))
+
     def _adjust_ctc_logits(self, logits):
         """Apply optional blank bias and temperature scaling to CTC logits."""
         if logits is None:
@@ -331,11 +481,16 @@ class Trainer(object):
 
         bias = self.ctc_blank_logit_bias
         temperature = self.ctc_logit_temperature
+        scale = self._get_active_ctc_blank_scale()
 
         adjusted = logits
-        if bias != 0.0 and 0 <= self.ctc_blank_id < logits.size(-1):
+        if (bias != 0.0 or scale != 1.0) and 0 <= self.ctc_blank_id < logits.size(-1):
             adjusted = logits.clone()
-            adjusted[..., self.ctc_blank_id] = adjusted[..., self.ctc_blank_id] - bias
+            if bias != 0.0:
+                adjusted[..., self.ctc_blank_id] = adjusted[..., self.ctc_blank_id] - bias
+            if scale != 1.0:
+                safe_scale = float(max(1.0e-6, scale))
+                adjusted[..., self.ctc_blank_id] = adjusted[..., self.ctc_blank_id] + math.log(safe_scale)
         if temperature != 1.0:
             adjusted = adjusted / temperature
 
@@ -1430,6 +1585,7 @@ class Trainer(object):
         train_losses = defaultdict(list)
         self.model.train()
         self._set_active_diagonal_attention_weight(training=True)
+        self._set_active_ctc_blank_scale(training=True)
         if self.accelerator is not None and not self.accelerator.is_local_main_process:
             data_iterator = self.train_dataloader
         else:
@@ -1441,6 +1597,7 @@ class Trainer(object):
                 train_losses["train/%s" % key].append(value)
 
         train_losses = {key: np.mean(value) for key, value in train_losses.items()}
+        train_losses.setdefault('train/ctc_blank_scale', self._get_active_ctc_blank_scale())
         train_losses['train/learning_rate'] = self._get_lr()
         self.epochs += 1
 
@@ -1465,6 +1622,7 @@ class Trainer(object):
     def _eval_epoch(self):
         self.model.eval()
         self._set_active_diagonal_attention_weight(training=False)
+        self._set_active_ctc_blank_scale(training=False)
         eval_losses = defaultdict(list)
         eval_images = defaultdict(list)
         if self.accelerator is not None and not self.accelerator.is_local_main_process:
@@ -1694,6 +1852,7 @@ class Trainer(object):
 
         eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
         eval_losses.setdefault('eval/diag_weight', self._get_active_diagonal_attention_weight())
+        eval_losses.setdefault('eval/ctc_blank_scale', self._get_active_ctc_blank_scale())
         eval_losses.update(eval_images)
         for key in list(eval_losses.keys()):
             if key.startswith('eval/image'):
