@@ -192,6 +192,8 @@ ctc_loss:
       tolerance: 0.05
       warmup_epochs: 5
       penalize_low_blank: false
+      blank_run_weight: 0.2
+      blank_run_threshold: 0.5
     coverage:
       enabled: true
       weight: 0.12

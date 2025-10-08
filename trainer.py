@@ -723,10 +723,74 @@ class Trainer(object):
         penalty = over_penalty + under_penalty
         loss_value = penalty.mean() * weight
 
+        blank_run_weight = float(cfg.get('blank_run_weight', 0.2))
+        blank_run_threshold = float(cfg.get('blank_run_threshold', 0.5))
+        blank_run_penalty = None
+        total_run_penalty = blank_probs.new_zeros(())
+        total_runs = 0
+
+        if blank_run_weight > 0.0:
+            if mask is not None:
+                valid_lengths = mask.sum(dim=1).to(torch.long)
+                mask_bool = mask > 0.5
+            else:
+                valid_lengths = torch.full(
+                    (blank_probs.size(0),),
+                    blank_probs.size(1),
+                    device=blank_probs.device,
+                    dtype=torch.long,
+                )
+                mask_bool = None
+
+            blank_mask = blank_probs > blank_run_threshold
+            if mask_bool is not None:
+                blank_mask = blank_mask & mask_bool
+
+            for batch_index in range(blank_probs.size(0)):
+                seq_len = int(valid_lengths[batch_index].item())
+                if seq_len <= 0:
+                    continue
+
+                seq_mask = blank_mask[batch_index, :seq_len]
+                if not torch.any(seq_mask):
+                    continue
+
+                seq_probs = blank_probs[batch_index, :seq_len]
+                run_start = None
+
+                for t in range(seq_len):
+                    if bool(seq_mask[t]):
+                        if run_start is None:
+                            run_start = t
+                    elif run_start is not None:
+                        run_slice = slice(run_start, t)
+                        run_mass = seq_probs[run_slice].sum()
+                        total_run_penalty = total_run_penalty + torch.clamp(run_mass - 3.0, min=0.0)
+                        total_runs += 1
+                        run_start = None
+
+                if run_start is not None:
+                    run_slice = slice(run_start, seq_len)
+                    run_mass = seq_probs[run_slice].sum()
+                    total_run_penalty = total_run_penalty + torch.clamp(run_mass - 3.0, min=0.0)
+                    total_runs += 1
+
+            if total_runs > 0:
+                blank_run_penalty = total_run_penalty / float(total_runs)
+                loss_value = loss_value + blank_run_penalty * blank_run_weight
+            else:
+                blank_run_penalty = total_run_penalty
+
         stats = {
             'diagnostics/ctc_blank_rate': float(blank_rate.mean().detach().item()),
             'diagnostics/ctc_blank_rate_weight': float(weight),
         }
+        if blank_run_penalty is not None:
+            stats.update({
+                'diagnostics/ctc_blank_run_penalty': float(blank_run_penalty.detach().item()),
+                'diagnostics/ctc_blank_run_weight': float(blank_run_weight),
+                'diagnostics/ctc_blank_run_count': float(total_runs),
+            })
         return loss_value, stats
 
     def _compute_ctc_coverage_regularization(self, probs, input_lengths, target_lengths, cfg):
