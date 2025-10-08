@@ -129,6 +129,7 @@ ctc_loss:
     coverage:
       enabled: true          # encourages enough non-blank mass to cover the transcript length
       weight: 0.12
+      tv_weight: 0.3         # stronger temporal smoothing on the non-blank posterior mass
       margin: 3.0            # allows up to ~3 frames of under-coverage before the loss activates
       locked_weight: 0.25    # gentler overshoot damping once coverage has caught up
       locked_margin: 0.0     # optional extra slack before the overshoot term activates
@@ -149,6 +150,8 @@ regularization:
 ```
 
 All of the auxiliary losses honour a `warmup_epochs` key (`5` for the CTC penalties and `8` for the duration term in the default config) so you can delay their activation until the alignment has roughly converged.
+
+The coverage helper now applies a locally normalised hinge along with a heavier total-variation prior over the non-blank posterior mass. This combination pushes token durations to recover sooner while keeping adjacent timesteps smooth enough to avoid 1-frame spikes.
 
 Decoding-time safeguards provide gentler blank suppression without distorting training. The beam-search configuration supports a temperature, blank penalty, insertion bonus, and lightweight length normalisation:
 

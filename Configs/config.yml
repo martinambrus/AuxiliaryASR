@@ -195,6 +195,7 @@ ctc_loss:
     coverage:
       enabled: true
       weight: 0.12
+      tv_weight: 0.3
       margin: 3.0
       locked_weight: 0.25
       locked_margin: 0.0

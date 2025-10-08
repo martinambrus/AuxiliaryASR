@@ -785,14 +785,48 @@ class Trainer(object):
             baseline = math.log(2.0) * locked_softness
             overshoot = (softened - baseline).clamp_min(0.0)
 
-        penalty = shortfall
+        denom_lengths = target_lengths.clamp_min(1.0)
+
+        penalty = shortfall / denom_lengths
         if locked_weight > 0.0:
-            penalty = penalty + locked_weight * overshoot
+            penalty = penalty + locked_weight * (overshoot / denom_lengths)
 
         denom = target_lengths.clamp_min(1.0)
         coverage_ratio = expected_non_blank / denom
 
-        loss_value = penalty.mean() * weight
+        coverage_term = penalty.mean()
+
+        tv_weight = float(cfg.get('tv_weight', cfg.get('lambda_tv', 0.0)))
+        tv_weight = max(0.0, tv_weight)
+        tv_loss = None
+        if tv_weight > 0.0 and probs.dim() == 3 and probs.size(1) > 1:
+            non_blank_probs = probs.clone()
+            if 0 <= blank_id < non_blank_probs.size(-1):
+                non_blank_probs[..., blank_id] = 0.0
+
+            diffs = non_blank_probs[:, 1:, :] - non_blank_probs[:, :-1, :]
+            diffs = diffs.abs().sum(dim=2)
+
+            if mask is not None:
+                pair_mask = (mask[:, 1:] > 0) & (mask[:, :-1] > 0)
+                pair_mask = pair_mask.to(diffs.dtype)
+                diffs = diffs * pair_mask
+                pair_counts = pair_mask.sum(dim=1)
+            else:
+                pair_counts = torch.full(
+                    (diffs.size(0),),
+                    diffs.size(1),
+                    device=diffs.device,
+                    dtype=diffs.dtype,
+                )
+
+            pair_counts = pair_counts.clamp_min(1.0)
+            tv_per_sample = diffs.sum(dim=1) / pair_counts
+            tv_loss = tv_per_sample.mean()
+        else:
+            tv_loss = torch.tensor(0.0, device=probs.device, dtype=probs.dtype)
+
+        loss_value = weight * coverage_term + tv_weight * tv_loss
 
         stats = {
             'diagnostics/ctc_expected_non_blank': float(expected_non_blank.mean().detach().item()),
@@ -808,6 +842,9 @@ class Trainer(object):
                 stats['diagnostics/ctc_coverage_locked_ratio'] = float(
                     overshoot_mask.float().mean().detach().item()
                 )
+        if tv_weight > 0.0 and tv_loss is not None:
+            stats['diagnostics/ctc_temporal_tv'] = float(tv_loss.detach().item())
+            stats['diagnostics/ctc_temporal_tv_weight'] = float(tv_weight)
         return loss_value, stats
 
     def _compute_attention_duration_regularization(self, attn, text_lengths, mel_lengths):
