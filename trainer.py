@@ -731,49 +731,45 @@ class Trainer(object):
 
         if blank_run_weight > 0.0:
             if mask is not None:
-                valid_lengths = mask.sum(dim=1).to(torch.long)
                 mask_bool = mask > 0.5
             else:
-                valid_lengths = torch.full(
-                    (blank_probs.size(0),),
-                    blank_probs.size(1),
-                    device=blank_probs.device,
-                    dtype=torch.long,
-                )
                 mask_bool = None
 
             blank_mask = blank_probs > blank_run_threshold
             if mask_bool is not None:
                 blank_mask = blank_mask & mask_bool
 
-            for batch_index in range(blank_probs.size(0)):
-                seq_len = int(valid_lengths[batch_index].item())
-                if seq_len <= 0:
-                    continue
+            if blank_mask.any():
+                # Identify contiguous runs of blanks using tensor operations.
+                prev_mask = torch.cat(
+                    [blank_mask.new_zeros((blank_mask.size(0), 1)), blank_mask[:, :-1]], dim=1
+                )
+                run_starts = blank_mask & (~prev_mask)
+                run_counts = run_starts.to(torch.long).sum(dim=1)
 
-                seq_mask = blank_mask[batch_index, :seq_len]
-                if not torch.any(seq_mask):
-                    continue
+                max_runs = int(run_counts.max().item()) if run_counts.numel() > 0 else 0
+                if max_runs > 0:
+                    run_ids = run_starts.to(torch.long).cumsum(dim=1) - 1
+                    run_ids = run_ids.masked_fill(~blank_mask, -1)
 
-                seq_probs = blank_probs[batch_index, :seq_len]
-                run_start = None
+                    batch_indices = torch.arange(blank_probs.size(0), device=blank_probs.device)
+                    batch_indices = batch_indices.unsqueeze(1).expand_as(run_ids)
 
-                for t in range(seq_len):
-                    if bool(seq_mask[t]):
-                        if run_start is None:
-                            run_start = t
-                    elif run_start is not None:
-                        run_slice = slice(run_start, t)
-                        run_mass = seq_probs[run_slice].sum()
-                        total_run_penalty = total_run_penalty + torch.clamp(run_mass - 3.0, min=0.0)
-                        total_runs += 1
-                        run_start = None
+                    valid_positions = run_ids >= 0
+                    if valid_positions.any():
+                        run_sums = blank_probs.new_zeros((blank_probs.size(0), max_runs))
+                        run_sums.index_put_(
+                            (batch_indices[valid_positions], run_ids[valid_positions]),
+                            blank_probs[valid_positions],
+                            accumulate=True,
+                        )
 
-                if run_start is not None:
-                    run_slice = slice(run_start, seq_len)
-                    run_mass = seq_probs[run_slice].sum()
-                    total_run_penalty = total_run_penalty + torch.clamp(run_mass - 3.0, min=0.0)
-                    total_runs += 1
+                        run_mask = torch.arange(max_runs, device=blank_probs.device)
+                        run_mask = run_mask.unsqueeze(0) < run_counts.unsqueeze(1)
+                        run_penalties = torch.clamp(run_sums - 3.0, min=0.0)
+                        run_penalties = run_penalties.masked_fill(~run_mask, 0.0)
+                        total_run_penalty = total_run_penalty + run_penalties.sum()
+                        total_runs = int(run_counts.sum().item())
 
             if total_runs > 0:
                 blank_run_penalty = total_run_penalty / float(total_runs)
