@@ -100,6 +100,7 @@ class Trainer(object):
         sigma = float(diagonal_attention_prior_sigma)
         self.diagonal_attention_prior_sigma = sigma if sigma > 0 else 0.5
         self.maxm_mem_usage = 0
+        self._epoch_step_progress = 0.0
         self.steps_per_epoch = steps_per_epoch if steps_per_epoch is None else int(steps_per_epoch)
         try:
             parsed_total_epochs = int(total_epochs) if total_epochs is not None else None
@@ -137,6 +138,7 @@ class Trainer(object):
             coverage_reg_cfg = {}
         self.ctc_coverage_regularization_enabled = bool(coverage_reg_cfg.get('enabled', False))
         self.ctc_coverage_regularization_config = coverage_reg_cfg
+        self._configure_min_duration_weight(coverage_reg_cfg.get('weight', None))
 
         alignment_reg_cfg = {}
         if isinstance(self.config, dict):
@@ -556,6 +558,89 @@ class Trainer(object):
 
         return float(max(0.0, weight))
 
+    def _configure_min_duration_weight(self, weight_cfg):
+        schedule = None
+        initial = 0.0
+        target = 0.0
+        ramp_ratio = 0.0
+
+        if isinstance(weight_cfg, dict):
+            initial = float(
+                weight_cfg.get(
+                    'initial',
+                    weight_cfg.get(
+                        'start', weight_cfg.get('base', weight_cfg.get('value', 1.0))
+                    ),
+                )
+            )
+            target = float(weight_cfg.get('target', weight_cfg.get('final', weight_cfg.get('end', initial))))
+            ramp_ratio = float(
+                weight_cfg.get(
+                    'ramp_ratio',
+                    weight_cfg.get(
+                        'warmup_ratio', weight_cfg.get('warmup_pct', weight_cfg.get('schedule_pct', 0.3))
+                    ),
+                )
+            )
+        else:
+            try:
+                target = float(weight_cfg)
+            except (TypeError, ValueError):
+                target = 1.5
+            initial = 1.0
+            ramp_ratio = 0.3
+
+        initial = float(max(0.0, initial))
+        target = float(max(0.0, target))
+        ramp_ratio = float(min(max(ramp_ratio, 0.0), 1.0))
+
+        if target <= 0.0 and initial <= 0.0:
+            schedule = None
+            self._active_min_duration_weight = 0.0
+        else:
+            schedule = {
+                'initial': initial,
+                'target': target,
+                'ramp_ratio': ramp_ratio,
+            }
+            self._active_min_duration_weight = float(initial if ramp_ratio > 0.0 else target)
+
+        self.min_duration_weight_schedule = schedule
+
+    def _training_progress_fraction(self) -> float:
+        total_epochs = self.total_epochs
+        if total_epochs is None or total_epochs <= 0:
+            return 1.0 if self.epochs > 0 else 0.0
+
+        step_progress = float(getattr(self, '_epoch_step_progress', 0.0))
+        step_progress = float(min(max(step_progress, 0.0), 1.0))
+        completed_epochs = float(min(max(self.epochs, 0), total_epochs))
+        progress = (completed_epochs + step_progress) / float(max(1, total_epochs))
+        return float(min(max(progress, 0.0), 1.0))
+
+    def _current_min_duration_weight(self, training: bool) -> float:
+        schedule = getattr(self, 'min_duration_weight_schedule', None)
+        if not schedule:
+            weight = 0.0
+        else:
+            initial = float(schedule.get('initial', 0.0))
+            target = float(schedule.get('target', initial))
+            ramp_ratio = float(schedule.get('ramp_ratio', 0.0))
+
+            if not training:
+                weight = target
+            else:
+                if ramp_ratio <= 0.0:
+                    weight = target
+                else:
+                    progress = self._training_progress_fraction()
+                    ramp_progress = min(1.0, progress / max(ramp_ratio, 1.0e-6))
+                    weight = initial + (target - initial) * ramp_progress
+
+        weight = float(max(0.0, weight))
+        self._active_min_duration_weight = weight
+        return weight
+
     def _current_ctc_blank_scale(self, epoch_index: int) -> float:
         if not self._ctc_blank_scale_enabled:
             return 1.0
@@ -643,7 +728,7 @@ class Trainer(object):
             return True
         return self.epochs >= max(warmup, 0)
 
-    def _compute_ctc_alignment_regularization(self, logits, input_lengths, target_lengths):
+    def _compute_ctc_alignment_regularization(self, logits, input_lengths, target_lengths, tokens=None):
         if logits is None:
             return {}, {}
 
@@ -670,7 +755,11 @@ class Trainer(object):
             coverage_cfg = self.ctc_coverage_regularization_config
             if self._ctc_regularization_warmup_passed(coverage_cfg):
                 coverage_result = self._compute_ctc_coverage_regularization(
-                    probs, input_lengths, target_lengths, coverage_cfg
+                    logits,
+                    input_lengths,
+                    tokens,
+                    target_lengths,
+                    coverage_cfg,
                 )
                 if coverage_result is not None:
                     loss_value, stats = coverage_result
@@ -729,85 +818,81 @@ class Trainer(object):
         }
         return loss_value, stats
 
-    def _compute_ctc_coverage_regularization(self, probs, input_lengths, target_lengths, cfg):
-        blank_id = self.ctc_blank_id
-        if blank_id < 0 or blank_id >= probs.size(-1):
+    def _compute_ctc_coverage_regularization(self, logits, input_lengths, tokens, token_lengths, cfg):
+        if tokens is None or token_lengths is None:
             return None
 
-        weight = float(cfg.get('weight', 0.0))
+        weight = float(self._current_min_duration_weight(training=True))
         if weight == 0.0:
             return None
 
-        if target_lengths is None:
-            return None
-        if not torch.is_tensor(target_lengths):
-            target_lengths = torch.as_tensor(target_lengths, device=probs.device)
-        target_lengths = target_lengths.to(device=probs.device, dtype=torch.float32)
-
-        non_blank = 1.0 - probs[..., blank_id]
-        if non_blank.dim() != 2:
-            return None
-
-        mask = None
-        if input_lengths is not None:
-            if not torch.is_tensor(input_lengths):
-                input_lengths = torch.as_tensor(input_lengths, device=non_blank.device)
-            input_lengths = input_lengths.to(device=non_blank.device, dtype=torch.long)
-            max_len = non_blank.size(1)
-            mask = torch.arange(max_len, device=non_blank.device).unsqueeze(0)
-            mask = mask < input_lengths.unsqueeze(1)
-            mask = mask.to(non_blank.dtype)
-
-        if mask is not None:
-            expected_non_blank = (non_blank * mask).sum(dim=1)
-        else:
-            expected_non_blank = non_blank.sum(dim=1)
-
-        margin = float(cfg.get('margin', cfg.get('delta', 4.0)))
-        margin = max(margin, 0.0)
-
-        shortfall = torch.clamp((target_lengths - expected_non_blank) - margin, min=0.0)
-
-        locked_weight = float(cfg.get('locked_weight', cfg.get('asym_weight', 0.25)))
-        locked_weight = max(0.0, locked_weight)
-        locked_margin = float(cfg.get('locked_margin', 0.0))
-        locked_margin = max(0.0, locked_margin)
-        locked_softness = float(cfg.get('locked_softness', 1.0))
-        locked_softness = max(0.0, locked_softness)
-
-        overshoot = torch.clamp(
-            expected_non_blank - (target_lengths + locked_margin),
-            min=0.0,
+        expected = self._compute_ctc_expected_durations(
+            logits,
+            input_lengths,
+            tokens,
+            token_lengths,
         )
-        if locked_softness > 0.0:
-            scaled = overshoot / locked_softness
-            softened = F.softplus(scaled) * locked_softness
-            baseline = math.log(2.0) * locked_softness
-            overshoot = (softened - baseline).clamp_min(0.0)
+        if expected is None:
+            return None
 
-        penalty = shortfall
-        if locked_weight > 0.0:
-            penalty = penalty + locked_weight * overshoot
+        if not torch.is_tensor(token_lengths):
+            token_lengths = torch.as_tensor(token_lengths, device=expected.device)
+        token_lengths = token_lengths.to(device=expected.device, dtype=torch.long)
 
-        denom = target_lengths.clamp_min(1.0)
-        coverage_ratio = expected_non_blank / denom
+        if not torch.is_tensor(tokens):
+            tokens = torch.as_tensor(tokens, device=expected.device)
+        else:
+            tokens = tokens.to(device=expected.device)
 
-        loss_value = penalty.mean() * weight
+        max_len = expected.size(1)
+        seq_positions = torch.arange(max_len, device=expected.device).unsqueeze(0)
+        token_mask = seq_positions < token_lengths.unsqueeze(1)
+        token_mask = token_mask & (tokens[:, :max_len] > 0)
+
+        if not torch.any(token_mask):
+            return None
+
+        token_mask_f = token_mask.to(expected.dtype)
+        min_duration = float(cfg.get('min_duration', cfg.get('min_frames', 2.0)))
+        min_duration = max(0.0, min_duration)
+
+        shortfall = torch.clamp(min_duration - expected, min=0.0)
+        masked_shortfall = shortfall * token_mask_f
+
+        token_counts = token_mask_f.sum(dim=1)
+        valid_sequences = token_counts > 0
+        if not torch.any(valid_sequences):
+            return None
+
+        per_sequence_penalty = torch.zeros_like(token_counts)
+        per_sequence_penalty[valid_sequences] = (
+            masked_shortfall.sum(dim=1)[valid_sequences]
+            / token_counts[valid_sequences].clamp_min(1.0)
+        )
+
+        loss_value = weight * per_sequence_penalty[valid_sequences].mean()
 
         stats = {
-            'diagnostics/ctc_expected_non_blank': float(expected_non_blank.mean().detach().item()),
-            'diagnostics/ctc_coverage_ratio': float(coverage_ratio.mean().detach().item()),
+            'diagnostics/ctc_min_duration_weight': float(weight),
         }
+
         with torch.no_grad():
-            short_mask = shortfall > 0
-            overshoot_mask = overshoot > 0
-            stats['diagnostics/ctc_coverage_short_ratio'] = float(
-                short_mask.float().mean().detach().item()
-            )
-            if locked_weight > 0.0:
-                stats['diagnostics/ctc_coverage_locked_ratio'] = float(
-                    overshoot_mask.float().mean().detach().item()
-                )
+            mask_bool = token_mask
+            expected_valid = expected[mask_bool]
+            if expected_valid.numel() > 0:
+                stats['diagnostics/ctc_min_duration_mean'] = float(expected_valid.mean().item())
+                stats['diagnostics/ctc_min_duration_min'] = float(expected_valid.min().item())
+                stats['diagnostics/ctc_min_duration_max'] = float(expected_valid.max().item())
+
+            short_mask = masked_shortfall > 0
+            total_tokens = float(token_counts.sum().item())
+            if total_tokens <= 0:
+                stats['diagnostics/ctc_min_duration_short_ratio'] = 0.0
+            else:
+                stats['diagnostics/ctc_min_duration_short_ratio'] = float(
+                    short_mask.sum().item()
+                ) / total_tokens
+
         return loss_value, stats
 
     def _compute_attention_duration_regularization(self, attn, text_lengths, mel_lengths):
@@ -877,51 +962,133 @@ class Trainer(object):
 
         with torch.no_grad():
             adjusted = self._adjust_ctc_logits(logits.detach())
-            probs = adjusted.float().softmax(dim=2)
+            log_probs = adjusted.float().log_softmax(dim=2)
 
             if input_lengths is not None:
                 if not torch.is_tensor(input_lengths):
-                    input_lengths = torch.as_tensor(input_lengths, device=probs.device)
-                input_lengths = input_lengths.to(device=probs.device, dtype=torch.long)
-                time_mask = torch.arange(probs.size(1), device=probs.device).unsqueeze(0)
-                time_mask = time_mask < input_lengths.unsqueeze(1)
-                probs = probs * time_mask.unsqueeze(2).to(probs.dtype)
+                    input_lengths = torch.as_tensor(input_lengths, device=log_probs.device)
+                input_lengths = input_lengths.to(device=log_probs.device, dtype=torch.long)
             else:
-                input_lengths = torch.full((probs.size(0),), probs.size(1), device=probs.device, dtype=torch.long)
+                input_lengths = torch.full(
+                    (log_probs.size(0),),
+                    log_probs.size(1),
+                    device=log_probs.device,
+                    dtype=torch.long,
+                )
 
             if token_lengths is not None:
                 if not torch.is_tensor(token_lengths):
                     token_lengths = torch.as_tensor(token_lengths, device=tokens.device)
                 token_lengths = token_lengths.to(device=tokens.device, dtype=torch.long)
             else:
-                token_lengths = torch.full((tokens.size(0),), tokens.size(1), device=tokens.device, dtype=torch.long)
+                token_lengths = torch.full(
+                    (tokens.size(0),),
+                    tokens.size(1),
+                    device=tokens.device,
+                    dtype=torch.long,
+                )
 
-            vocab_size = probs.size(-1)
-            expected = torch.zeros(tokens.size(0), tokens.size(1), device=probs.device, dtype=probs.dtype)
+            if not torch.is_tensor(tokens):
+                tokens = torch.as_tensor(tokens, device=log_probs.device)
+            else:
+                tokens = tokens.to(device=log_probs.device)
 
-            for batch_idx in range(probs.size(0)):
+            expected = torch.zeros(
+                tokens.size(0), tokens.size(1), device=log_probs.device, dtype=log_probs.dtype
+            )
+
+            blank_id = int(self.ctc_blank_id)
+
+            for batch_idx in range(log_probs.size(0)):
+                time_len = int(input_lengths[batch_idx].item())
                 seq_len = int(token_lengths[batch_idx].item())
-                if seq_len <= 0:
+                if time_len <= 0 or seq_len <= 0:
                     continue
+
+                time_len = min(time_len, log_probs.size(1))
+                seq_len = min(seq_len, tokens.size(1))
 
                 token_seq = tokens[batch_idx, :seq_len]
-                valid_mask = token_seq > 0
-                if not torch.any(valid_mask):
+                valid_positions = []
+                label_ids = []
+                for pos in range(seq_len):
+                    token_id = int(token_seq[pos].item())
+                    if token_id <= 0:
+                        continue
+                    valid_positions.append(pos)
+                    label_ids.append(token_id)
+
+                label_count = len(label_ids)
+                if label_count == 0:
                     continue
 
-                active_tokens = token_seq[valid_mask]
-                if active_tokens.numel() == 0:
+                extended = torch.full(
+                    (2 * label_count + 1,),
+                    blank_id,
+                    device=log_probs.device,
+                    dtype=torch.long,
+                )
+                extended[1::2] = torch.tensor(label_ids, device=log_probs.device, dtype=torch.long)
+
+                seq_log_probs = log_probs[batch_idx, :time_len]
+                num_states = extended.size(0)
+
+                log_alpha = seq_log_probs.new_full((time_len, num_states), float('-inf'))
+                log_alpha[0, 0] = seq_log_probs[0, blank_id]
+                if num_states > 1:
+                    log_alpha[0, 1] = seq_log_probs[0, extended[1]]
+
+                for t in range(1, time_len):
+                    for state in range(num_states):
+                        label = int(extended[state].item())
+                        emit = seq_log_probs[t, label]
+                        terms = [log_alpha[t - 1, state]]
+                        if state - 1 >= 0:
+                            terms.append(log_alpha[t - 1, state - 1])
+                        if (
+                            state - 2 >= 0
+                            and label != blank_id
+                            and label != int(extended[state - 2].item())
+                        ):
+                            terms.append(log_alpha[t - 1, state - 2])
+                        log_alpha[t, state] = emit + torch.logsumexp(torch.stack(terms), dim=0)
+
+                log_beta = seq_log_probs.new_full((time_len, num_states), float('-inf'))
+                log_beta[-1, num_states - 1] = 0.0
+                if num_states > 1:
+                    log_beta[-1, num_states - 2] = 0.0
+
+                for t in range(time_len - 2, -1, -1):
+                    for state in range(num_states):
+                        label = int(extended[state].item())
+                        terms = [seq_log_probs[t + 1, label] + log_beta[t + 1, state]]
+                        if state + 1 < num_states:
+                            next_label = int(extended[state + 1].item())
+                            terms.append(seq_log_probs[t + 1, next_label] + log_beta[t + 1, state + 1])
+                        if (
+                            state + 2 < num_states
+                            and label != blank_id
+                            and label != int(extended[state + 2].item())
+                        ):
+                            skip_label = int(extended[state + 2].item())
+                            terms.append(seq_log_probs[t + 1, skip_label] + log_beta[t + 1, state + 2])
+                        log_beta[t, state] = torch.logsumexp(torch.stack(terms), dim=0)
+
+                final_states = [log_alpha[time_len - 1, num_states - 1]]
+                if num_states > 1:
+                    final_states.append(log_alpha[time_len - 1, num_states - 2])
+                log_normalizer = torch.logsumexp(torch.stack(final_states), dim=0)
+                if not torch.isfinite(log_normalizer):
                     continue
 
-                time_len = int(input_lengths[batch_idx].item())
-                token_mass = probs[batch_idx, :time_len].sum(dim=0)
-                counts = torch.bincount(active_tokens, minlength=vocab_size).to(token_mass.dtype)
-                occ = counts.gather(0, active_tokens).clamp_min(1.0)
-                per_token = token_mass.gather(0, active_tokens) / occ
+                log_post = log_alpha[:time_len] + log_beta[:time_len] - log_normalizer
 
-                target_slice = expected[batch_idx, :seq_len]
-                target_slice[valid_mask] = per_token
-                expected[batch_idx, :seq_len] = target_slice
+                for idx, position in enumerate(valid_positions):
+                    state_index = 2 * idx + 1
+                    if state_index >= num_states:
+                        continue
+                    occupancy = torch.exp(log_post[:, state_index])
+                    expected[batch_idx, position] = occupancy.sum()
 
         return expected
 
@@ -1365,6 +1532,23 @@ class Trainer(object):
             break
         return lr
 
+    def _estimate_epoch_steps(self, dataloader):
+        if dataloader is None:
+            return None
+
+        try:
+            length = len(dataloader)
+        except (TypeError, ValueError):
+            length = None
+
+        if isinstance(length, int) and length > 0:
+            return length
+
+        if self.steps_per_epoch is not None and self.steps_per_epoch > 0:
+            return int(self.steps_per_epoch)
+
+        return None
+
     def _build_frame_targets(self, text_input, text_lengths, frame_lengths, max_frames):
         device = text_input.device
         batch_size = text_input.size(0)
@@ -1576,7 +1760,10 @@ class Trainer(object):
                 loss_ctc = torch.zeros(1, device=self.device)
 
             reg_losses, reg_stats = self._compute_ctc_alignment_regularization(
-                ppgs, mel_input_length, text_input_length
+                ppgs,
+                mel_input_length,
+                text_input_length,
+                tokens=text_input,
             )
             for key, value in reg_losses.items():
                 total_loss = total_loss + value
@@ -1839,7 +2026,12 @@ class Trainer(object):
         else:
             data_iterator = tqdm(self.train_dataloader, desc="[train]")
 
+        epoch_steps_estimate = self._estimate_epoch_steps(self.train_dataloader)
         for train_steps_per_epoch, batch in enumerate(data_iterator, 1):
+            if epoch_steps_estimate and epoch_steps_estimate > 0:
+                self._epoch_step_progress = float(train_steps_per_epoch - 1) / float(epoch_steps_estimate)
+            else:
+                self._epoch_step_progress = 0.0
             losses = self.run(batch)
             for key, value in losses.items():
                 train_losses["train/%s" % key].append(value)
@@ -1848,6 +2040,7 @@ class Trainer(object):
         train_losses.setdefault('train/ctc_blank_scale', self._get_active_ctc_blank_scale())
         train_losses['train/learning_rate'] = self._get_lr()
         self.epochs += 1
+        self._epoch_step_progress = 0.0
 
         if torch.cuda.is_available():
             gpu_id = torch.cuda.current_device()

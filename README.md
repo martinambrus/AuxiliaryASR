@@ -127,12 +127,12 @@ ctc_loss:
       target: 0.62
       tolerance: 0.05        # slack before the penalty ramps up
     coverage:
-      enabled: true          # encourages enough non-blank mass to cover the transcript length
-      weight: 0.12
-      margin: 3.0            # allows up to ~3 frames of under-coverage before the loss activates
-      locked_weight: 0.25    # gentler overshoot damping once coverage has caught up
-      locked_margin: 0.0     # optional extra slack before the overshoot term activates
-      locked_softness: 1.0   # smooth the overshoot branch for softer gradients
+      enabled: true          # pushes each token to claim ~2 frames using a per-token hinge
+      weight:
+        initial: 1.0         # start a little softer while alignments are settling
+        target: 1.5          # full strength once ~30% of training has elapsed
+        ramp_ratio: 0.3      # ramp over the first 30% of the planned training duration
+      min_duration: 2.0      # hinge on the expected frames per token (via forward-backward)
 
 alignment_regularization:
   attention_duration:

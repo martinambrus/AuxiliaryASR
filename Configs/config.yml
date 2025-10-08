@@ -194,11 +194,11 @@ ctc_loss:
       penalize_low_blank: false
     coverage:
       enabled: true
-      weight: 0.12
-      margin: 3.0
-      locked_weight: 0.25
-      locked_margin: 0.0
-      locked_softness: 1.0
+      weight:
+        initial: 1.0
+        target: 1.5
+        ramp_ratio: 0.3
+      min_duration: 2.0
       warmup_epochs: 5
 
 alignment_regularization:
