@@ -130,7 +130,7 @@ class Trainer(object):
         if not isinstance(blank_reg_cfg, dict):
             blank_reg_cfg = {}
         self.ctc_blank_rate_regularization_enabled = bool(blank_reg_cfg.get('enabled', False))
-        self.ctc_blank_rate_regularization_config = blank_reg_cfg
+        self.ctc_blank_rate_regularization_config = self._configure_ctc_blank_rate_regularization(blank_reg_cfg)
 
         coverage_reg_cfg = ctc_reg_cfg.get('coverage', {}) or {}
         if not isinstance(coverage_reg_cfg, dict):
@@ -458,6 +458,104 @@ class Trainer(object):
         self.ctc_blank_scale_schedule = schedule
         self._active_ctc_blank_scale = base_scale if self._ctc_blank_scale_enabled else 1.0
 
+    def _configure_ctc_blank_rate_regularization(self, cfg):
+        config = dict(cfg) if isinstance(cfg, dict) else {}
+
+        weight_cfg = config.get('weight', 0.0)
+        schedule = None
+        base_weight = 0.0
+
+        if isinstance(weight_cfg, dict):
+            initial = float(weight_cfg.get(
+                'initial',
+                weight_cfg.get(
+                    'start',
+                    weight_cfg.get('base', weight_cfg.get('value', weight_cfg.get('scale', 0.0))),
+                ),
+            ))
+            target = float(weight_cfg.get(
+                'target', weight_cfg.get('final', weight_cfg.get('end', initial))
+            ))
+            warmup_epochs = int(weight_cfg.get('warmup_epochs', weight_cfg.get('ramp_epochs', 0)))
+            hold_epochs = int(weight_cfg.get('hold_epochs', weight_cfg.get('initial_epochs', 0)))
+            warmup_steps = int(weight_cfg.get('warmup_steps', weight_cfg.get('ramp_steps', 0)))
+            hold_steps = int(weight_cfg.get('hold_steps', weight_cfg.get('initial_steps', 0)))
+
+            mode = weight_cfg.get('mode', None)
+            if mode not in ('step', 'epoch'):
+                mode = 'step' if (warmup_steps > 0 or hold_steps > 0) else 'epoch'
+
+            schedule = {
+                'initial': float(initial),
+                'target': float(target),
+                'warmup_epochs': max(0, warmup_epochs),
+                'hold_epochs': max(0, hold_epochs),
+                'warmup_steps': max(0, warmup_steps),
+                'hold_steps': max(0, hold_steps),
+                'mode': mode,
+            }
+            base_weight = float(initial)
+        else:
+            try:
+                base_weight = float(weight_cfg)
+            except (TypeError, ValueError):
+                base_weight = 0.0
+
+        config['_weight_schedule'] = schedule
+        config['_base_weight'] = base_weight
+        config['_raw_weight'] = weight_cfg
+        config['weight'] = base_weight
+        return config
+
+    def _current_ctc_blank_rate_weight(self, training: bool) -> float:
+        cfg = self.ctc_blank_rate_regularization_config or {}
+        schedule = cfg.get('_weight_schedule')
+        base_weight = float(cfg.get('_base_weight', cfg.get('weight', 0.0)))
+        if not schedule:
+            return float(base_weight)
+
+        initial = float(schedule.get('initial', base_weight))
+        target = float(schedule.get('target', initial))
+        mode = schedule.get('mode', 'epoch')
+
+        if mode == 'step':
+            if training:
+                step_index = self._optimizer_step_count + 1
+            else:
+                step_index = max(1, self._optimizer_step_count)
+
+            hold_steps = int(schedule.get('hold_steps', 0))
+            warmup_steps = int(schedule.get('warmup_steps', 0))
+
+            if hold_steps > 0 and step_index <= hold_steps:
+                weight = initial
+            else:
+                if warmup_steps <= 0:
+                    weight = target
+                else:
+                    progress_steps = max(0, step_index - hold_steps)
+                    progress = min(1.0, progress_steps / float(max(1, warmup_steps)))
+                    weight = initial + (target - initial) * progress
+        else:
+            epoch_index = self.epochs + 1 if training else max(1, self.epochs)
+            hold_epochs = int(schedule.get('hold_epochs', 0))
+            warmup_epochs = int(schedule.get('warmup_epochs', 0))
+
+            if hold_epochs > 0 and epoch_index <= hold_epochs:
+                weight = initial
+            else:
+                if warmup_epochs <= 0:
+                    weight = target
+                else:
+                    progress_epochs = max(0.0, (epoch_index - 1 - hold_epochs))
+                    progress = min(1.0, progress_epochs / float(max(1, warmup_epochs)))
+                    weight = initial + (target - initial) * progress
+
+            if epoch_index > hold_epochs + warmup_epochs:
+                weight = target
+
+        return float(max(0.0, weight))
+
     def _current_ctc_blank_scale(self, epoch_index: int) -> float:
         if not self._ctc_blank_scale_enabled:
             return 1.0
@@ -586,7 +684,8 @@ class Trainer(object):
         if blank_id < 0 or blank_id >= probs.size(-1):
             return None
 
-        weight = float(cfg.get('weight', 0.0))
+        weight = float(self._current_ctc_blank_rate_weight(training=True))
+        self._active_ctc_blank_rate_weight = weight
         if weight == 0.0:
             return None
 
@@ -626,6 +725,7 @@ class Trainer(object):
 
         stats = {
             'diagnostics/ctc_blank_rate': float(blank_rate.mean().detach().item()),
+            'diagnostics/ctc_blank_rate_weight': float(weight),
         }
         return loss_value, stats
 

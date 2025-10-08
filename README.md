@@ -120,7 +120,10 @@ ctc_loss:
   regularization:
     blank_rate:
       enabled: true          # applies a mild hinge penalty when the blank posterior dominates
-      weight: 0.25           # penalise batches whose blank rate exceeds ~0.62
+      weight:
+        initial: 0.75        # start the hinge penalty gently to avoid shocking early training
+        target: 0.85         # settle in the 0.8–0.85 "sweet" zone once alignments stabilise
+        warmup_steps: 10000  # linearly ramp across the first ~10k optimiser steps
       target: 0.62
       tolerance: 0.05        # slack before the penalty ramps up
     coverage:
