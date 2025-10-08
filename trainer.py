@@ -1009,16 +1009,12 @@ class Trainer(object):
                 seq_len = min(seq_len, tokens.size(1))
 
                 token_seq = tokens[batch_idx, :seq_len]
-                valid_positions = []
-                label_ids = []
-                for pos in range(seq_len):
-                    token_id = int(token_seq[pos].item())
-                    if token_id <= 0:
-                        continue
-                    valid_positions.append(pos)
-                    label_ids.append(token_id)
+                valid_positions = (token_seq > 0).nonzero(as_tuple=False).flatten()
+                if valid_positions.numel() == 0:
+                    continue
 
-                label_count = len(label_ids)
+                label_ids = token_seq[valid_positions]
+                label_count = label_ids.numel()
                 if label_count == 0:
                     continue
 
@@ -1028,67 +1024,104 @@ class Trainer(object):
                     device=log_probs.device,
                     dtype=torch.long,
                 )
-                extended[1::2] = torch.tensor(label_ids, device=log_probs.device, dtype=torch.long)
+                extended[1::2] = label_ids.to(dtype=torch.long, device=log_probs.device)
 
                 seq_log_probs = log_probs[batch_idx, :time_len]
                 num_states = extended.size(0)
 
-                log_alpha = seq_log_probs.new_full((time_len, num_states), float('-inf'))
-                log_alpha[0, 0] = seq_log_probs[0, blank_id]
+                neg_inf = float('-inf')
+
+                emissions = seq_log_probs.gather(
+                    1, extended.unsqueeze(0).expand(time_len, -1)
+                )
+
+                log_alpha = seq_log_probs.new_full((time_len, num_states), neg_inf)
+                log_alpha[0, 0] = emissions[0, 0]
                 if num_states > 1:
-                    log_alpha[0, 1] = seq_log_probs[0, extended[1]]
+                    log_alpha[0, 1] = emissions[0, 1]
+
+                is_blank = extended == blank_id
+                skip_forward_mask = torch.zeros(
+                    num_states, dtype=torch.bool, device=log_probs.device
+                )
+                if num_states > 2:
+                    skip_forward_mask[2:] = (
+                        ~is_blank[2:]
+                        & (extended[2:] != extended[:-2])
+                    )
 
                 for t in range(1, time_len):
-                    for state in range(num_states):
-                        label = int(extended[state].item())
-                        emit = seq_log_probs[t, label]
-                        terms = [log_alpha[t - 1, state]]
-                        if state - 1 >= 0:
-                            terms.append(log_alpha[t - 1, state - 1])
-                        if (
-                            state - 2 >= 0
-                            and label != blank_id
-                            and label != int(extended[state - 2].item())
-                        ):
-                            terms.append(log_alpha[t - 1, state - 2])
-                        log_alpha[t, state] = emit + torch.logsumexp(torch.stack(terms), dim=0)
+                    # Vectorised forward recursion: allow self, previous and
+                    # skip connections (when the repeated-label constraint is
+                    # satisfied) without per-state Python loops.
+                    prev = log_alpha[t - 1]
+                    stay = prev
+                    from_prev1 = prev.new_full((num_states,), neg_inf)
+                    from_prev1[1:] = prev[:-1]
 
-                log_beta = seq_log_probs.new_full((time_len, num_states), float('-inf'))
+                    from_prev2 = prev.new_full((num_states,), neg_inf)
+                    if num_states > 2:
+                        from_prev2[2:] = prev[:-2]
+                        from_prev2 = from_prev2.masked_fill(~skip_forward_mask, neg_inf)
+
+                    transitions = torch.logaddexp(stay, from_prev1)
+                    if num_states > 2:
+                        transitions = torch.logaddexp(transitions, from_prev2)
+
+                    log_alpha[t] = emissions[t] + transitions
+
+                log_beta = seq_log_probs.new_full((time_len, num_states), neg_inf)
                 log_beta[-1, num_states - 1] = 0.0
                 if num_states > 1:
                     log_beta[-1, num_states - 2] = 0.0
 
-                for t in range(time_len - 2, -1, -1):
-                    for state in range(num_states):
-                        label = int(extended[state].item())
-                        terms = [seq_log_probs[t + 1, label] + log_beta[t + 1, state]]
-                        if state + 1 < num_states:
-                            next_label = int(extended[state + 1].item())
-                            terms.append(seq_log_probs[t + 1, next_label] + log_beta[t + 1, state + 1])
-                        if (
-                            state + 2 < num_states
-                            and label != blank_id
-                            and label != int(extended[state + 2].item())
-                        ):
-                            skip_label = int(extended[state + 2].item())
-                            terms.append(seq_log_probs[t + 1, skip_label] + log_beta[t + 1, state + 2])
-                        log_beta[t, state] = torch.logsumexp(torch.stack(terms), dim=0)
+                skip_backward_mask = torch.zeros(
+                    num_states, dtype=torch.bool, device=log_probs.device
+                )
+                if num_states > 2:
+                    skip_backward_mask[:-2] = (
+                        ~is_blank[:-2]
+                        & (extended[:-2] != extended[2:])
+                    )
 
-                final_states = [log_alpha[time_len - 1, num_states - 1]]
-                if num_states > 1:
-                    final_states.append(log_alpha[time_len - 1, num_states - 2])
-                log_normalizer = torch.logsumexp(torch.stack(final_states), dim=0)
+                for t in range(time_len - 2, -1, -1):
+                    # Mirror the forward recursion for the backward pass using
+                    # the same vectorised transition structure.
+                    next_beta = log_beta[t + 1]
+
+                    stay = emissions[t + 1] + next_beta
+
+                    to_next1 = next_beta.new_full((num_states,), neg_inf)
+                    if num_states > 1:
+                        to_next1[:-1] = emissions[t + 1, 1:] + next_beta[1:]
+
+                    to_next2 = next_beta.new_full((num_states,), neg_inf)
+                    if num_states > 2:
+                        to_next2[:-2] = emissions[t + 1, 2:] + next_beta[2:]
+                        to_next2 = to_next2.masked_fill(~skip_backward_mask, neg_inf)
+
+                    transitions = torch.logaddexp(stay, to_next1)
+                    if num_states > 2:
+                        transitions = torch.logaddexp(transitions, to_next2)
+
+                    log_beta[t] = transitions
+
+                if num_states == 1:
+                    log_normalizer = log_alpha[time_len - 1, 0]
+                else:
+                    log_normalizer = torch.logsumexp(
+                        log_alpha[time_len - 1, num_states - 2 : num_states], dim=0
+                    )
                 if not torch.isfinite(log_normalizer):
                     continue
 
                 log_post = log_alpha[:time_len] + log_beta[:time_len] - log_normalizer
 
-                for idx, position in enumerate(valid_positions):
-                    state_index = 2 * idx + 1
-                    if state_index >= num_states:
-                        continue
-                    occupancy = torch.exp(log_post[:, state_index])
-                    expected[batch_idx, position] = occupancy.sum()
+                state_indices = 2 * torch.arange(label_count, device=log_probs.device) + 1
+                if state_indices.numel() == 0:
+                    continue
+                summed = torch.exp(log_post[:, state_indices]).sum(dim=0)
+                expected[batch_idx, valid_positions] = summed
 
         return expected
 
