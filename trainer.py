@@ -723,10 +723,70 @@ class Trainer(object):
         penalty = over_penalty + under_penalty
         loss_value = penalty.mean() * weight
 
+        blank_run_weight = float(cfg.get('blank_run_weight', 0.2))
+        blank_run_threshold = float(cfg.get('blank_run_threshold', 0.5))
+        blank_run_penalty = None
+        total_run_penalty = blank_probs.new_zeros(())
+        total_runs = 0
+
+        if blank_run_weight > 0.0:
+            if mask is not None:
+                mask_bool = mask > 0.5
+            else:
+                mask_bool = None
+
+            blank_mask = blank_probs > blank_run_threshold
+            if mask_bool is not None:
+                blank_mask = blank_mask & mask_bool
+
+            if blank_mask.any():
+                # Identify contiguous runs of blanks using tensor operations.
+                prev_mask = torch.cat(
+                    [blank_mask.new_zeros((blank_mask.size(0), 1)), blank_mask[:, :-1]], dim=1
+                )
+                run_starts = blank_mask & (~prev_mask)
+                run_counts = run_starts.to(torch.long).sum(dim=1)
+
+                max_runs = int(run_counts.max().item()) if run_counts.numel() > 0 else 0
+                if max_runs > 0:
+                    run_ids = run_starts.to(torch.long).cumsum(dim=1) - 1
+                    run_ids = run_ids.masked_fill(~blank_mask, -1)
+
+                    batch_indices = torch.arange(blank_probs.size(0), device=blank_probs.device)
+                    batch_indices = batch_indices.unsqueeze(1).expand_as(run_ids)
+
+                    valid_positions = run_ids >= 0
+                    if valid_positions.any():
+                        run_sums = blank_probs.new_zeros((blank_probs.size(0), max_runs))
+                        run_sums.index_put_(
+                            (batch_indices[valid_positions], run_ids[valid_positions]),
+                            blank_probs[valid_positions],
+                            accumulate=True,
+                        )
+
+                        run_mask = torch.arange(max_runs, device=blank_probs.device)
+                        run_mask = run_mask.unsqueeze(0) < run_counts.unsqueeze(1)
+                        run_penalties = torch.clamp(run_sums - 3.0, min=0.0)
+                        run_penalties = run_penalties.masked_fill(~run_mask, 0.0)
+                        total_run_penalty = total_run_penalty + run_penalties.sum()
+                        total_runs = int(run_counts.sum().item())
+
+            if total_runs > 0:
+                blank_run_penalty = total_run_penalty / float(total_runs)
+                loss_value = loss_value + blank_run_penalty * blank_run_weight
+            else:
+                blank_run_penalty = total_run_penalty
+
         stats = {
             'diagnostics/ctc_blank_rate': float(blank_rate.mean().detach().item()),
             'diagnostics/ctc_blank_rate_weight': float(weight),
         }
+        if blank_run_penalty is not None:
+            stats.update({
+                'diagnostics/ctc_blank_run_penalty': float(blank_run_penalty.detach().item()),
+                'diagnostics/ctc_blank_run_weight': float(blank_run_weight),
+                'diagnostics/ctc_blank_run_count': float(total_runs),
+            })
         return loss_value, stats
 
     def _compute_ctc_coverage_regularization(self, probs, input_lengths, target_lengths, cfg):
