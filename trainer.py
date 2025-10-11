@@ -921,7 +921,10 @@ class Trainer(object):
 
         min_frames = float(cfg.get('min_frames', 0.0))
         tolerance = float(cfg.get('tolerance', 0.0))
-        max_frames = float(cfg.get('max_frames', 0.0))
+        floor_frames = float(cfg.get('min_coverage_frames', 2.0))
+
+        if floor_frames > 0.0:
+            min_frames = max(min_frames, floor_frames)
 
         device = attn.device
         text_lengths = text_lengths.to(device=device, dtype=torch.long)
@@ -941,10 +944,6 @@ class Trainer(object):
 
         lower_bound = max(0.0, min_frames - tolerance)
         penalty = torch.clamp(lower_bound - durations, min=0.0)
-
-        if max_frames > 0.0:
-            upper_bound = max_frames + max(0.0, tolerance)
-            penalty = penalty + torch.clamp(durations - upper_bound, min=0.0)
 
         penalty = penalty * text_mask
         average_penalty = penalty.sum() / denom

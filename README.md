@@ -121,11 +121,12 @@ ctc_loss:
     blank_rate:
       enabled: true          # applies a mild hinge penalty when the blank posterior dominates
       weight:
-        initial: 0.75        # start the hinge penalty gently to avoid shocking early training
-        target: 0.85         # settle in the 0.8–0.85 "sweet" zone once alignments stabilise
+        initial: 0.8         # start the hinge penalty gently to avoid shocking early training
+        target: 0.9          # settle in the upper-0.8 range once alignments stabilise
         warmup_steps: 10000  # linearly ramp across the first ~10k optimiser steps
-      target: 0.62
-      tolerance: 0.05        # slack before the penalty ramps up
+      target: 0.6
+      tolerance: 0.03        # slack before the penalty ramps up
+      penalize_low_blank: true  # nudge the model back toward short blank pauses when it over-emits tokens
     coverage:
       enabled: true          # encourages enough non-blank mass to cover the transcript length
       weight: 0.12
@@ -141,6 +142,7 @@ alignment_regularization:
     weight: 0.15             # average penalty applied when tokens fall below the minimum duration
     min_frames: 2.0
     tolerance: 0.3
+    min_coverage_frames: 2.0
 
 regularization:
   entropy:
@@ -165,7 +167,7 @@ decoding:
     insertion_bonus: 0.05   # encourages emitting non-blank symbols when hypotheses compete
 ```
 
-Additionally, the diagonal attention prior now masks out padded timesteps, applies a light dropout (configurable through `model_params.attention_dropout`), and uses a tiny guided-attention helper for the first few thousand optimiser steps. By default the helper holds a λ of 0.05 for the first ~4k steps before settling to 0.02 with a narrower σ≈0.25 along the normalised axes. This gentle schedule nudges early monotonicity without undoing the coverage and blank-rate regularisers; if you notice diagonal coherence dropping (e.g., due to a masking bug), simply disable the prior by setting `use_diagonal_attention_prior` to `False`.
+Additionally, the diagonal attention prior now masks out padded timesteps, applies a light dropout (configurable through `model_params.attention_dropout`), and uses a tiny guided-attention helper for the first few thousand optimiser steps. By default the helper holds a λ of 0.04 for the first ~4k steps before settling to 0.015 with a slightly wider σ≈0.32 along the normalised axes. This gentler schedule keeps the diagonal score in the 0.62–0.68 window while relaxing the “hug-the-diagonal” pressure that previously compressed durations; if you notice diagonal coherence dropping (e.g., due to a masking bug), simply disable the prior by setting `use_diagonal_attention_prior` to `False`.
 
 To avoid choosing checkpoints that only excel at PER while misaligning attention or dropping symbols, training now logs a joint selection score that blends PER, diagonal coherence, and the normalised CTC length gap. The configuration exposes the coefficients under `checkpoint_selection` and the trainer will keep a `best_joint.pth` symlink pointing at the most alignment-friendly checkpoint observed so far.
 
