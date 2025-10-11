@@ -160,8 +160,8 @@ sortagrad_switch_to_shuffled_dataset_epoch: 10
 # make ASR learn to read phonemes from left to right, not randomly
 use_diagonal_attention_prior: True
 diagonal_attention_prior_weight:
-  initial: 0.04
-  target: 0.015
+  initial: 0.028
+  target: 0.011
   hold_steps: 4000  # keep the helper active for ~3-5k optimiser steps
   warmup_steps: 0
 diagonal_attention_prior_sigma: 0.32
@@ -175,12 +175,12 @@ ctc_loss:
   logit_temperature: 1.0
   blank_scale:
     enabled: true
-    base: 0.7
+    base: 0.68
     schedule:
       - pct: 0.3
-        value: 0.6
+        value: 0.58
       - pct: 0.7
-        value: 0.85
+        value: 0.83
   regularization:
     blank_rate:
       enabled: true
@@ -207,10 +207,10 @@ ctc_loss:
 alignment_regularization:
   attention_duration:
     enabled: true
-    weight: 0.15
-    min_frames: 2.0
-    tolerance: 0.3
-    min_coverage_frames: 2.0
+    weight: 0.08
+    min_frames: 1.8
+    tolerance: 0.2
+    min_coverage_frames: 1.8
     warmup_epochs: 8
 
 dataset_params:
