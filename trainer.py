@@ -649,6 +649,9 @@ class Trainer(object):
                 adjusted[..., self.ctc_blank_id] = adjusted[..., self.ctc_blank_id] - bias
             if scale != 1.0:
                 safe_scale = float(max(1.0e-6, scale))
+                # Apply the scaling pre-softmax so the configured blank schedule
+                # maps directly to a logit shift. Doing this post-softmax would
+                # amplify the effect and overshoot the intended blank rate.
                 adjusted[..., self.ctc_blank_id] = adjusted[..., self.ctc_blank_id] + math.log(safe_scale)
         if temperature != 1.0:
             adjusted = adjusted / temperature

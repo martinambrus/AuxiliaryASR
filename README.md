@@ -103,7 +103,7 @@ Each augmentation block can be toggled on or off independently through `Configs/
 
 #### Keeping the CTC branch expressive
 
-When the auxiliary ASR is trained on only a few hours of speech, the CTC head can collapse into predicting mostly blanks, which hurts diagonal alignments and increases the skip/merge gap. The default configuration now enables gentle blank-rate and coverage regularisers so deletions are discouraged without overwhelming the core losses:
+When the auxiliary ASR is trained on only a few hours of speech, the CTC head can collapse into predicting mostly blanks, which hurts diagonal alignments and increases the skip/merge gap. The default configuration now enables gentle blank-rate and coverage regularisers so deletions are discouraged without overwhelming the core losses; the blank prior is tuned toward a 0.50–0.55 operating band while keeping long-blank penalties intact:
 
 ```yaml
 ctc_loss:
@@ -111,12 +111,12 @@ ctc_loss:
   logit_temperature: 1.0     # flattens the CTC posterior to discourage over-confidence
   blank_scale:
     enabled: true            # multiply the blank posterior by a scheduled down-weighting factor
-    base: 0.58               # start lower so non-blanks reclaim mass earlier in training
+    base: 0.54               # start lower so non-blanks reclaim mass earlier in training
     schedule:
-      - pct: 0.3             # first, descend to 0.48 by 30% of training
-        value: 0.48
-      - pct: 0.7             # then relax back up to ~0.73 by 70% and hold it steady
-        value: 0.73
+      - pct: 0.3             # first, descend to 0.44 by 30% of training
+        value: 0.44
+      - pct: 0.7             # then relax back up to ~0.68 by 70% and hold it steady
+        value: 0.68
   regularization:
     blank_rate:
       enabled: true          # applies a mild hinge penalty when the blank posterior dominates
@@ -139,10 +139,10 @@ ctc_loss:
 alignment_regularization:
   attention_duration:
     enabled: true            # prevents the attention map from collapsing to 1–2 frame spikes
-    weight: 0.04             # tiny one-sided hinge applied on the expected durations
-    min_frames: 1.8
-    tolerance: 0.2
-    min_coverage_frames: 1.8
+    weight: 0.025            # tiny one-sided hinge applied on the expected durations
+    min_frames: 1.78
+    tolerance: 0.22
+    min_coverage_frames: 1.78
     anneal_target_p50: 2.0   # automatically ramp the weight toward zero once the median hits 2 frames
     anneal_patience: 2       # require two consecutive epochs before each decay
     anneal_decay: 0.5        # halve the weight after each satisfied streak
@@ -154,7 +154,7 @@ regularization:
         weight: 0.02         # maximise entropy to keep non-blank symbols active
 ```
 
-All of the auxiliary losses honour a `warmup_epochs` key (`5` for the CTC penalties and `8` for the duration term in the default config) so you can delay their activation until the alignment has roughly converged.
+All of the auxiliary losses honour a `warmup_epochs` key (`5` for the CTC penalties and `8` for the duration term in the default config) so you can delay their activation until the alignment has roughly converged. The duration guard stays one-sided and trims only when the expected coverage drops below ~1.8 frames, nudging the median toward two frames before annealing back.
 
 The coverage helper now applies a locally normalised hinge along with a heavier total-variation prior over the non-blank posterior mass. This combination pushes token durations to recover sooner while keeping adjacent timesteps smooth enough to avoid 1-frame spikes.
 
@@ -170,7 +170,7 @@ decoding:
     insertion_bonus: 0.05   # encourages emitting non-blank symbols when hypotheses compete
 ```
 
-Additionally, the diagonal attention prior now masks out padded timesteps, applies a light dropout (configurable through `model_params.attention_dropout`), and uses a guided-attention helper that completely stands down for the first six epochs before returning at roughly half its former strength (λ≈0.005 with σ≈0.32). This two-stage schedule lets Arabic alignments fan out toward a diag score around 0.7 while still supplying a gentle prior later in training; if you notice diagonal coherence dropping (e.g., due to a masking bug), simply disable the prior by setting `use_diagonal_attention_prior` to `False`.
+Additionally, the diagonal attention prior now masks out padded timesteps, applies a light dropout (configurable through `model_params.attention_dropout`), and uses a guided-attention helper that completely stands down for the first six epochs before easing back in over the next four at roughly λ≈0.0025→0.004 with a wider σ≈0.45. This two-stage schedule lets Arabic alignments fan out toward a diag score around 0.7 while still supplying a gentle prior later in training; if you notice diagonal coherence dropping (e.g., due to a masking bug), simply disable the prior by setting `use_diagonal_attention_prior` to `False`.
 
 To avoid choosing checkpoints that only excel at PER while misaligning attention or dropping symbols, training now logs a joint selection score that blends PER, diagonal coherence, and the normalised CTC length gap. The configuration exposes the coefficients under `checkpoint_selection` and the trainer will keep a `best_joint.pth` symlink pointing at the most alignment-friendly checkpoint observed so far.
 
