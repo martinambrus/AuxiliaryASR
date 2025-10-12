@@ -160,9 +160,9 @@ sortagrad_switch_to_shuffled_dataset_epoch: 10
 # make ASR learn to read phonemes from left to right, not randomly
 use_diagonal_attention_prior: True
 diagonal_attention_prior_weight:
-  initial: 0.006
-  target: 0.006
-  inactive_epochs: 4  # disable the helper entirely for the first few epochs on Arabic
+  initial: 0.005
+  target: 0.005
+  inactive_epochs: 6  # keep Arabic alignments free-running a little longer before reintroducing the prior
   warmup_epochs: 0
 diagonal_attention_prior_sigma: 0.32
 
@@ -175,12 +175,12 @@ ctc_loss:
   logit_temperature: 1.0
   blank_scale:
     enabled: true
-    base: 0.63
+    base: 0.58
     schedule:
       - pct: 0.3
-        value: 0.53
+        value: 0.48
       - pct: 0.7
-        value: 0.78
+        value: 0.73
   regularization:
     blank_rate:
       enabled: true
@@ -207,10 +207,10 @@ ctc_loss:
 alignment_regularization:
   attention_duration:
     enabled: true
-    weight: 0.035
-    min_frames: 1.75
+    weight: 0.04
+    min_frames: 1.8
     tolerance: 0.2
-    min_coverage_frames: 1.75
+    min_coverage_frames: 1.8
     warmup_epochs: 8
     anneal_target_p50: 2.0
     anneal_patience: 2
