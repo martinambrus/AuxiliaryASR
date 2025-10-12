@@ -160,11 +160,12 @@ sortagrad_switch_to_shuffled_dataset_epoch: 10
 # make ASR learn to read phonemes from left to right, not randomly
 use_diagonal_attention_prior: True
 diagonal_attention_prior_weight:
-  initial: 0.0025
-  target: 0.004
+  initial: 0.0015
+  target: 0.0025
   inactive_epochs: 6  # keep Arabic alignments free-running a little longer before reintroducing the prior
   warmup_epochs: 4   # ramp the helper back in gently over the first few active epochs
-diagonal_attention_prior_sigma: 0.45
+  reactivation_scale: 0.45  # halve the helper strength when it returns so alignments can fan out
+diagonal_attention_prior_sigma: 0.6
 
 # stabilizes ASR training for smaller datasets
 entropy_params:
@@ -175,28 +176,28 @@ ctc_loss:
   logit_temperature: 1.0
   blank_scale:
     enabled: true
-    base: 0.54
+    base: 0.5
     schedule:
       - pct: 0.3
-        value: 0.44
+        value: 0.42
       - pct: 0.7
-        value: 0.68
+        value: 0.62
   regularization:
     blank_rate:
       enabled: true
       weight:
-        initial: 0.8
-        target: 0.9
+        initial: 0.55
+        target: 0.65
         warmup_steps: 10000
-      target: 0.6
-      tolerance: 0.03
+      target: 0.54
+      tolerance: 0.04
       warmup_epochs: 5
       penalize_low_blank: true
       blank_run_weight: 0.2
       blank_run_threshold: 0.5
     coverage:
       enabled: true
-      weight: 0.12
+      weight: 0.18
       tv_weight: 0.3
       margin: 3.0
       locked_weight: 0.25
@@ -207,10 +208,10 @@ ctc_loss:
 alignment_regularization:
   attention_duration:
     enabled: true
-    weight: 0.025
-    min_frames: 1.78
-    tolerance: 0.22
-    min_coverage_frames: 1.78
+    weight: 0.04
+    min_frames: 1.8
+    tolerance: 0.2
+    min_coverage_frames: 1.8
     warmup_epochs: 8
     anneal_target_p50: 2.0
     anneal_patience: 2
