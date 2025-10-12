@@ -160,10 +160,10 @@ sortagrad_switch_to_shuffled_dataset_epoch: 10
 # make ASR learn to read phonemes from left to right, not randomly
 use_diagonal_attention_prior: True
 diagonal_attention_prior_weight:
-  initial: 0.028
-  target: 0.011
-  hold_steps: 4000  # keep the helper active for ~3-5k optimiser steps
-  warmup_steps: 0
+  initial: 0.006
+  target: 0.006
+  inactive_epochs: 4  # disable the helper entirely for the first few epochs on Arabic
+  warmup_epochs: 0
 diagonal_attention_prior_sigma: 0.32
 
 # stabilizes ASR training for smaller datasets
@@ -175,12 +175,12 @@ ctc_loss:
   logit_temperature: 1.0
   blank_scale:
     enabled: true
-    base: 0.68
+    base: 0.63
     schedule:
       - pct: 0.3
-        value: 0.58
+        value: 0.53
       - pct: 0.7
-        value: 0.83
+        value: 0.78
   regularization:
     blank_rate:
       enabled: true
@@ -207,11 +207,15 @@ ctc_loss:
 alignment_regularization:
   attention_duration:
     enabled: true
-    weight: 0.08
-    min_frames: 1.8
+    weight: 0.035
+    min_frames: 1.75
     tolerance: 0.2
-    min_coverage_frames: 1.8
+    min_coverage_frames: 1.75
     warmup_epochs: 8
+    anneal_target_p50: 2.0
+    anneal_patience: 2
+    anneal_decay: 0.5
+    anneal_min_weight: 0.0
 
 dataset_params:
   # SpecAugment parameters applied only on the training split.

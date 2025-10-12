@@ -149,6 +149,8 @@ class Trainer(object):
             attn_duration_cfg = {}
         self.attention_duration_regularization_enabled = bool(attn_duration_cfg.get('enabled', False))
         self.attention_duration_regularization_config = attn_duration_cfg
+        self._attn_duration_anneal_streak = 0
+        self._attn_duration_annealed = False
 
         self.mixspeech_config = mixspeech_config or {}
         self.mixspeech_enabled = bool(self.mixspeech_config.get('enabled', False))
@@ -287,6 +289,9 @@ class Trainer(object):
             hold_epochs = int(weight_config.get('hold_epochs', 0))
             warmup_steps = int(weight_config.get('warmup_steps', weight_config.get('ramp_steps', 0)))
             hold_steps = int(weight_config.get('hold_steps', weight_config.get('initial_steps', 0)))
+            inactive_epochs = int(weight_config.get('inactive_epochs', weight_config.get('zero_epochs', 0)))
+            inactive_steps = int(weight_config.get('inactive_steps', weight_config.get('zero_steps', 0)))
+            reactivation_scale = float(weight_config.get('reactivation_scale', 1.0))
 
             schedule = {
                 'initial': initial,
@@ -295,6 +300,9 @@ class Trainer(object):
                 'hold_epochs': max(0, hold_epochs),
                 'warmup_steps': max(0, warmup_steps),
                 'hold_steps': max(0, hold_steps),
+                'inactive_epochs': max(0, inactive_epochs),
+                'inactive_steps': max(0, inactive_steps),
+                'reactivation_scale': float(max(0.0, reactivation_scale)),
             }
 
             # Default to a step-based schedule if any step-related parameter is set.
@@ -326,6 +334,12 @@ class Trainer(object):
             else:
                 step_index = max(1, self._optimizer_step_count)
 
+            inactive_steps = int(schedule.get('inactive_steps', 0))
+            if inactive_steps > 0:
+                if step_index <= inactive_steps:
+                    return 0.0
+                step_index = step_index - inactive_steps
+
             hold_steps = int(schedule.get('hold_steps', 0))
             warmup_steps = int(schedule.get('warmup_steps', 0))
 
@@ -339,9 +353,19 @@ class Trainer(object):
                     progress = min(1.0, progress_steps / float(max(1, warmup_steps)))
                     weight = initial + (target - initial) * progress
 
+            scale = float(schedule.get('reactivation_scale', 1.0))
+            if scale != 1.0:
+                weight = weight * scale
+
             return float(weight)
 
         epoch_index = self.epochs + 1 if training else max(1, self.epochs)
+        inactive_epochs = int(schedule.get('inactive_epochs', 0))
+        if inactive_epochs > 0:
+            if epoch_index <= inactive_epochs:
+                return 0.0
+            epoch_index = epoch_index - inactive_epochs
+
         warmup_epochs = int(schedule.get('warmup_epochs', 0))
         hold_epochs = int(schedule.get('hold_epochs', 0))
 
@@ -353,6 +377,10 @@ class Trainer(object):
 
         if epoch_index > warmup_epochs + hold_epochs:
             weight = target
+
+        scale = float(schedule.get('reactivation_scale', 1.0))
+        if scale != 1.0:
+            weight = weight * scale
 
         return float(weight)
 
@@ -642,6 +670,64 @@ class Trainer(object):
         if warmup <= 0:
             return True
         return self.epochs >= max(warmup, 0)
+
+    def _maybe_update_attention_duration_weight(self, train_metrics):
+        if not self.attention_duration_regularization_enabled:
+            return
+
+        if not isinstance(train_metrics, dict):
+            return
+
+        cfg = self.attention_duration_regularization_config or {}
+        if not cfg:
+            return
+
+        target = cfg.get('anneal_target_p50')
+        if target is None:
+            return
+
+        metric_key = cfg.get('anneal_metric', 'train/diagnostics/attn_duration_p50')
+        if metric_key not in train_metrics:
+            return
+
+        current_weight = float(cfg.get('weight', 0.0))
+        min_weight = float(cfg.get('anneal_min_weight', 0.0))
+        decay = float(cfg.get('anneal_decay', 0.5))
+        decay = float(np.clip(decay, 0.0, 1.0))
+        if decay <= 0.0 or current_weight <= min_weight:
+            self._attn_duration_annealed = current_weight <= min_weight
+            return
+
+        patience = int(cfg.get('anneal_patience', 1))
+        patience = max(1, patience)
+
+        value = float(train_metrics[metric_key])
+        if value >= float(target):
+            self._attn_duration_anneal_streak += 1
+        else:
+            self._attn_duration_anneal_streak = 0
+
+        if self._attn_duration_anneal_streak < patience:
+            return
+
+        new_weight = max(min_weight, current_weight * decay)
+        if abs(new_weight - current_weight) < 1.0e-6:
+            self._attn_duration_anneal_streak = 0
+            self._attn_duration_annealed = new_weight <= min_weight
+            return
+
+        cfg['weight'] = new_weight
+        self.attention_duration_regularization_config = cfg
+        self._attn_duration_anneal_streak = 0
+        self._attn_duration_annealed = new_weight <= min_weight
+        try:
+            self.logger.info(
+                "annealed attention-duration regulariser to weight %.6f after reaching p50=%.3f",
+                new_weight,
+                value,
+            )
+        except Exception:
+            pass
 
     def _compute_ctc_alignment_regularization(self, logits, input_lengths, target_lengths):
         if logits is None:
@@ -1941,6 +2027,7 @@ class Trainer(object):
                 train_losses["train/%s" % key].append(value)
 
         train_losses = {key: np.mean(value) for key, value in train_losses.items()}
+        self._maybe_update_attention_duration_weight(train_losses)
         train_losses.setdefault('train/ctc_blank_scale', self._get_active_ctc_blank_scale())
         train_losses['train/learning_rate'] = self._get_lr()
         self.epochs += 1
