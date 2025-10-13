@@ -138,6 +138,18 @@ class Trainer(object):
         self.ctc_coverage_regularization_enabled = bool(coverage_reg_cfg.get('enabled', False))
         self.ctc_coverage_regularization_config = coverage_reg_cfg
 
+        expected_duration_cfg = ctc_reg_cfg.get('expected_duration', {}) or {}
+        if not isinstance(expected_duration_cfg, dict):
+            expected_duration_cfg = {}
+        else:
+            expected_duration_cfg = dict(expected_duration_cfg)
+        self.ctc_expected_duration_regularization_enabled = bool(
+            expected_duration_cfg.get('enabled', False)
+        )
+        self.ctc_expected_duration_config = expected_duration_cfg
+        self._ctc_expected_duration_anneal_streak = 0
+        self._ctc_expected_duration_annealed = False
+
         alignment_reg_cfg = {}
         if isinstance(self.config, dict):
             alignment_reg_cfg = self.config.get('alignment_regularization', {}) or {}
@@ -732,7 +744,65 @@ class Trainer(object):
         except Exception:
             pass
 
-    def _compute_ctc_alignment_regularization(self, logits, input_lengths, target_lengths):
+    def _maybe_update_ctc_expected_duration_weight(self, train_metrics):
+        if not self.ctc_expected_duration_regularization_enabled:
+            return
+
+        if not isinstance(train_metrics, dict):
+            return
+
+        cfg = self.ctc_expected_duration_config or {}
+        if not cfg:
+            return
+
+        target = cfg.get('anneal_target_p50')
+        if target is None:
+            return
+
+        metric_key = cfg.get('anneal_metric', 'train/diagnostics/ctc_expected_duration_p50')
+        if metric_key not in train_metrics:
+            return
+
+        current_weight = float(cfg.get('weight', 0.0))
+        min_weight = float(cfg.get('anneal_min_weight', 0.0))
+        decay = float(np.clip(cfg.get('anneal_decay', 0.5), 0.0, 1.0))
+        if decay <= 0.0 or current_weight <= min_weight:
+            self._ctc_expected_duration_annealed = current_weight <= min_weight
+            return
+
+        patience = int(cfg.get('anneal_patience', 1))
+        patience = max(1, patience)
+
+        value = float(train_metrics[metric_key])
+        if value >= float(target):
+            self._ctc_expected_duration_anneal_streak += 1
+        else:
+            self._ctc_expected_duration_anneal_streak = 0
+
+        if self._ctc_expected_duration_anneal_streak < patience:
+            return
+
+        new_weight = max(min_weight, current_weight * decay)
+        if abs(new_weight - current_weight) < 1.0e-6:
+            self._ctc_expected_duration_anneal_streak = 0
+            self._ctc_expected_duration_annealed = new_weight <= min_weight
+            return
+
+        cfg = dict(cfg)
+        cfg['weight'] = new_weight
+        self.ctc_expected_duration_config = cfg
+        self._ctc_expected_duration_anneal_streak = 0
+        self._ctc_expected_duration_annealed = new_weight <= min_weight
+        try:
+            self.logger.info(
+                "annealed expected-duration regulariser to weight %.6f after reaching p50=%.3f",
+                new_weight,
+                value,
+            )
+        except Exception:
+            pass
+
+    def _compute_ctc_alignment_regularization(self, logits, input_lengths, target_lengths, targets=None):
         if logits is None:
             return {}, {}
 
@@ -764,6 +834,17 @@ class Trainer(object):
                 if coverage_result is not None:
                     loss_value, stats = coverage_result
                     reg_losses['ctc/coverage_reg'] = loss_value
+                    reg_stats.update(stats)
+
+        if self.ctc_expected_duration_regularization_enabled and targets is not None:
+            expected_cfg = self.ctc_expected_duration_config or {}
+            if self._ctc_regularization_warmup_passed(expected_cfg):
+                expected_result = self._compute_ctc_expected_duration_regularization(
+                    probs, input_lengths, targets, target_lengths, expected_cfg
+                )
+                if expected_result is not None:
+                    loss_value, stats = expected_result
+                    reg_losses['ctc/expected_duration_reg'] = loss_value
                     reg_stats.update(stats)
 
         return reg_losses, reg_stats
@@ -1012,6 +1093,111 @@ class Trainer(object):
         if tv_weight > 0.0 and tv_loss is not None:
             stats['diagnostics/ctc_temporal_tv'] = float(tv_loss.detach().item())
             stats['diagnostics/ctc_temporal_tv_weight'] = float(tv_weight)
+        return loss_value, stats
+
+    def _compute_ctc_expected_duration_regularization(self, probs, input_lengths, tokens, token_lengths, cfg):
+        weight = float(cfg.get('weight', 0.0))
+        if weight == 0.0:
+            return None
+
+        if probs is None or probs.dim() != 3:
+            return None
+
+        if tokens is None or token_lengths is None:
+            return None
+
+        if tokens.size(0) != probs.size(0):
+            return None
+
+        device = probs.device
+        tokens = tokens.to(device=device, dtype=torch.long)
+        token_lengths = token_lengths.to(device=device, dtype=torch.long)
+
+        max_tokens = int(tokens.size(1))
+        if max_tokens <= 0:
+            return None
+
+        vocab_size = int(probs.size(-1))
+        if vocab_size <= 0:
+            return None
+
+        if input_lengths is not None:
+            if not torch.is_tensor(input_lengths):
+                input_lengths = torch.as_tensor(input_lengths, device=device)
+            input_lengths = input_lengths.to(device=device, dtype=torch.long)
+            time_positions = torch.arange(probs.size(1), device=device).unsqueeze(0)
+            time_mask = (time_positions < input_lengths.unsqueeze(1)).to(probs.dtype)
+            probs = probs * time_mask.unsqueeze(-1)
+
+        token_positions = torch.arange(max_tokens, device=device).unsqueeze(0)
+        token_mask = token_positions < token_lengths.unsqueeze(1)
+        valid_ids = (tokens >= 0) & (tokens < vocab_size)
+        positive_ids = tokens > 0
+        token_mask = token_mask & valid_ids & positive_ids
+
+        if not torch.any(token_mask):
+            return None
+
+        tokens_clipped = tokens.clamp(min=0, max=vocab_size - 1)
+        one_hot = F.one_hot(tokens_clipped, num_classes=vocab_size).to(probs.dtype)
+        one_hot = one_hot * token_mask.unsqueeze(-1).to(probs.dtype)
+
+        token_mass = torch.einsum('btv,blv->bl', probs, one_hot)
+        counts_by_token = one_hot.sum(dim=1)
+        counts_per_position = (one_hot * counts_by_token.unsqueeze(1)).sum(dim=-1).clamp_min(1.0)
+
+        expected = token_mass / counts_per_position
+        expected = expected * token_mask.to(expected.dtype)
+
+        floor_value = float(cfg.get('floor', cfg.get('min_frames', 1.8)))
+        floor_value = max(0.0, floor_value)
+        tolerance = float(cfg.get('tolerance', 0.0))
+        tolerance = max(0.0, tolerance)
+        lower_bound = max(0.0, floor_value - tolerance)
+
+        softness = float(cfg.get('softness', cfg.get('smoothing', 0.0)))
+        softness = max(0.0, softness)
+
+        shortfall = lower_bound - expected
+        shortfall = shortfall * token_mask.to(shortfall.dtype)
+        if softness > 0.0:
+            scaled = shortfall / softness
+            penalty = F.softplus(scaled) * softness
+            baseline = math.log(2.0) * softness
+            penalty = torch.clamp(penalty - baseline, min=0.0)
+        else:
+            penalty = torch.clamp(shortfall, min=0.0)
+
+        valid_count = token_mask.float().sum().clamp_min(1.0)
+        penalty_sum = penalty.sum()
+        average_penalty = penalty_sum / valid_count
+
+        loss_value = average_penalty * weight
+
+        stats = {
+            'diagnostics/ctc_expected_duration_weight': float(weight),
+            'diagnostics/ctc_expected_duration_floor': float(lower_bound),
+        }
+
+        valid_durations = expected[token_mask]
+        if valid_durations.numel() > 0:
+            detached = valid_durations.detach()
+            stats['diagnostics/ctc_expected_duration_mean'] = float(detached.mean().item())
+            stats['diagnostics/ctc_expected_duration_min'] = float(detached.min().item())
+            stats['diagnostics/ctc_expected_duration_max'] = float(detached.max().item())
+            for quantile, name in ((0.1, 'p10'), (0.5, 'p50'), (0.9, 'p90')):
+                stats[f'diagnostics/ctc_expected_duration_{name}'] = float(
+                    torch.quantile(detached, quantile).item()
+                )
+
+        short_mask = (penalty > 0) & token_mask
+        short_ratio = short_mask.float().sum() / valid_count
+        stats['diagnostics/ctc_expected_duration_short_ratio'] = float(short_ratio.detach().item())
+        stats['diagnostics/ctc_expected_duration_penalty'] = float(average_penalty.detach().item())
+
+        if softness > 0.0:
+            stats['diagnostics/ctc_expected_duration_softness'] = float(softness)
+
         return loss_value, stats
 
     def _compute_attention_duration_regularization(self, attn, text_lengths, mel_lengths):
@@ -1779,7 +1965,7 @@ class Trainer(object):
                 loss_ctc = torch.zeros(1, device=self.device)
 
             reg_losses, reg_stats = self._compute_ctc_alignment_regularization(
-                ppgs, mel_input_length, text_input_length
+                ppgs, mel_input_length, text_input_length, text_input
             )
             for key, value in reg_losses.items():
                 total_loss = total_loss + value
@@ -2049,6 +2235,13 @@ class Trainer(object):
 
         train_losses = {key: np.mean(value) for key, value in train_losses.items()}
         self._maybe_update_attention_duration_weight(train_losses)
+        self._maybe_update_ctc_expected_duration_weight(train_losses)
+        train_losses.setdefault(
+            'train/ctc_expected_duration_weight',
+            float(self.ctc_expected_duration_config.get('weight', 0.0))
+            if isinstance(self.ctc_expected_duration_config, dict)
+            else 0.0,
+        )
         train_losses.setdefault('train/ctc_blank_scale', self._get_active_ctc_blank_scale())
         train_losses['train/learning_rate'] = self._get_lr()
         self.epochs += 1

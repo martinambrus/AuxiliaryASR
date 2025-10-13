@@ -103,7 +103,7 @@ Each augmentation block can be toggled on or off independently through `Configs/
 
 #### Keeping the CTC branch expressive
 
-When the auxiliary ASR is trained on only a few hours of speech, the CTC head can collapse into predicting mostly blanks, which hurts diagonal alignments and increases the skip/merge gap. The default configuration now enables gentle blank-rate and coverage regularisers so deletions are discouraged without overwhelming the core losses; the blank prior is tuned toward a 0.50–0.55 operating band while keeping long-blank penalties intact:
+When the auxiliary ASR is trained on only a few hours of speech, the CTC head can collapse into predicting mostly blanks, which hurts diagonal alignments and increases the skip/merge gap. The default configuration now enables gentle blank-rate, coverage, and expected-duration regularisers so deletions are discouraged without overwhelming the core losses; the blank prior is tuned toward a 0.50–0.55 operating band while keeping long-blank penalties intact:
 
 ```yaml
 ctc_loss:
@@ -111,40 +111,49 @@ ctc_loss:
   logit_temperature: 1.0     # flattens the CTC posterior to discourage over-confidence
   blank_scale:
     enabled: true            # multiply the blank posterior by a scheduled down-weighting factor
-    base: 0.50               # start lower so non-blanks reclaim mass earlier in training
+    base: 0.46               # start lower so non-blanks reclaim mass earlier in training
     schedule:
-      - pct: 0.3             # first, descend to 0.42 by 30% of training
-        value: 0.42
-      - pct: 0.7             # then ease back toward ~0.62 by 70% and hold it steady
-        value: 0.62
+      - pct: 0.35            # first, descend to 0.38 by ~35% of training
+        value: 0.38
+      - pct: 0.75            # then ease back toward ~0.54 as alignments stabilise
+        value: 0.54
   regularization:
     blank_rate:
       enabled: true          # applies a mild hinge penalty when the blank posterior dominates
       weight:
-        initial: 0.55        # keep the hinge light enough that non-blanks can reclaim mass
-        target: 0.65         # settle in the mid-0.6 range once alignments stabilise
-        warmup_steps: 10000  # linearly ramp across the first ~10k optimiser steps
-      target: 0.54
-      tolerance: 0.04        # slack before the penalty ramps up
+        initial: 0.60        # keep the hinge light enough that non-blanks can reclaim mass
+        target: 0.75         # settle toward the upper end once alignments stabilise
+        warmup_steps: 12000  # linearly ramp across the first ~12k optimiser steps
+      target: 0.52
+      tolerance: 0.03        # slack before the penalty ramps up
       penalize_low_blank: true  # nudge the model back toward short blank pauses when it over-emits tokens
-      coverage:
-        enabled: true          # encourages enough non-blank mass to cover the transcript length
-        weight: 0.34
-        tv_weight: 0.2         # temporal smoothing without fighting the longer-hold objective
-        margin: 0.25           # small slack before penalising under-coverage
-        target_scale: 1.95     # ask for just under two frames of non-blank per token
-        min_coverage_frames: 1.9
-        locked_weight: 0.03    # keep overshoot legal while damping extreme spikes
-        locked_margin: 0.0     # optional extra slack before the overshoot term activates
-        locked_softness: 1.0   # smooth the overshoot branch for softer gradients
+    coverage:
+      enabled: true          # encourages enough non-blank mass to cover the transcript length
+      weight: 0.42
+      tv_weight: 0.15        # temporal smoothing without fighting the longer-hold objective
+      margin: 0.15           # small slack before penalising under-coverage
+      target_scale: 2.1      # ask for just over two frames of non-blank per token
+      min_coverage_frames: 2.05
+      locked_weight: 0.05    # keep overshoot legal while damping extreme spikes
+      locked_margin: 0.05    # optional extra slack before the overshoot term activates
+      locked_softness: 1.0   # smooth the overshoot branch for softer gradients
+    expected_duration:
+      enabled: true          # per-token hinge on the expected forward-backward durations
+      weight: 0.05           # tiny but competitive with the diagonal helper
+      floor: 1.85            # hinge around 1.85 frames (with tolerance below)
+      tolerance: 0.15        # gap allowed before the penalty activates
+      softness: 0.1          # smooth the hinge for stable gradients
+      anneal_target_p50: 2.0 # once the median hits ~2 frames, anneal the weight back toward zero
+      anneal_patience: 2
+      anneal_decay: 0.5
 
 alignment_regularization:
   attention_duration:
     enabled: true            # prevents the attention map from collapsing to 1–2 frame spikes
-    weight: 0.055            # still tiny but large enough to compete with the diagonal helper
-    min_frames: 1.9
-    tolerance: 0.15
-    min_coverage_frames: 1.9
+    weight: 0.05             # still tiny but large enough to compete with the diagonal helper
+    min_frames: 1.95
+    tolerance: 0.10
+    min_coverage_frames: 1.95
     anneal_target_p50: 2.05  # automatically ramp the weight toward zero once the median clears 2 frames
     anneal_patience: 2       # require two consecutive epochs before each decay
     anneal_decay: 0.5        # halve the weight after each satisfied streak
@@ -156,9 +165,9 @@ regularization:
         weight: 0.02         # maximise entropy to keep non-blank symbols active
 ```
 
-All of the auxiliary losses honour a `warmup_epochs` key (`5` for the CTC penalties and `8` for the duration term in the default config) so you can delay their activation until the alignment has roughly converged. The duration guard stays one-sided and trims only when the expected coverage drops below ~1.75–1.9 frames, nudging the median toward two frames with a 0.055 weight before annealing back once the model consistently holds tokens for longer than two frames.
+All of the auxiliary losses honour a `warmup_epochs` key (`4` for the CTC penalties and `6` for the duration term in the default config) so you can delay their activation until the alignment has roughly converged. The CTC-side expected-duration guard stays one-sided and trims only when the forward–backward coverage drops below ~1.7–1.85 frames, nudging the median toward two frames with a 0.05 weight before annealing back once the model consistently holds tokens longer.
 
-The coverage helper now applies a locally normalised hinge with a scaled frame target (`target_scale: 1.95`) plus a hard floor (`min_coverage_frames: 1.9`) alongside a lighter total-variation prior over the non-blank posterior mass. The scaled target asks the model to accumulate just under two frames of non-blank probability per token while the reduced overshoot penalty (`locked_weight: 0.03`) keeps longer holds legal, so durations can recover sooner without exploding blank runs.
+The coverage helper now applies a locally normalised hinge with a scaled frame target (`target_scale: 2.1`) plus a hard floor (`min_coverage_frames: 2.05`) alongside a lighter total-variation prior over the non-blank posterior mass. The scaled target asks the model to accumulate just over two frames of non-blank probability per token while the slightly stronger overshoot penalty (`locked_weight: 0.05`) keeps longer holds legal without allowing extreme spikes, so durations can recover sooner without exploding blank runs. The per-token expected-duration guard then provides a second line of defence if the average improves but individual phonemes remain clipped.
 
 Decoding-time safeguards provide gentler blank suppression without distorting training. The beam-search configuration supports a temperature, blank penalty, insertion bonus, and lightweight length normalisation:
 
@@ -172,7 +181,7 @@ decoding:
     insertion_bonus: 0.05   # encourages emitting non-blank symbols when hypotheses compete
 ```
 
-Additionally, the diagonal attention prior now masks out padded timesteps, applies a light dropout (configurable through `model_params.attention_dropout`), and uses a guided-attention helper that stands down entirely for the first twelve epochs before easing back in over the next eight at roughly λ≈0→0.0012. When it returns the helper is scaled to ~0.0003 via `reactivation_scale: 0.25` and the Gaussian prior widens to σ≈1.25, letting Arabic alignments drift toward a diag score around 0.7 while still supplying a gentle prior later in training; if you notice diagonal coherence dropping (e.g., due to a masking bug), simply disable the prior by setting `use_diagonal_attention_prior` to `False`.
+Additionally, the diagonal attention prior now masks out padded timesteps, applies a light dropout (configurable through `model_params.attention_dropout`), and uses a guided-attention helper that stands down entirely for the first three epochs before easing back in over the next five at roughly λ≈0.0004→0.0022. When it returns the helper is scaled to ~0.0012 via `reactivation_scale: 0.55` and the Gaussian prior sits at σ≈1.0, letting Arabic alignments drift toward a diag score around 0.7 while still supplying a gentle prior later in training; if you notice diagonal coherence dropping (e.g., due to a masking bug), simply disable the prior by setting `use_diagonal_attention_prior` to `False`.
 
 To avoid choosing checkpoints that only excel at PER while misaligning attention or dropping symbols, training now logs a joint selection score that blends PER, diagonal coherence, and the normalised CTC length gap. The configuration exposes the coefficients under `checkpoint_selection` and the trainer will keep a `best_joint.pth` symlink pointing at the most alignment-friendly checkpoint observed so far.
 
