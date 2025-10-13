@@ -915,7 +915,14 @@ class Trainer(object):
         margin = float(cfg.get('margin', cfg.get('delta', 4.0)))
         margin = max(margin, 0.0)
 
-        shortfall = torch.clamp((target_lengths - expected_non_blank) - margin, min=0.0)
+        target_scale = float(cfg.get('target_scale', 1.0))
+        target_scale = max(target_scale, 0.0)
+        target_bias = float(cfg.get('target_bias', 0.0))
+
+        effective_target = target_lengths * target_scale + target_bias
+        effective_target = effective_target.to(device=target_lengths.device, dtype=target_lengths.dtype)
+
+        shortfall = torch.clamp((effective_target - expected_non_blank) - margin, min=0.0)
 
         locked_weight = float(cfg.get('locked_weight', cfg.get('asym_weight', 0.25)))
         locked_weight = max(0.0, locked_weight)
@@ -925,7 +932,7 @@ class Trainer(object):
         locked_softness = max(0.0, locked_softness)
 
         overshoot = torch.clamp(
-            expected_non_blank - (target_lengths + locked_margin),
+            expected_non_blank - (effective_target + locked_margin),
             min=0.0,
         )
         if locked_softness > 0.0:
@@ -934,14 +941,15 @@ class Trainer(object):
             baseline = math.log(2.0) * locked_softness
             overshoot = (softened - baseline).clamp_min(0.0)
 
-        denom_lengths = target_lengths.clamp_min(1.0)
+        target_floor = effective_target.clamp_min(1.0)
+
+        denom_lengths = target_floor
 
         penalty = shortfall / denom_lengths
         if locked_weight > 0.0:
             penalty = penalty + locked_weight * (overshoot / denom_lengths)
 
-        denom = target_lengths.clamp_min(1.0)
-        coverage_ratio = expected_non_blank / denom
+        coverage_ratio = expected_non_blank / denom_lengths
 
         coverage_term = penalty.mean()
 
@@ -980,7 +988,11 @@ class Trainer(object):
         stats = {
             'diagnostics/ctc_expected_non_blank': float(expected_non_blank.mean().detach().item()),
             'diagnostics/ctc_coverage_ratio': float(coverage_ratio.mean().detach().item()),
+            'diagnostics/ctc_coverage_target': float(target_floor.mean().detach().item()),
         }
+        if target_scale != 1.0 or target_bias != 0.0:
+            raw_ratio = expected_non_blank / target_lengths.clamp_min(1.0)
+            stats['diagnostics/ctc_coverage_token_ratio'] = float(raw_ratio.mean().detach().item())
         with torch.no_grad():
             short_mask = shortfall > 0
             overshoot_mask = overshoot > 0
