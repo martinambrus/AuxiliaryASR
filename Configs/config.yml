@@ -161,11 +161,11 @@ sortagrad_switch_to_shuffled_dataset_epoch: 10
 use_diagonal_attention_prior: True
 diagonal_attention_prior_weight:
   initial: 0.0
-  target: 0.0015
-  inactive_epochs: 8  # keep Arabic alignments free-running longer before reintroducing the helper
-  warmup_epochs: 6    # ramp the helper back in gently over the first active epochs
-  reactivation_scale: 0.35  # bring the helper back at roughly one-third strength so alignments can fan out
-diagonal_attention_prior_sigma: 0.85
+  target: 0.0012
+  inactive_epochs: 12  # let Arabic alignments roam freely for longer before any diagonal pressure returns
+  warmup_epochs: 8     # stretch the ramp so the helper eases back in gradually
+  reactivation_scale: 0.25  # re-enable at roughly quarter strength to keep diag ≈0.7 rather than snapping to the diagonal
+diagonal_attention_prior_sigma: 1.25
 
 # stabilizes ASR training for smaller datasets
 entropy_params:
@@ -197,11 +197,12 @@ ctc_loss:
       blank_run_threshold: 0.5
     coverage:
       enabled: true
-      weight: 0.26
-      tv_weight: 0.25
-      margin: 0.5
-      target_scale: 1.65
-      locked_weight: 0.05
+      weight: 0.34
+      tv_weight: 0.2
+      margin: 0.25
+      target_scale: 1.95
+      min_coverage_frames: 1.9
+      locked_weight: 0.03
       locked_margin: 0.0
       locked_softness: 1.0
       warmup_epochs: 5
@@ -209,12 +210,12 @@ ctc_loss:
 alignment_regularization:
   attention_duration:
     enabled: true
-    weight: 0.045
-    min_frames: 1.8
-    tolerance: 0.2
-    min_coverage_frames: 1.8
+    weight: 0.055
+    min_frames: 1.9
+    tolerance: 0.15
+    min_coverage_frames: 1.9
     warmup_epochs: 8
-    anneal_target_p50: 2.0
+    anneal_target_p50: 2.05
     anneal_patience: 2
     anneal_decay: 0.5
     anneal_min_weight: 0.0

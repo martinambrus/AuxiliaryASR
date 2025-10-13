@@ -922,6 +922,12 @@ class Trainer(object):
         effective_target = target_lengths * target_scale + target_bias
         effective_target = effective_target.to(device=target_lengths.device, dtype=target_lengths.dtype)
 
+        floor_frames = float(cfg.get('min_coverage_frames', 0.0))
+        if floor_frames > 0.0:
+            min_total = target_lengths * floor_frames
+            min_total = min_total.to(device=effective_target.device, dtype=effective_target.dtype)
+            effective_target = torch.maximum(effective_target, min_total)
+
         shortfall = torch.clamp((effective_target - expected_non_blank) - margin, min=0.0)
 
         locked_weight = float(cfg.get('locked_weight', cfg.get('asym_weight', 0.25)))
