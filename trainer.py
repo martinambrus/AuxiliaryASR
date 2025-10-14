@@ -294,6 +294,10 @@ class Trainer(object):
 
     def _configure_diagonal_attention_weight(self, weight_config):
         schedule = None
+        self._diagonal_weight_scale = 1.0
+        self._diag_band_low_streak = 0
+        self._diag_band_high_streak = 0
+        self.diagonal_weight_adaptive_config = None
         if isinstance(weight_config, dict):
             initial = float(weight_config.get('initial', weight_config.get('base', weight_config.get('start', 0.0))))
             target = float(weight_config.get('target', weight_config.get('final', initial)))
@@ -324,6 +328,42 @@ class Trainer(object):
                 schedule['mode'] = 'epoch'
 
             base_weight = initial
+
+            adaptive_cfg = weight_config.get(
+                'adaptive', weight_config.get('auto', weight_config.get('band', None))
+            )
+            if isinstance(adaptive_cfg, dict):
+                if adaptive_cfg.get('enabled', True):
+                    lower = float(adaptive_cfg.get('lower', adaptive_cfg.get('min', 0.65)))
+                    upper = float(adaptive_cfg.get('upper', adaptive_cfg.get('max', 0.75)))
+                    boost = float(adaptive_cfg.get('boost', adaptive_cfg.get('scale_up', 1.25)))
+                    decay = float(adaptive_cfg.get('decay', adaptive_cfg.get('scale_down', 0.85)))
+                    min_scale = float(adaptive_cfg.get('min_scale', adaptive_cfg.get('floor', 0.3)))
+                    max_scale = float(adaptive_cfg.get('max_scale', adaptive_cfg.get('ceil', 3.0)))
+                    patience = int(adaptive_cfg.get('patience', 2))
+                    recovery = float(adaptive_cfg.get('recovery', adaptive_cfg.get('relax', 0.1)))
+                    metric_key = adaptive_cfg.get('metric', 'train/diagnostics/diag_coherence')
+
+                    self.diagonal_weight_adaptive_config = {
+                        'lower': lower,
+                        'upper': upper,
+                        'boost': max(1.0, boost),
+                        'decay': float(np.clip(decay, 0.0, 1.0)),
+                        'min_scale': max(0.0, min_scale),
+                        'max_scale': max(0.0, max_scale),
+                        'patience': max(1, patience),
+                        'recovery': float(np.clip(recovery, 0.0, 1.0)),
+                        'metric': metric_key,
+                    }
+
+                    initial_scale = float(adaptive_cfg.get('initial_scale', 1.0))
+                    max_scale_value = self.diagonal_weight_adaptive_config['max_scale']
+                    min_scale_value = self.diagonal_weight_adaptive_config['min_scale']
+                    if max_scale_value > 0.0:
+                        initial_scale = float(np.clip(initial_scale, min_scale_value, max_scale_value))
+                    else:
+                        initial_scale = max(initial_scale, min_scale_value)
+                    self._diagonal_weight_scale = initial_scale
         else:
             base_weight = float(weight_config) if weight_config is not None else 0.0
 
@@ -334,67 +374,82 @@ class Trainer(object):
     def _current_diagonal_attention_weight(self, training: bool) -> float:
         schedule = self.diagonal_attention_weight_schedule
         if not schedule:
-            return float(self.diagonal_attention_prior_weight)
-
-        initial = float(schedule['initial'])
-        target = float(schedule['target'])
-        mode = schedule.get('mode', 'epoch')
-
-        if mode == 'step':
-            if training:
-                step_index = self._optimizer_step_count + 1
-            else:
-                step_index = max(1, self._optimizer_step_count)
-
-            inactive_steps = int(schedule.get('inactive_steps', 0))
-            if inactive_steps > 0:
-                if step_index <= inactive_steps:
-                    return 0.0
-                step_index = step_index - inactive_steps
-
-            hold_steps = int(schedule.get('hold_steps', 0))
-            warmup_steps = int(schedule.get('warmup_steps', 0))
-
-            if hold_steps > 0 and step_index <= hold_steps:
-                weight = initial
-            else:
-                if warmup_steps <= 0:
-                    weight = target
-                else:
-                    progress_steps = max(0, step_index - hold_steps)
-                    progress = min(1.0, progress_steps / float(max(1, warmup_steps)))
-                    weight = initial + (target - initial) * progress
-
-            scale = float(schedule.get('reactivation_scale', 1.0))
-            if scale != 1.0:
-                weight = weight * scale
-
-            return float(weight)
-
-        epoch_index = self.epochs + 1 if training else max(1, self.epochs)
-        inactive_epochs = int(schedule.get('inactive_epochs', 0))
-        if inactive_epochs > 0:
-            if epoch_index <= inactive_epochs:
-                return 0.0
-            epoch_index = epoch_index - inactive_epochs
-
-        warmup_epochs = int(schedule.get('warmup_epochs', 0))
-        hold_epochs = int(schedule.get('hold_epochs', 0))
-
-        if warmup_epochs <= 0:
-            weight = target
+            base_weight = float(self.diagonal_attention_prior_weight)
         else:
-            progress = min(1.0, max(0.0, (epoch_index - 1) / float(max(1, warmup_epochs))))
-            weight = initial + (target - initial) * progress
+            initial = float(schedule['initial'])
+            target = float(schedule['target'])
+            mode = schedule.get('mode', 'epoch')
 
-        if epoch_index > warmup_epochs + hold_epochs:
-            weight = target
+            if mode == 'step':
+                if training:
+                    step_index = self._optimizer_step_count + 1
+                else:
+                    step_index = max(1, self._optimizer_step_count)
 
-        scale = float(schedule.get('reactivation_scale', 1.0))
-        if scale != 1.0:
-            weight = weight * scale
+                inactive_steps = int(schedule.get('inactive_steps', 0))
+                if inactive_steps > 0:
+                    if step_index <= inactive_steps:
+                        base_weight = 0.0
+                        step_index = 0
+                    else:
+                        step_index = step_index - inactive_steps
 
-        return float(weight)
+                if inactive_steps > 0 and step_index <= 0:
+                    base_weight = 0.0
+                else:
+                    hold_steps = int(schedule.get('hold_steps', 0))
+                    warmup_steps = int(schedule.get('warmup_steps', 0))
+
+                    if hold_steps > 0 and step_index <= hold_steps:
+                        weight = initial
+                    else:
+                        if warmup_steps <= 0:
+                            weight = target
+                        else:
+                            progress_steps = max(0, step_index - hold_steps)
+                            progress = min(1.0, progress_steps / float(max(1, warmup_steps)))
+                            weight = initial + (target - initial) * progress
+
+                    scale = float(schedule.get('reactivation_scale', 1.0))
+                    if scale != 1.0:
+                        weight = weight * scale
+
+                    base_weight = float(weight)
+            else:
+                epoch_index = self.epochs + 1 if training else max(1, self.epochs)
+                inactive_epochs = int(schedule.get('inactive_epochs', 0))
+                if inactive_epochs > 0:
+                    if epoch_index <= inactive_epochs:
+                        base_weight = 0.0
+                        epoch_index = 0
+                    else:
+                        epoch_index = epoch_index - inactive_epochs
+
+                if inactive_epochs > 0 and epoch_index <= 0:
+                    base_weight = 0.0
+                else:
+                    warmup_epochs = int(schedule.get('warmup_epochs', 0))
+                    hold_epochs = int(schedule.get('hold_epochs', 0))
+
+                    if warmup_epochs <= 0:
+                        weight = target
+                    else:
+                        progress = min(1.0, max(0.0, (epoch_index - 1) / float(max(1, warmup_epochs))))
+                        weight = initial + (target - initial) * progress
+
+                    if epoch_index > warmup_epochs + hold_epochs:
+                        weight = target
+
+                    scale = float(schedule.get('reactivation_scale', 1.0))
+                    if scale != 1.0:
+                        weight = weight * scale
+
+                    base_weight = float(weight)
+
+        scale = float(getattr(self, '_diagonal_weight_scale', 1.0))
+        if scale <= 0.0:
+            return 0.0
+        return float(base_weight * scale)
 
     def _set_active_diagonal_attention_weight(self, training: bool) -> None:
         if not self.use_diagonal_attention_prior:
@@ -685,6 +740,90 @@ class Trainer(object):
         if warmup <= 0:
             return True
         return self.epochs >= max(warmup, 0)
+
+    def _maybe_update_diagonal_attention_weight(self, train_metrics):
+        if not self.use_diagonal_attention_prior:
+            return
+
+        if not isinstance(train_metrics, dict):
+            return
+
+        cfg = self.diagonal_weight_adaptive_config
+        if not cfg:
+            return
+
+        metric_key = cfg.get('metric', 'train/diagnostics/diag_coherence')
+        if metric_key not in train_metrics:
+            return
+
+        try:
+            value = float(train_metrics[metric_key])
+        except (TypeError, ValueError):
+            return
+
+        lower = float(cfg.get('lower', 0.65))
+        upper = float(cfg.get('upper', 0.75))
+        boost = float(cfg.get('boost', 1.25))
+        decay = float(cfg.get('decay', 0.85))
+        decay = float(np.clip(decay, 0.0, 1.0))
+        patience = int(cfg.get('patience', 1))
+        patience = max(1, patience)
+        min_scale = float(cfg.get('min_scale', 0.0))
+        max_scale = float(cfg.get('max_scale', 0.0))
+        recovery = float(cfg.get('recovery', 0.0))
+        recovery = float(np.clip(recovery, 0.0, 1.0))
+
+        scale = float(getattr(self, '_diagonal_weight_scale', 1.0))
+        updated = False
+
+        if value < lower:
+            self._diag_band_low_streak += 1
+            self._diag_band_high_streak = 0
+            if self._diag_band_low_streak >= patience:
+                new_scale = scale * max(1.0, boost)
+                if max_scale > 0.0:
+                    new_scale = min(new_scale, max_scale)
+                if min_scale > 0.0:
+                    new_scale = max(new_scale, min_scale)
+                if abs(new_scale - scale) > 1.0e-6:
+                    scale = new_scale
+                    updated = True
+                self._diag_band_low_streak = 0
+        elif value > upper:
+            self._diag_band_high_streak += 1
+            self._diag_band_low_streak = 0
+            if self._diag_band_high_streak >= patience:
+                new_scale = scale * decay
+                if min_scale > 0.0:
+                    new_scale = max(new_scale, min_scale)
+                if max_scale > 0.0:
+                    new_scale = min(new_scale, max_scale)
+                if abs(new_scale - scale) > 1.0e-6:
+                    scale = new_scale
+                    updated = True
+                self._diag_band_high_streak = 0
+        else:
+            if self._diag_band_low_streak != 0 or self._diag_band_high_streak != 0:
+                self._diag_band_low_streak = 0
+                self._diag_band_high_streak = 0
+            if recovery > 0.0 and abs(scale - 1.0) > 1.0e-6:
+                new_scale = scale + (1.0 - scale) * recovery
+                if min_scale > 0.0:
+                    new_scale = max(new_scale, min_scale)
+                if max_scale > 0.0:
+                    new_scale = min(new_scale, max_scale)
+                if abs(new_scale - scale) > 1.0e-6:
+                    scale = new_scale
+                    updated = True
+
+        if updated:
+            self._diagonal_weight_scale = float(scale)
+            try:
+                self.logger.info(
+                    "updated diagonal helper scale to %.6f after diag=%.4f", scale, value
+                )
+            except Exception:
+                pass
 
     def _maybe_update_attention_duration_weight(self, train_metrics):
         if not self.attention_duration_regularization_enabled:
@@ -1168,6 +1307,20 @@ class Trainer(object):
         else:
             penalty = torch.clamp(shortfall, min=0.0)
 
+        normalize_mode = str(cfg.get('normalize', cfg.get('normalise', 'none'))).lower()
+        if normalize_mode in ('floor', 'target'):
+            denom = lower_bound if normalize_mode == 'floor' else max(floor_value, 1.0e-6)
+            if denom > 0.0:
+                penalty = penalty / float(denom)
+
+        penalty_power = float(cfg.get('penalty_power', cfg.get('power', 1.0)))
+        if abs(penalty_power - 1.0) > 1.0e-6:
+            penalty = penalty.pow(penalty_power)
+
+        boost = float(cfg.get('boost', cfg.get('scale', 1.0)))
+        if boost != 1.0:
+            penalty = penalty * boost
+
         valid_count = token_mask.float().sum().clamp_min(1.0)
         penalty_sum = penalty.sum()
         average_penalty = penalty_sum / valid_count
@@ -1238,12 +1391,32 @@ class Trainer(object):
         lower_bound = max(0.0, min_frames - tolerance)
         penalty = torch.clamp(lower_bound - durations, min=0.0)
 
+        normalize_mode = str(cfg.get('normalize', cfg.get('normalise', 'none'))).lower()
+        if normalize_mode in ('floor', 'target', 'min'):
+            if normalize_mode == 'target' and min_frames > 0.0:
+                denom_value = float(min_frames)
+            else:
+                denom_value = float(lower_bound if lower_bound > 0.0 else min_frames)
+            if denom_value > 0.0:
+                penalty = penalty / denom_value
+
+        penalty_power = float(cfg.get('penalty_power', cfg.get('power', 1.0)))
+        if abs(penalty_power - 1.0) > 1.0e-6:
+            penalty = penalty.pow(penalty_power)
+
+        boost = float(cfg.get('boost', cfg.get('scale', 1.0)))
+        if boost != 1.0:
+            penalty = penalty * boost
+
         penalty = penalty * text_mask
         average_penalty = penalty.sum() / denom
 
         loss_value = weight * average_penalty
 
-        stats = {}
+        stats = {
+            'diagnostics/attn_duration_weight': float(weight),
+            'diagnostics/attn_duration_floor': float(lower_bound),
+        }
         durations_masked = (durations * text_mask).detach()
         valid_mask = text_mask.bool()
         valid_durations = durations_masked[valid_mask]
@@ -2142,6 +2315,22 @@ class Trainer(object):
                     losses['attn_duration_reg'] = duration_loss.item()
                     losses.update(duration_stats)
 
+            diag_value = None
+            if s2s_attn is not None:
+                try:
+                    diag_scores = diagonal_attention_coherence(
+                        s2s_attn,
+                        text_input_length,
+                        mel_input_length,
+                        sigma=self.diagonal_attention_prior_sigma,
+                    )
+                    if isinstance(diag_scores, torch.Tensor):
+                        diag_value = float(diag_scores.detach().mean().item())
+                    else:
+                        diag_value = float(np.mean(diag_scores))
+                except Exception:
+                    diag_value = None
+
             if self.use_diagonal_attention_prior and s2s_attn is not None:
                 self._set_active_diagonal_attention_weight(training=self.model.training)
                 diag_weight = self._get_active_diagonal_attention_weight()
@@ -2155,6 +2344,13 @@ class Trainer(object):
                     total_loss = total_loss + diag_weight * loss_diagonal
                     losses['diag_attn'] = loss_diagonal.item()
                     losses['diag_attn_weight'] = float(diag_weight)
+
+            if diag_value is not None:
+                losses['diagnostics/diag_coherence'] = diag_value
+
+            losses['diagnostics/diag_weight_scale'] = float(
+                getattr(self, '_diagonal_weight_scale', 1.0)
+            )
 
             loss = total_loss
 
@@ -2234,6 +2430,7 @@ class Trainer(object):
                 train_losses["train/%s" % key].append(value)
 
         train_losses = {key: np.mean(value) for key, value in train_losses.items()}
+        self._maybe_update_diagonal_attention_weight(train_losses)
         self._maybe_update_attention_duration_weight(train_losses)
         self._maybe_update_ctc_expected_duration_weight(train_losses)
         train_losses.setdefault(
@@ -2243,6 +2440,7 @@ class Trainer(object):
             else 0.0,
         )
         train_losses.setdefault('train/ctc_blank_scale', self._get_active_ctc_blank_scale())
+        train_losses.setdefault('train/diag_weight_scale', float(getattr(self, '_diagonal_weight_scale', 1.0)))
         train_losses['train/learning_rate'] = self._get_lr()
         self.epochs += 1
 

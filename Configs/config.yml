@@ -160,12 +160,23 @@ sortagrad_switch_to_shuffled_dataset_epoch: 10
 # make ASR learn to read phonemes from left to right, not randomly
 use_diagonal_attention_prior: True
 diagonal_attention_prior_weight:
-  initial: 0.0004
-  target: 0.0022
-  inactive_epochs: 3  # allow a brief roam before re-introducing gentle diagonal structure
-  warmup_epochs: 5     # ease the helper back over a shorter horizon so it can react sooner to drifting alignments
-  reactivation_scale: 0.55  # resume at just over half strength to settle alignments near the 0.7 coherence band
-diagonal_attention_prior_sigma: 1.0
+  initial: 0.0012
+  target: 0.0035
+  inactive_epochs: 1  # keep the helper muted only for the first epoch so alignments do not collapse off-diagonal
+  warmup_epochs: 6     # give the helper a longer glide back in to avoid shocking the decoder
+  reactivation_scale: 0.65  # resume at about two thirds strength so the adaptive scaler can steer toward the target band
+  adaptive:
+    enabled: true
+    lower: 0.66
+    upper: 0.72
+    boost: 1.4
+    decay: 0.85
+    min_scale: 0.55
+    max_scale: 2.8
+    patience: 2
+    recovery: 0.12
+    metric: train/diagnostics/diag_coherence
+diagonal_attention_prior_sigma: 0.9
 
 # stabilizes ASR training for smaller datasets
 entropy_params:
@@ -176,57 +187,63 @@ ctc_loss:
   logit_temperature: 1.0
   blank_scale:
     enabled: true
-    base: 0.46
+    base: 0.38
     schedule:
-      - pct: 0.35
-        value: 0.38
-      - pct: 0.75
-        value: 0.54
+      - pct: 0.4
+        value: 0.34
+      - pct: 0.85
+        value: 0.5
   regularization:
     blank_rate:
       enabled: true
       weight:
-        initial: 0.6
-        target: 0.75
-        warmup_steps: 12000
-      target: 0.52
-      tolerance: 0.03
-      warmup_epochs: 4
+        initial: 0.8
+        target: 1.0
+        warmup_steps: 8000
+        warmup_epochs: 2
+      target: 0.5
+      tolerance: 0.02
+      warmup_epochs: 3
       penalize_low_blank: true
-      blank_run_weight: 0.2
-      blank_run_threshold: 0.5
+      blank_run_weight: 0.25
+      blank_run_threshold: 0.45
     coverage:
       enabled: true
-      weight: 0.42
-      tv_weight: 0.15
-      margin: 0.15
-      target_scale: 2.1
-      min_coverage_frames: 2.05
-      locked_weight: 0.05
-      locked_margin: 0.05
-      locked_softness: 1.0
-      warmup_epochs: 4
+      weight: 0.56
+      tv_weight: 0.12
+      margin: 0.1
+      target_scale: 2.25
+      min_coverage_frames: 2.2
+      locked_weight: 0.08
+      locked_margin: 0.04
+      locked_softness: 0.6
+      warmup_epochs: 3
     expected_duration:
       enabled: true
-      weight: 0.05
-      floor: 1.85
-      tolerance: 0.15
-      softness: 0.1
-      warmup_epochs: 4
-      anneal_target_p50: 2.0
-      anneal_patience: 2
+      weight: 0.12
+      floor: 2.0
+      tolerance: 0.12
+      softness: 0.05
+      normalize: floor
+      penalty_power: 1.5
+      boost: 1.0
+      warmup_epochs: 3
+      anneal_target_p50: 2.05
+      anneal_patience: 3
       anneal_decay: 0.5
       anneal_min_weight: 0.0
 
 alignment_regularization:
   attention_duration:
     enabled: true
-    weight: 0.05
-    min_frames: 1.95
-    tolerance: 0.1
-    min_coverage_frames: 1.95
-    warmup_epochs: 6
-    anneal_target_p50: 2.05
+    weight: 0.07
+    min_frames: 2.05
+    tolerance: 0.12
+    min_coverage_frames: 2.05
+    normalize: floor
+    penalty_power: 1.4
+    warmup_epochs: 5
+    anneal_target_p50: 2.1
     anneal_patience: 2
     anneal_decay: 0.5
     anneal_min_weight: 0.0
