@@ -950,7 +950,8 @@ class Trainer(object):
             return {}, {}
 
         adjusted = self._adjust_ctc_logits(logits)
-        probs = torch.softmax(adjusted.float(), dim=-1)
+        log_probs = torch.log_softmax(adjusted.float(), dim=-1)
+        probs = log_probs.exp()
 
         reg_losses = {}
         reg_stats = {}
@@ -979,7 +980,7 @@ class Trainer(object):
             expected_cfg = self.ctc_expected_duration_config or {}
             if self._ctc_regularization_warmup_passed(expected_cfg):
                 expected_result = self._compute_ctc_expected_duration_regularization(
-                    probs, input_lengths, targets, target_lengths, expected_cfg
+                    probs, log_probs, input_lengths, targets, target_lengths, expected_cfg
                 )
                 if expected_result is not None:
                     loss_value, stats = expected_result
@@ -1234,13 +1235,24 @@ class Trainer(object):
             stats['diagnostics/ctc_temporal_tv_weight'] = float(tv_weight)
         return loss_value, stats
 
-    def _compute_ctc_expected_duration_regularization(self, probs, input_lengths, tokens, token_lengths, cfg):
+    def _compute_ctc_expected_duration_regularization(
+        self,
+        probs,
+        log_probs,
+        input_lengths,
+        tokens,
+        token_lengths,
+        cfg,
+    ):
         weight = float(cfg.get('weight', 0.0))
         if weight == 0.0:
             return None
 
         if probs is None or probs.dim() != 3:
             return None
+
+        if log_probs is None or log_probs.dim() != probs.dim():
+            log_probs = probs.clamp_min(1.0e-12).log()
 
         if tokens is None or token_lengths is None:
             return None
@@ -1260,13 +1272,21 @@ class Trainer(object):
         if vocab_size <= 0:
             return None
 
+        if input_lengths is not None and not torch.is_tensor(input_lengths):
+            input_lengths = torch.as_tensor(input_lengths, device=device)
+
         if input_lengths is not None:
-            if not torch.is_tensor(input_lengths):
-                input_lengths = torch.as_tensor(input_lengths, device=device)
             input_lengths = input_lengths.to(device=device, dtype=torch.long)
             time_positions = torch.arange(probs.size(1), device=device).unsqueeze(0)
             time_mask = (time_positions < input_lengths.unsqueeze(1)).to(probs.dtype)
             probs = probs * time_mask.unsqueeze(-1)
+        else:
+            input_lengths = torch.full(
+                (probs.size(0),),
+                probs.size(1),
+                device=device,
+                dtype=torch.long,
+            )
 
         token_positions = torch.arange(max_tokens, device=device).unsqueeze(0)
         token_mask = token_positions < token_lengths.unsqueeze(1)
@@ -1277,15 +1297,16 @@ class Trainer(object):
         if not torch.any(token_mask):
             return None
 
-        tokens_clipped = tokens.clamp(min=0, max=vocab_size - 1)
-        one_hot = F.one_hot(tokens_clipped, num_classes=vocab_size).to(probs.dtype)
-        one_hot = one_hot * token_mask.unsqueeze(-1).to(probs.dtype)
+        expected = self._ctc_expected_durations_forward_backward(
+            log_probs,
+            input_lengths,
+            tokens,
+            token_lengths,
+            vocab_size=vocab_size,
+        )
+        if expected is None:
+            return None
 
-        token_mass = torch.einsum('btv,blv->bl', probs, one_hot)
-        counts_by_token = one_hot.sum(dim=1)
-        counts_per_position = (one_hot * counts_by_token.unsqueeze(1)).sum(dim=-1).clamp_min(1.0)
-
-        expected = token_mass / counts_per_position
         expected = expected * token_mask.to(expected.dtype)
 
         floor_value = float(cfg.get('floor', cfg.get('min_frames', 1.8)))
@@ -1352,6 +1373,176 @@ class Trainer(object):
             stats['diagnostics/ctc_expected_duration_softness'] = float(softness)
 
         return loss_value, stats
+
+    def _ctc_expected_durations_forward_backward(
+        self,
+        log_probs,
+        input_lengths,
+        tokens,
+        token_lengths,
+        vocab_size=None,
+    ):
+        if log_probs is None or tokens is None:
+            return None
+
+        if vocab_size is None:
+            vocab_size = int(log_probs.size(-1))
+
+        if vocab_size <= 0:
+            return None
+
+        batch_size = tokens.size(0)
+        max_tokens = tokens.size(1)
+        if batch_size == 0 or max_tokens == 0:
+            return None
+
+        device = log_probs.device
+        dtype = log_probs.dtype
+
+        if input_lengths is not None and not torch.is_tensor(input_lengths):
+            input_lengths = torch.as_tensor(input_lengths, device=device)
+
+        if token_lengths is not None and not torch.is_tensor(token_lengths):
+            token_lengths = torch.as_tensor(token_lengths, device=tokens.device)
+
+        if input_lengths is None:
+            input_lengths = torch.full(
+                (batch_size,), log_probs.size(1), device=device, dtype=torch.long
+            )
+        else:
+            input_lengths = input_lengths.to(device=device, dtype=torch.long)
+
+        if token_lengths is None:
+            token_lengths = torch.full(
+                (batch_size,), max_tokens, device=tokens.device, dtype=torch.long
+            )
+        else:
+            token_lengths = token_lengths.to(device=tokens.device, dtype=torch.long)
+
+        expected = log_probs.new_zeros((batch_size, max_tokens), dtype=dtype)
+
+        for batch_idx in range(batch_size):
+            time_len = int(input_lengths[batch_idx].item())
+            time_len = max(0, min(time_len, log_probs.size(1)))
+            if time_len <= 0:
+                continue
+
+            seq_len = int(token_lengths[batch_idx].item())
+            seq_len = max(0, min(seq_len, max_tokens))
+            if seq_len <= 0:
+                continue
+
+            token_seq = tokens[batch_idx, :seq_len]
+            valid_mask = (token_seq > 0) & (token_seq < vocab_size)
+            if not torch.any(valid_mask):
+                continue
+
+            filtered_tokens = token_seq[valid_mask]
+            durations = self._ctc_forward_backward_expected_durations_single(
+                log_probs[batch_idx, :time_len],
+                filtered_tokens.long(),
+            )
+
+            if durations is None or durations.numel() == 0:
+                continue
+
+            target_slice = expected[batch_idx, :seq_len]
+            target_slice[valid_mask] = durations.to(dtype)
+            expected[batch_idx, :seq_len] = target_slice
+
+        return expected
+
+    def _ctc_forward_backward_expected_durations_single(self, log_probs, target_tokens):
+        if log_probs is None or target_tokens is None:
+            return None
+
+        time_len = log_probs.size(0)
+        if time_len <= 0:
+            return log_probs.new_zeros((0,), dtype=log_probs.dtype)
+
+        target_tokens = target_tokens[target_tokens > 0]
+        token_count = target_tokens.numel()
+        if token_count == 0:
+            return log_probs.new_zeros((0,), dtype=log_probs.dtype)
+
+        blank_id = self.ctc_blank_id
+        vocab_size = log_probs.size(1)
+        if blank_id < 0 or blank_id >= vocab_size:
+            return log_probs.new_zeros((token_count,), dtype=log_probs.dtype)
+
+        device = log_probs.device
+        dtype = log_probs.dtype
+
+        extended = torch.full(
+            (token_count * 2 + 1,),
+            blank_id,
+            dtype=torch.long,
+            device=device,
+        )
+        extended[1::2] = target_tokens
+
+        state_count = extended.size(0)
+        alpha = log_probs.new_full((time_len, state_count), float('-inf'))
+        alpha[0, 0] = log_probs[0, blank_id]
+        if state_count > 1:
+            alpha[0, 1] = log_probs[0, extended[1]]
+
+        for t in range(1, time_len):
+            prev = alpha[t - 1]
+            for s in range(state_count):
+                log_emit = log_probs[t, extended[s]]
+                candidates = [prev[s]]
+                if s - 1 >= 0:
+                    candidates.append(prev[s - 1])
+                if (
+                    s - 2 >= 0
+                    and extended[s] != blank_id
+                    and extended[s] != extended[s - 2]
+                ):
+                    candidates.append(prev[s - 2])
+
+                stacked = torch.stack(candidates)
+                alpha[t, s] = log_emit + torch.logsumexp(stacked, dim=0)
+
+        beta = log_probs.new_full((time_len, state_count), float('-inf'))
+        beta[-1, -1] = 0.0
+        if state_count > 1:
+            beta[-1, -2] = 0.0
+
+        for t in range(time_len - 2, -1, -1):
+            next_beta = beta[t + 1]
+            for s in range(state_count):
+                candidates = [next_beta[s] + log_probs[t + 1, extended[s]]]
+                if s + 1 < state_count:
+                    candidates.append(
+                        next_beta[s + 1] + log_probs[t + 1, extended[s + 1]]
+                    )
+                if (
+                    s + 2 < state_count
+                    and extended[s] != blank_id
+                    and extended[s] != extended[s + 2]
+                ):
+                    candidates.append(
+                        next_beta[s + 2] + log_probs[t + 1, extended[s + 2]]
+                    )
+
+                stacked = torch.stack(candidates)
+                beta[t, s] = torch.logsumexp(stacked, dim=0)
+
+        terminal_states = [alpha[-1, -1]]
+        if state_count > 1:
+            terminal_states.append(alpha[-1, -2])
+
+        log_likelihood = torch.logsumexp(torch.stack(terminal_states), dim=0)
+        if not torch.isfinite(log_likelihood):
+            return log_probs.new_zeros((token_count,), dtype=dtype)
+
+        log_gamma = alpha + beta - log_likelihood
+        posterior = torch.exp(log_gamma)
+
+        token_positions = torch.arange(1, state_count, 2, device=device)
+        expected = posterior[:, token_positions].sum(dim=0)
+        return expected
 
     def _compute_attention_duration_regularization(self, attn, text_lengths, mel_lengths):
         if not self.attention_duration_regularization_enabled:
@@ -1439,51 +1630,14 @@ class Trainer(object):
 
         with torch.no_grad():
             adjusted = self._adjust_ctc_logits(logits.detach())
-            probs = adjusted.float().softmax(dim=2)
+            log_probs = F.log_softmax(adjusted.float(), dim=2)
 
-            if input_lengths is not None:
-                if not torch.is_tensor(input_lengths):
-                    input_lengths = torch.as_tensor(input_lengths, device=probs.device)
-                input_lengths = input_lengths.to(device=probs.device, dtype=torch.long)
-                time_mask = torch.arange(probs.size(1), device=probs.device).unsqueeze(0)
-                time_mask = time_mask < input_lengths.unsqueeze(1)
-                probs = probs * time_mask.unsqueeze(2).to(probs.dtype)
-            else:
-                input_lengths = torch.full((probs.size(0),), probs.size(1), device=probs.device, dtype=torch.long)
-
-            if token_lengths is not None:
-                if not torch.is_tensor(token_lengths):
-                    token_lengths = torch.as_tensor(token_lengths, device=tokens.device)
-                token_lengths = token_lengths.to(device=tokens.device, dtype=torch.long)
-            else:
-                token_lengths = torch.full((tokens.size(0),), tokens.size(1), device=tokens.device, dtype=torch.long)
-
-            vocab_size = probs.size(-1)
-            expected = torch.zeros(tokens.size(0), tokens.size(1), device=probs.device, dtype=probs.dtype)
-
-            for batch_idx in range(probs.size(0)):
-                seq_len = int(token_lengths[batch_idx].item())
-                if seq_len <= 0:
-                    continue
-
-                token_seq = tokens[batch_idx, :seq_len]
-                valid_mask = token_seq > 0
-                if not torch.any(valid_mask):
-                    continue
-
-                active_tokens = token_seq[valid_mask]
-                if active_tokens.numel() == 0:
-                    continue
-
-                time_len = int(input_lengths[batch_idx].item())
-                token_mass = probs[batch_idx, :time_len].sum(dim=0)
-                counts = torch.bincount(active_tokens, minlength=vocab_size).to(token_mass.dtype)
-                occ = counts.gather(0, active_tokens).clamp_min(1.0)
-                per_token = token_mass.gather(0, active_tokens) / occ
-
-                target_slice = expected[batch_idx, :seq_len]
-                target_slice[valid_mask] = per_token
-                expected[batch_idx, :seq_len] = target_slice
+            expected = self._ctc_expected_durations_forward_backward(
+                log_probs,
+                input_lengths,
+                tokens,
+                token_lengths,
+            )
 
         return expected
 
