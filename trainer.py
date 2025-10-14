@@ -1482,52 +1482,60 @@ class Trainer(object):
         extended[1::2] = target_tokens
 
         state_count = extended.size(0)
-        alpha = log_probs.new_full((time_len, state_count), float('-inf'))
-        alpha[0, 0] = log_probs[0, blank_id]
+        neg_inf = float('-inf')
+
+        gather_index = extended.view(1, -1).expand(time_len, -1)
+        emissions = log_probs.gather(dim=1, index=gather_index)
+
+        alpha = emissions.new_full((time_len, state_count), neg_inf)
+        alpha[0, 0] = emissions[0, 0]
         if state_count > 1:
-            alpha[0, 1] = log_probs[0, extended[1]]
+            alpha[0, 1] = emissions[0, 1]
+
+        skip_mask = torch.zeros(state_count, dtype=torch.bool, device=device)
+        if state_count > 2:
+            skip_mask[2:] = (
+                extended[2:] != blank_id
+            ) & (extended[2:] != extended[:-2])
+
+        has_skip = bool(skip_mask.any())
 
         for t in range(1, time_len):
             prev = alpha[t - 1]
-            for s in range(state_count):
-                log_emit = log_probs[t, extended[s]]
-                candidates = [prev[s]]
-                if s - 1 >= 0:
-                    candidates.append(prev[s - 1])
-                if (
-                    s - 2 >= 0
-                    and extended[s] != blank_id
-                    and extended[s] != extended[s - 2]
-                ):
-                    candidates.append(prev[s - 2])
 
-                stacked = torch.stack(candidates)
-                alpha[t, s] = log_emit + torch.logsumexp(stacked, dim=0)
+            stay = prev
 
-        beta = log_probs.new_full((time_len, state_count), float('-inf'))
+            advance = emissions.new_full((state_count,), neg_inf)
+            advance[1:] = prev[:-1]
+
+            skip = emissions.new_full((state_count,), neg_inf)
+            if has_skip:
+                skip[2:] = prev[:-2]
+                skip = skip.masked_fill(~skip_mask, neg_inf)
+
+            stacked = torch.stack((stay, advance, skip), dim=0)
+            alpha[t] = emissions[t] + torch.logsumexp(stacked, dim=0)
+
+        beta = emissions.new_full((time_len, state_count), neg_inf)
         beta[-1, -1] = 0.0
         if state_count > 1:
             beta[-1, -2] = 0.0
 
         for t in range(time_len - 2, -1, -1):
             next_beta = beta[t + 1]
-            for s in range(state_count):
-                candidates = [next_beta[s] + log_probs[t + 1, extended[s]]]
-                if s + 1 < state_count:
-                    candidates.append(
-                        next_beta[s + 1] + log_probs[t + 1, extended[s + 1]]
-                    )
-                if (
-                    s + 2 < state_count
-                    and extended[s] != blank_id
-                    and extended[s] != extended[s + 2]
-                ):
-                    candidates.append(
-                        next_beta[s + 2] + log_probs[t + 1, extended[s + 2]]
-                    )
 
-                stacked = torch.stack(candidates)
-                beta[t, s] = torch.logsumexp(stacked, dim=0)
+            stay = next_beta + emissions[t + 1]
+
+            advance = emissions.new_full((state_count,), neg_inf)
+            advance[:-1] = next_beta[1:] + emissions[t + 1, 1:]
+
+            skip = emissions.new_full((state_count,), neg_inf)
+            if has_skip:
+                skip[:-2] = next_beta[2:] + emissions[t + 1, 2:]
+                skip = skip.masked_fill(~skip_mask, neg_inf)
+
+            stacked = torch.stack((stay, advance, skip), dim=0)
+            beta[t] = torch.logsumexp(stacked, dim=0)
 
         terminal_states = [alpha[-1, -1]]
         if state_count > 1:
