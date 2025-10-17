@@ -1332,6 +1332,10 @@ def main(config_path):
         results = train_results.copy()
         results.update(eval_results)
 
+        alignment_updates = trainer.apply_alignment_health_policies(results)
+        if alignment_updates:
+            results.update(alignment_updates)
+
         p50_metric = results.get('diagnostics/attn_duration_p50')
         current_optimizer_step = trainer._get_optimizer_step_count()
         lambda_updated = _maybe_update_lambda_length(p50_metric, current_optimizer_step)

@@ -212,6 +212,36 @@ alignment_regularization:
     tolerance: 0.3
     warmup_epochs: 8
 
+alignment_health_monitor:
+  enabled: true
+  attention_duration:
+    metric: "diagnostics/attn_duration_p50"
+    target: 2.0
+    tolerance: 0.1
+    patience: 2
+    min_epoch: 6
+    cooldown: 3
+    boost:
+      attention_weight: 0.05
+      max_attention_weight: 0.35
+      diag_weight: 0.01
+      max_diag_weight: 0.12
+      blank_target_shift: -0.02
+      min_blank_target: 0.48
+      max_blank_target: 0.72
+  diagonal_coherence:
+    metric: "eval/diag_coherence"
+    target: 0.35
+    tolerance: 0.03
+    patience: 2
+    min_epoch: 5
+    cooldown: 2
+    boost:
+      diag_weight: 0.02
+      max_diag_weight: 0.15
+      sigma_decay: 0.02
+      min_sigma: 0.18
+
 dataset_params:
   # SpecAugment parameters applied only on the training split.
   spec_augment:

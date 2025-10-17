@@ -167,6 +167,31 @@ decoding:
 
 Additionally, the diagonal attention prior now masks out padded timesteps, applies a light dropout (configurable through `model_params.attention_dropout`), and uses a tiny guided-attention helper for the first few thousand optimiser steps. By default the helper holds a λ of 0.05 for the first ~4k steps before settling to 0.02 with a narrower σ≈0.25 along the normalised axes. This gentle schedule nudges early monotonicity without undoing the coverage and blank-rate regularisers; if you notice diagonal coherence dropping (e.g., due to a masking bug), simply disable the prior by setting `use_diagonal_attention_prior` to `False`.
 
+### Automatic alignment health monitor
+
+Cross-lingual corpora sometimes exhibit very different speaking rates or phonotactics. When the auxiliary losses are tuned on one language it is easy for another to collapse into one-frame spikes (median attention duration near 1) or for the attention maps to drift off the diagonal. To keep the model stable without micro-managing the config, the trainer now exposes an `alignment_health_monitor` block (enabled by default). On each evaluation pass the monitor inspects metrics such as `diagnostics/attn_duration_p50` and `eval/diag_coherence`; if they fall below their targets for a few validations in a row it automatically increases the attention-duration penalty, boosts the diagonal prior, narrows the prior’s σ, and gently lowers the target CTC blank-rate. The boosts respect configurable ceilings so mature languages stay untouched while harder corpora (e.g., dense Arabic datasets) quickly recover p50 ≥ 2.0 without manual restarts.
+
+The default thresholds are conservative, but you can tune the patience, cooldown, and boost magnitudes in `Configs/config.yml`:
+
+```yaml
+alignment_health_monitor:
+  enabled: true
+  attention_duration:
+    target: 2.0
+    tolerance: 0.1
+    boost:
+      attention_weight: 0.05   # increase duration penalty in 0.05 steps up to 0.35
+      diag_weight: 0.01         # gently strengthen the guided-attention helper
+      blank_target_shift: -0.02 # lower the blank-rate target to curb deletions
+  diagonal_coherence:
+    target: 0.35
+    boost:
+      diag_weight: 0.02
+      sigma_decay: 0.02        # tighten the diagonal prior when attention drifts
+```
+
+Disable the entire block (or individual subsections) if you prefer to manage the hyperparameters manually.
+
 To avoid choosing checkpoints that only excel at PER while misaligning attention or dropping symbols, training now logs a joint selection score that blends PER, diagonal coherence, and the normalised CTC length gap. The configuration exposes the coefficients under `checkpoint_selection` and the trainer will keep a `best_joint.pth` symlink pointing at the most alignment-friendly checkpoint observed so far.
 
 ```yaml

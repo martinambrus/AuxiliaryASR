@@ -131,6 +131,12 @@ class Trainer(object):
             blank_reg_cfg = {}
         self.ctc_blank_rate_regularization_enabled = bool(blank_reg_cfg.get('enabled', False))
         self.ctc_blank_rate_regularization_config = self._configure_ctc_blank_rate_regularization(blank_reg_cfg)
+        self.ctc_blank_rate_base_target = float(
+            self.ctc_blank_rate_regularization_config.get('_base_target', 0.65)
+        )
+        self._alignment_blank_target_shift = 0.0
+        self._alignment_blank_target_min = None
+        self._alignment_blank_target_max = None
 
         coverage_reg_cfg = ctc_reg_cfg.get('coverage', {}) or {}
         if not isinstance(coverage_reg_cfg, dict):
@@ -147,8 +153,14 @@ class Trainer(object):
         attn_duration_cfg = alignment_reg_cfg.get('attention_duration', {}) or {}
         if not isinstance(attn_duration_cfg, dict):
             attn_duration_cfg = {}
+        else:
+            attn_duration_cfg = dict(attn_duration_cfg)
+        base_attn_weight = float(attn_duration_cfg.get('weight', 0.0))
+        attn_duration_cfg.setdefault('_base_weight', base_attn_weight)
+        self.attention_duration_base_weight = base_attn_weight
         self.attention_duration_regularization_enabled = bool(attn_duration_cfg.get('enabled', False))
         self.attention_duration_regularization_config = attn_duration_cfg
+        self._alignment_duration_boost = 0.0
 
         self.mixspeech_config = mixspeech_config or {}
         self.mixspeech_enabled = bool(self.mixspeech_config.get('enabled', False))
@@ -177,6 +189,16 @@ class Trainer(object):
         self.entropy_regularization_eps = float(entropy_cfg.get('eps', 1.0e-6))
         targets_cfg = entropy_cfg.get('targets', {}) if isinstance(entropy_cfg, dict) else {}
         self.entropy_regularization_targets = self._parse_entropy_regularization_targets(targets_cfg, entropy_cfg)
+
+        health_cfg = {}
+        if isinstance(self.config, dict):
+            health_cfg = self.config.get('alignment_health_monitor', {}) or {}
+            if not isinstance(health_cfg, dict):
+                health_cfg = {}
+        self.alignment_health_monitor_enabled = bool(health_cfg.get('enabled', False))
+        self.alignment_health_monitor_config = health_cfg
+        self._alignment_diag_boost = 0.0
+        self._alignment_health_state = self._init_alignment_health_state()
 
         memopt_cfg = memory_optimization_config or {}
         if not isinstance(memopt_cfg, dict):
@@ -362,7 +384,8 @@ class Trainer(object):
             return
 
         weight = self._current_diagonal_attention_weight(training=training)
-        self._active_diagonal_attention_weight = weight
+        weight = weight + float(getattr(self, '_alignment_diag_boost', 0.0))
+        self._active_diagonal_attention_weight = max(0.0, weight)
 
     def _get_active_diagonal_attention_weight(self) -> float:
         return float(getattr(self, '_active_diagonal_attention_weight', self.diagonal_attention_prior_weight))
@@ -505,7 +528,27 @@ class Trainer(object):
         config['_base_weight'] = base_weight
         config['_raw_weight'] = weight_cfg
         config['weight'] = base_weight
+        try:
+            base_target = float(config.get('target', config.get('target_blank_rate', 0.65)))
+        except (TypeError, ValueError):
+            base_target = 0.65
+        config['_base_target'] = base_target
+        config['target'] = base_target
+        config['target_blank_rate'] = base_target
         return config
+
+    def _init_alignment_health_state(self):
+        state = {}
+        monitor_cfg = self.alignment_health_monitor_config
+        if not isinstance(monitor_cfg, dict):
+            return state
+
+        for key in ('attention_duration', 'diagonal_coherence'):
+            section = monitor_cfg.get(key)
+            if isinstance(section, dict) and section:
+                state[key] = {'violations': 0, 'cooldown': 0}
+
+        return state
 
     def _current_ctc_blank_rate_weight(self, training: bool) -> float:
         cfg = self.ctc_blank_rate_regularization_config or {}
@@ -555,6 +598,29 @@ class Trainer(object):
                 weight = target
 
         return float(max(0.0, weight))
+
+    def _get_ctc_blank_rate_target(self) -> float:
+        cfg = self.ctc_blank_rate_regularization_config or {}
+        base_target = cfg.get('_base_target', cfg.get('target', cfg.get('target_blank_rate', 0.65)))
+        try:
+            base_value = float(base_target)
+        except (TypeError, ValueError):
+            base_value = 0.65
+
+        shift = float(getattr(self, '_alignment_blank_target_shift', 0.0))
+        min_target = getattr(self, '_alignment_blank_target_min', None)
+        max_target = getattr(self, '_alignment_blank_target_max', None)
+        if min_target is None:
+            min_target = 0.0
+        if max_target is None:
+            max_target = 0.95
+
+        target = base_value + shift
+        target = max(min_target, min(max_target, target))
+
+        cfg['target'] = target
+        cfg['target_blank_rate'] = target
+        return target
 
     def _current_ctc_blank_scale(self, epoch_index: int) -> float:
         if not self._ctc_blank_scale_enabled:
@@ -709,7 +775,7 @@ class Trainer(object):
         else:
             blank_rate = blank_probs.mean(dim=1)
 
-        target = float(cfg.get('target', cfg.get('target_blank_rate', 0.65)))
+        target = float(self._get_ctc_blank_rate_target())
         tolerance = float(cfg.get('tolerance', 0.0))
         upper = min(max(target + tolerance, 0.0), 1.0)
         lower = max(min(target - tolerance, 1.0), 0.0)
@@ -780,6 +846,8 @@ class Trainer(object):
         stats = {
             'diagnostics/ctc_blank_rate': float(blank_rate.mean().detach().item()),
             'diagnostics/ctc_blank_rate_weight': float(weight),
+            'diagnostics/ctc_blank_target': float(target),
+            'diagnostics/ctc_blank_target_shift': float(getattr(self, '_alignment_blank_target_shift', 0.0)),
         }
         if blank_run_penalty is not None:
             stats.update({
@@ -907,6 +975,24 @@ class Trainer(object):
             stats['diagnostics/ctc_temporal_tv_weight'] = float(tv_weight)
         return loss_value, stats
 
+    def _get_base_attention_duration_weight(self) -> float:
+        cfg = self.attention_duration_regularization_config or {}
+        base = cfg.get('_base_weight', cfg.get('weight', 0.0))
+        try:
+            return float(base)
+        except (TypeError, ValueError):
+            return 0.0
+
+    def _get_attention_duration_weight(self) -> float:
+        base = self._get_base_attention_duration_weight()
+        boost = float(getattr(self, '_alignment_duration_boost', 0.0))
+        weight = base + boost
+        if weight < 0.0:
+            weight = 0.0
+        cfg = self.attention_duration_regularization_config or {}
+        cfg['weight'] = weight
+        return weight
+
     def _compute_attention_duration_regularization(self, attn, text_lengths, mel_lengths):
         if not self.attention_duration_regularization_enabled:
             return None
@@ -915,7 +1001,7 @@ class Trainer(object):
         if not self._alignment_regularization_warmup_passed(cfg):
             return None
 
-        weight = float(cfg.get('weight', 0.0))
+        weight = self._get_attention_duration_weight()
         if weight == 0.0:
             return None
 
@@ -966,6 +1052,8 @@ class Trainer(object):
             short_ratio = short_mask.float().sum() / denom
             stats['diagnostics/attn_duration_short_ratio'] = float(short_ratio.item())
 
+        stats['diagnostics/attn_duration_weight'] = float(weight)
+        stats['diagnostics/attn_duration_boost'] = float(getattr(self, '_alignment_duration_boost', 0.0))
         return loss_value, stats
 
     def _compute_ctc_expected_durations(self, logits, input_lengths, tokens, token_lengths):
@@ -1040,6 +1128,224 @@ class Trainer(object):
             return max(int(getattr(self.optimizer, "_step_count", 0)), 0)
         except (TypeError, ValueError):
             return 0
+
+    def apply_alignment_health_policies(self, metrics):
+        adjustments = {}
+        if not self.alignment_health_monitor_enabled:
+            return adjustments
+        if not isinstance(metrics, dict):
+            return adjustments
+
+        def _lookup_metric(name):
+            if not name:
+                return None
+            if name in metrics:
+                return metrics[name]
+            if isinstance(name, str):
+                if name.startswith('eval/'):
+                    alt = name.replace('eval/', 'diagnostics/', 1)
+                    if alt in metrics:
+                        return metrics[alt]
+                elif name.startswith('diagnostics/'):
+                    alt = name.replace('diagnostics/', 'eval/', 1)
+                    if alt in metrics:
+                        return metrics[alt]
+            return None
+
+        epoch_index = max(1, int(self.epochs))
+
+        monitor_cfg = self.alignment_health_monitor_config
+        if not isinstance(monitor_cfg, dict):
+            return adjustments
+
+        # Attention duration monitor
+        attn_cfg = monitor_cfg.get('attention_duration') if monitor_cfg else None
+        if isinstance(attn_cfg, dict) and attn_cfg:
+            state = self._alignment_health_state.setdefault(
+                'attention_duration', {'violations': 0, 'cooldown': 0}
+            )
+            metric_name = attn_cfg.get('metric', 'diagnostics/attn_duration_p50')
+            metric_value = _lookup_metric(metric_name)
+            try:
+                metric_value = float(metric_value)
+            except (TypeError, ValueError):
+                metric_value = None
+
+            if metric_value is None or not math.isfinite(metric_value):
+                state['violations'] = 0
+            else:
+                target = float(attn_cfg.get('target', 2.0))
+                tolerance = float(attn_cfg.get('tolerance', 0.0))
+                threshold = target - tolerance
+                violation = metric_value < threshold
+                if violation:
+                    state['violations'] = state.get('violations', 0) + 1
+                else:
+                    state['violations'] = 0
+
+                cooldown_remaining = max(0, int(state.get('cooldown', 0)))
+                if cooldown_remaining > 0:
+                    state['cooldown'] = cooldown_remaining - 1
+                patience = max(1, int(attn_cfg.get('patience', 1)))
+                min_epoch = int(attn_cfg.get('min_epoch', 0))
+                ready = (
+                    violation
+                    and state['violations'] >= patience
+                    and epoch_index >= max(1, min_epoch)
+                    and cooldown_remaining == 0
+                )
+
+                if ready:
+                    state['violations'] = 0
+                    state['cooldown'] = max(0, int(attn_cfg.get('cooldown', 0)))
+                    boost_cfg = attn_cfg.get('boost', {}) or {}
+                    applied_msgs = []
+
+                    attn_boost = float(boost_cfg.get('attention_weight', 0.0))
+                    if attn_boost != 0.0:
+                        base_weight = self._get_base_attention_duration_weight()
+                        current_boost = float(getattr(self, '_alignment_duration_boost', 0.0))
+                        target_weight = base_weight + current_boost + attn_boost
+                        max_weight = float(boost_cfg.get('max_attention_weight', 0.0))
+                        if max_weight > 0.0:
+                            target_weight = min(max_weight, target_weight)
+                        new_boost = max(0.0, target_weight - base_weight)
+                        if not math.isclose(new_boost, current_boost, rel_tol=1e-6, abs_tol=1e-6):
+                            self._alignment_duration_boost = new_boost
+                            new_weight = self._get_attention_duration_weight()
+                            adjustments['alignment/attn_duration_weight'] = new_weight
+                            adjustments['alignment/attn_duration_epoch'] = float(epoch_index)
+                            adjustments['alignment/attn_duration_metric'] = float(metric_value)
+                            applied_msgs.append(f"duration_weight→{new_weight:.3f}")
+
+                    diag_boost = float(boost_cfg.get('diag_weight', 0.0))
+                    if diag_boost != 0.0:
+                        base_diag = self._current_diagonal_attention_weight(training=False)
+                        current_diag_boost = float(getattr(self, '_alignment_diag_boost', 0.0))
+                        target_diag = base_diag + current_diag_boost + diag_boost
+                        max_diag = float(boost_cfg.get('max_diag_weight', 0.0))
+                        if max_diag > 0.0:
+                            target_diag = min(max_diag, target_diag)
+                        new_diag_boost = max(0.0, target_diag - base_diag)
+                        if not math.isclose(new_diag_boost, current_diag_boost, rel_tol=1e-6, abs_tol=1e-6):
+                            self._alignment_diag_boost = new_diag_boost
+                            self._set_active_diagonal_attention_weight(training=False)
+                            new_diag_weight = self._get_active_diagonal_attention_weight()
+                            adjustments['alignment/diag_weight'] = new_diag_weight
+                            applied_msgs.append(f"diag_weight→{new_diag_weight:.3f}")
+
+                    blank_shift = float(boost_cfg.get('blank_target_shift', 0.0))
+                    if blank_shift != 0.0 and self.ctc_blank_rate_regularization_enabled:
+                        base_shift = float(getattr(self, '_alignment_blank_target_shift', 0.0))
+                        base_target = float(getattr(self, 'ctc_blank_rate_base_target', 0.65))
+                        desired_target = base_target + base_shift + blank_shift
+                        if 'min_blank_target' in boost_cfg:
+                            self._alignment_blank_target_min = float(boost_cfg['min_blank_target'])
+                            desired_target = max(self._alignment_blank_target_min, desired_target)
+                        if 'max_blank_target' in boost_cfg:
+                            self._alignment_blank_target_max = float(boost_cfg['max_blank_target'])
+                            desired_target = min(self._alignment_blank_target_max, desired_target)
+                        new_shift = desired_target - base_target
+                        if not math.isclose(new_shift, base_shift, rel_tol=1e-6, abs_tol=1e-6):
+                            self._alignment_blank_target_shift = new_shift
+                            new_target = self._get_ctc_blank_rate_target()
+                            adjustments['alignment/ctc_blank_target'] = new_target
+                            applied_msgs.append(f"blank_target→{new_target:.3f}")
+
+                    if applied_msgs:
+                        message = ", ".join(applied_msgs)
+                        self.logger.info(
+                            "[AlignmentHealth] Attention-duration boost at epoch %d: %s (metric %.3f)",
+                            epoch_index,
+                            message,
+                            metric_value,
+                        )
+
+        # Diagonal coherence monitor
+        diag_cfg = monitor_cfg.get('diagonal_coherence') if monitor_cfg else None
+        if isinstance(diag_cfg, dict) and diag_cfg:
+            state = self._alignment_health_state.setdefault(
+                'diagonal_coherence', {'violations': 0, 'cooldown': 0}
+            )
+            metric_name = diag_cfg.get('metric', 'eval/diag_coherence')
+            metric_value = _lookup_metric(metric_name)
+            try:
+                metric_value = float(metric_value)
+            except (TypeError, ValueError):
+                metric_value = None
+
+            if metric_value is None or not math.isfinite(metric_value):
+                state['violations'] = 0
+            else:
+                target = float(diag_cfg.get('target', 0.35))
+                tolerance = float(diag_cfg.get('tolerance', 0.0))
+                threshold = target - tolerance
+                violation = metric_value < threshold
+                if violation:
+                    state['violations'] = state.get('violations', 0) + 1
+                else:
+                    state['violations'] = 0
+
+                cooldown_remaining = max(0, int(state.get('cooldown', 0)))
+                if cooldown_remaining > 0:
+                    state['cooldown'] = cooldown_remaining - 1
+                patience = max(1, int(diag_cfg.get('patience', 1)))
+                min_epoch = int(diag_cfg.get('min_epoch', 0))
+                ready = (
+                    violation
+                    and state['violations'] >= patience
+                    and epoch_index >= max(1, min_epoch)
+                    and cooldown_remaining == 0
+                )
+
+                if ready:
+                    state['violations'] = 0
+                    state['cooldown'] = max(0, int(diag_cfg.get('cooldown', 0)))
+                    boost_cfg = diag_cfg.get('boost', {}) or {}
+                    applied_msgs = []
+
+                    diag_boost = float(boost_cfg.get('diag_weight', 0.0))
+                    if diag_boost != 0.0:
+                        base_diag = self._current_diagonal_attention_weight(training=False)
+                        current_diag_boost = float(getattr(self, '_alignment_diag_boost', 0.0))
+                        target_diag = base_diag + current_diag_boost + diag_boost
+                        max_diag = float(boost_cfg.get('max_diag_weight', 0.0))
+                        if max_diag > 0.0:
+                            target_diag = min(max_diag, target_diag)
+                        new_diag_boost = max(0.0, target_diag - base_diag)
+                        if not math.isclose(new_diag_boost, current_diag_boost, rel_tol=1e-6, abs_tol=1e-6):
+                            self._alignment_diag_boost = new_diag_boost
+                            self._set_active_diagonal_attention_weight(training=False)
+                            new_weight = self._get_active_diagonal_attention_weight()
+                            adjustments['alignment/diag_weight'] = new_weight
+                            applied_msgs.append(f"diag_weight→{new_weight:.3f}")
+
+                    sigma_decay = float(boost_cfg.get('sigma_decay', 0.0))
+                    if sigma_decay > 0.0:
+                        min_sigma = float(boost_cfg.get('min_sigma', 0.0))
+                        new_sigma = max(min_sigma, self.diagonal_attention_prior_sigma - sigma_decay)
+                        if not math.isclose(
+                            new_sigma,
+                            self.diagonal_attention_prior_sigma,
+                            rel_tol=1e-6,
+                            abs_tol=1e-6,
+                        ):
+                            self.diagonal_attention_prior_sigma = new_sigma
+                            adjustments['alignment/diag_sigma'] = new_sigma
+                            applied_msgs.append(f"sigma→{new_sigma:.3f}")
+
+                    if applied_msgs:
+                        message = ", ".join(applied_msgs)
+                        self.logger.info(
+                            "[AlignmentHealth] Diagonal-coherence boost at epoch %d: %s (metric %.3f)",
+                            epoch_index,
+                            message,
+                            metric_value,
+                        )
+                        adjustments['alignment/diag_metric'] = float(metric_value)
+                        adjustments['alignment/diag_epoch'] = float(epoch_index)
+
+        return adjustments
 
     def update_dataloaders(
         self,
@@ -1943,6 +2249,9 @@ class Trainer(object):
 
         train_losses = {key: np.mean(value) for key, value in train_losses.items()}
         train_losses.setdefault('train/ctc_blank_scale', self._get_active_ctc_blank_scale())
+        train_losses.setdefault('train/diag_weight', self._get_active_diagonal_attention_weight())
+        train_losses.setdefault('train/attn_duration_weight', self._get_attention_duration_weight())
+        train_losses.setdefault('train/ctc_blank_target', self._get_ctc_blank_rate_target())
         train_losses['train/learning_rate'] = self._get_lr()
         self.epochs += 1
 
@@ -2229,6 +2538,8 @@ class Trainer(object):
         eval_losses = {key: np.mean(value) for key, value in eval_losses.items()}
         eval_losses.setdefault('eval/diag_weight', self._get_active_diagonal_attention_weight())
         eval_losses.setdefault('eval/ctc_blank_scale', self._get_active_ctc_blank_scale())
+        eval_losses.setdefault('eval/attn_duration_weight', self._get_attention_duration_weight())
+        eval_losses.setdefault('eval/ctc_blank_target', self._get_ctc_blank_rate_target())
         eval_losses.update(eval_images)
         for key in list(eval_losses.keys()):
             if key.startswith('eval/image'):
