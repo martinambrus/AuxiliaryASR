@@ -141,6 +141,16 @@ alignment_regularization:
     weight: 0.15             # average penalty applied when tokens fall below the minimum duration
     min_frames: 2.0
     tolerance: 0.3
+    dynamic_weight:          # auto-adjust the penalty to keep the median duration near ~2 frames
+      enabled: true
+      target_p50: 2.0
+      tolerance: 0.15
+      min_weight: 0.12
+      max_weight: 0.6
+      increase_factor: 1.35  # ramp the loss faster when the attention collapses
+      decrease_factor: 0.9   # ease off once durations stabilise above the target
+      cooldown_steps: 800
+      patience: 2
 
 regularization:
   entropy:
@@ -148,6 +158,11 @@ regularization:
       ctc:
         weight: 0.02         # maximise entropy to keep non-blank symbols active
 ```
+
+The dynamic controller keeps an eye on the median attention duration (`p50`) and, when it dips below the target, gradually
+raises the loss weight until tokens stretch back out to ~2 frames. Once the model stabilises, the controller gently relaxes the
+penalty again. This feedback loop has proven especially helpful on languages such as Arabic where early training tends to
+collapse onto single-frame spikes and produce the `p50=1` pathology reported above.
 
 All of the auxiliary losses honour a `warmup_epochs` key (`5` for the CTC penalties and `8` for the duration term in the default config) so you can delay their activation until the alignment has roughly converged.
 

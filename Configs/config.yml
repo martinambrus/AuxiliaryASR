@@ -211,6 +211,16 @@ alignment_regularization:
     min_frames: 2.0
     tolerance: 0.3
     warmup_epochs: 8
+    dynamic_weight:
+      enabled: true
+      target_p50: 2.0
+      tolerance: 0.15
+      min_weight: 0.12
+      max_weight: 0.6
+      increase_factor: 1.35
+      decrease_factor: 0.9
+      cooldown_steps: 800
+      patience: 2
 
 dataset_params:
   # SpecAugment parameters applied only on the training split.

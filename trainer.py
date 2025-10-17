@@ -149,6 +149,7 @@ class Trainer(object):
             attn_duration_cfg = {}
         self.attention_duration_regularization_enabled = bool(attn_duration_cfg.get('enabled', False))
         self.attention_duration_regularization_config = attn_duration_cfg
+        self._configure_attention_duration_regularization(attn_duration_cfg)
 
         self.mixspeech_config = mixspeech_config or {}
         self.mixspeech_enabled = bool(self.mixspeech_config.get('enabled', False))
@@ -643,6 +644,161 @@ class Trainer(object):
             return True
         return self.epochs >= max(warmup, 0)
 
+    def _configure_attention_duration_regularization(self, cfg):
+        if not isinstance(cfg, dict):
+            cfg = {}
+
+        base_weight = cfg.get('weight', 0.0)
+        try:
+            base_weight = float(base_weight)
+        except (TypeError, ValueError):
+            base_weight = 0.0
+        base_weight = max(0.0, base_weight)
+
+        dynamic_cfg = cfg.get('dynamic_weight', {}) or {}
+        if not isinstance(dynamic_cfg, dict):
+            dynamic_cfg = {}
+
+        self.attention_duration_dynamic_enabled = bool(dynamic_cfg.get('enabled', False))
+        self.attention_duration_dynamic_config = dynamic_cfg if self.attention_duration_dynamic_enabled else {}
+
+        min_weight = dynamic_cfg.get('min_weight', base_weight)
+        max_weight = dynamic_cfg.get('max_weight', base_weight)
+        try:
+            min_weight = float(min_weight)
+        except (TypeError, ValueError):
+            min_weight = base_weight
+        try:
+            max_weight = float(max_weight)
+        except (TypeError, ValueError):
+            max_weight = base_weight
+        min_weight = max(0.0, min_weight)
+        max_weight = max(min_weight, max_weight)
+
+        increase_factor = dynamic_cfg.get('increase_factor', 1.2)
+        decrease_factor = dynamic_cfg.get('decrease_factor', 0.9)
+        try:
+            increase_factor = float(increase_factor)
+        except (TypeError, ValueError):
+            increase_factor = 1.2
+        try:
+            decrease_factor = float(decrease_factor)
+        except (TypeError, ValueError):
+            decrease_factor = 0.9
+        increase_factor = max(1.0, increase_factor)
+        decrease_factor = max(0.0, min(1.0, decrease_factor))
+
+        target_p50 = dynamic_cfg.get('target_p50', cfg.get('min_frames', 2.0))
+        tolerance = dynamic_cfg.get('tolerance', 0.1)
+        try:
+            target_p50 = float(target_p50)
+        except (TypeError, ValueError):
+            target_p50 = float(cfg.get('min_frames', 2.0))
+        try:
+            tolerance = float(tolerance)
+        except (TypeError, ValueError):
+            tolerance = 0.1
+        tolerance = max(0.0, tolerance)
+
+        cooldown_steps = dynamic_cfg.get('cooldown_steps', 400)
+        patience = dynamic_cfg.get('patience', 0)
+        try:
+            cooldown_steps = int(cooldown_steps)
+        except (TypeError, ValueError):
+            cooldown_steps = 400
+        try:
+            patience = int(patience)
+        except (TypeError, ValueError):
+            patience = 0
+        cooldown_steps = max(0, cooldown_steps)
+        patience = max(0, patience)
+
+        self._attention_duration_weight_base = base_weight
+        self._attention_duration_weight_min = min_weight
+        self._attention_duration_weight_max = max_weight
+        self._attention_duration_increase_factor = increase_factor
+        self._attention_duration_decrease_factor = decrease_factor
+        self._attention_duration_target_p50 = target_p50
+        self._attention_duration_tolerance = tolerance
+        self._attention_duration_cooldown = cooldown_steps
+        self._attention_duration_patience = patience
+
+        initial_weight = base_weight
+        if self.attention_duration_dynamic_enabled:
+            initial_weight = min(max(initial_weight, min_weight), max_weight)
+
+        self._attention_duration_weight_state = {
+            'current_weight': float(initial_weight),
+            'last_adjust_step': 0,
+            'bad_steps': 0,
+            'recent_metric': None,
+        }
+
+    def _current_attention_duration_weight(self):
+        state = getattr(self, '_attention_duration_weight_state', None)
+        if not isinstance(state, dict):
+            return getattr(self, '_attention_duration_weight_base', 0.0)
+        return float(state.get('current_weight', getattr(self, '_attention_duration_weight_base', 0.0)))
+
+    def _maybe_update_attention_duration_weight(self, stats):
+        if not self.attention_duration_dynamic_enabled:
+            return
+        if not isinstance(stats, dict):
+            return
+
+        p50 = stats.get('diagnostics/attn_duration_p50')
+        if p50 is None:
+            return
+        try:
+            p50 = float(p50)
+        except (TypeError, ValueError):
+            return
+        if not math.isfinite(p50):
+            return
+
+        state = getattr(self, '_attention_duration_weight_state', None)
+        if not isinstance(state, dict):
+            return
+
+        step_index = max(0, int(getattr(self, '_optimizer_step_count', 0)))
+        cooldown = getattr(self, '_attention_duration_cooldown', 0)
+        last_step = int(state.get('last_adjust_step', 0))
+        if step_index - last_step < cooldown:
+            state['recent_metric'] = p50
+            return
+
+        target = getattr(self, '_attention_duration_target_p50', 2.0)
+        tolerance = getattr(self, '_attention_duration_tolerance', 0.1)
+        min_weight = getattr(self, '_attention_duration_weight_min', 0.0)
+        max_weight = getattr(self, '_attention_duration_weight_max', min_weight)
+        increase_factor = getattr(self, '_attention_duration_increase_factor', 1.2)
+        decrease_factor = getattr(self, '_attention_duration_decrease_factor', 0.9)
+        patience = getattr(self, '_attention_duration_patience', 0)
+
+        current_weight = float(state.get('current_weight', min_weight))
+
+        below_target = p50 < (target - tolerance)
+        above_target = p50 > (target + tolerance)
+
+        if below_target:
+            state['bad_steps'] = int(state.get('bad_steps', 0)) + 1
+            if patience == 0 or state['bad_steps'] >= patience:
+                new_weight = min(max_weight, current_weight * increase_factor)
+                if new_weight > current_weight + 1.0e-8:
+                    state['current_weight'] = float(new_weight)
+                    state['last_adjust_step'] = step_index
+                state['bad_steps'] = 0
+        elif above_target and decrease_factor < 1.0:
+            new_weight = max(min_weight, current_weight * decrease_factor)
+            if new_weight < current_weight - 1.0e-8:
+                state['current_weight'] = float(new_weight)
+                state['last_adjust_step'] = step_index
+            state['bad_steps'] = 0
+        else:
+            state['bad_steps'] = 0
+
+        state['recent_metric'] = p50
+
     def _compute_ctc_alignment_regularization(self, logits, input_lengths, target_lengths):
         if logits is None:
             return {}, {}
@@ -915,7 +1071,7 @@ class Trainer(object):
         if not self._alignment_regularization_warmup_passed(cfg):
             return None
 
-        weight = float(cfg.get('weight', 0.0))
+        weight = float(self._current_attention_duration_weight())
         if weight == 0.0:
             return None
 
@@ -951,7 +1107,7 @@ class Trainer(object):
 
         loss_value = weight * average_penalty
 
-        stats = {}
+        stats = {'diagnostics/attn_duration_weight': float(weight)}
         durations_masked = (durations * text_mask).detach()
         valid_mask = text_mask.bool()
         valid_durations = durations_masked[valid_mask]
@@ -1849,6 +2005,7 @@ class Trainer(object):
                     total_loss = total_loss + duration_loss
                     losses['attn_duration_reg'] = duration_loss.item()
                     losses.update(duration_stats)
+                    self._maybe_update_attention_duration_weight(duration_stats)
 
             if self.use_diagonal_attention_prior and s2s_attn is not None:
                 self._set_active_diagonal_attention_weight(training=self.model.training)
