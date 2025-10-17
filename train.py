@@ -1143,35 +1143,6 @@ def main(config_path):
         'current_value': joint_lambda_length,
     }
 
-    diag_boost_cfg = cfg_get_nested(config, 'diagonal_attention_prior_weight.boost', {}) or {}
-    if not isinstance(diag_boost_cfg, dict):
-        diag_boost_cfg = {}
-
-    diag_boost_enabled = bool(diag_boost_cfg.get('enabled', False))
-    diag_boost_threshold = float(diag_boost_cfg.get('threshold', 0.35))
-    diag_boost_patience = max(1, int(diag_boost_cfg.get('patience', 2)))
-    diag_boost_factor = float(diag_boost_cfg.get('factor', diag_boost_cfg.get('multiplier', 2.0)))
-    diag_boost_hold_steps = max(1, int(diag_boost_cfg.get('hold_steps', 4000)))
-    diag_boost_cooldown = max(0, int(diag_boost_cfg.get('cooldown_steps', diag_boost_cfg.get('cooldown', 8000))))
-    diag_boost_metric = str(diag_boost_cfg.get('metric', 'diag')).lower()
-    diag_boost_max_weight = diag_boost_cfg.get('max_weight', None)
-    if diag_boost_max_weight is not None:
-        diag_boost_max_weight = float(diag_boost_max_weight)
-
-    diag_boost_state = {
-        'enabled': diag_boost_enabled,
-        'threshold': diag_boost_threshold,
-        'patience': diag_boost_patience,
-        'factor': diag_boost_factor,
-        'hold_steps': diag_boost_hold_steps,
-        'cooldown_steps': diag_boost_cooldown,
-        'metric': diag_boost_metric,
-        'max_weight': diag_boost_max_weight,
-        'counter': 0,
-        'cooldown_until': 0,
-        'last_trigger_step': -1,
-    }
-
     grid_lambda_values = checkpoint_selection_cfg.get('lambda_length_grid', []) or []
     grid_delta_values = checkpoint_selection_cfg.get('target_length_diff_grid', []) or []
     if not isinstance(grid_lambda_values, (list, tuple)):
@@ -1260,60 +1231,6 @@ def main(config_path):
         )
         updated = True
         return updated
-
-    def _maybe_update_diagonal_attention_boost(metric_value, current_step):
-        if not diag_boost_state['enabled']:
-            return False
-
-        if metric_value is None or not math.isfinite(metric_value):
-            diag_boost_state['counter'] = 0
-            return False
-
-        threshold = diag_boost_state['threshold']
-        target_metric = diag_boost_state['metric']
-        if target_metric in ('p50', 'duration', 'duration_p50', 'attn_duration_p50'):
-            below_threshold = metric_value < threshold
-        else:
-            below_threshold = metric_value < threshold
-
-        boost_active = hasattr(trainer, 'is_diagonal_attention_boost_active') and trainer.is_diagonal_attention_boost_active()
-
-        cooldown_until = diag_boost_state.get('cooldown_until', 0)
-        if cooldown_until and current_step < cooldown_until and not boost_active:
-            diag_boost_state['counter'] = 0
-            return False
-
-        if below_threshold:
-            diag_boost_state['counter'] += 1
-        else:
-            diag_boost_state['counter'] = 0
-            return False
-
-        if diag_boost_state['counter'] < diag_boost_state['patience']:
-            return False
-
-        diag_boost_state['counter'] = 0
-        diag_boost_state['last_trigger_step'] = current_step
-
-        factor = max(1.0, float(diag_boost_state.get('factor', 1.0)))
-        hold_steps = max(1, int(diag_boost_state.get('hold_steps', 1)))
-        max_weight = diag_boost_state.get('max_weight', None)
-
-        if hasattr(trainer, 'activate_diagonal_attention_boost'):
-            trainer.activate_diagonal_attention_boost(
-                factor=factor,
-                hold_steps=hold_steps,
-                max_weight=max_weight,
-                current_step=current_step,
-            )
-
-        cooldown_steps = int(diag_boost_state.get('cooldown_steps', 0))
-        if cooldown_steps > 0:
-            diag_boost_state['cooldown_until'] = current_step + cooldown_steps
-        else:
-            diag_boost_state['cooldown_until'] = 0
-
-        return True
 
     best_joint_score = None
     best_checkpoint_path = None
@@ -1438,34 +1355,6 @@ def main(config_path):
             decay_progress = 0.0
         decay_progress = min(max(decay_progress, 0.0), 1.0)
         results['eval/checkpoint_lambda_length_decay_progress'] = decay_progress
-
-        diag_metric_value = None
-        if diag_boost_state['enabled']:
-            metric_key = diag_boost_state.get('metric', 'diag')
-            if metric_key in ('p50', 'duration', 'duration_p50', 'attn_duration_p50'):
-                diag_metric_value = results.get('diagnostics/attn_duration_p50')
-            else:
-                diag_metric_value = results.get('eval/diag_coherence')
-        diag_boost_triggered = _maybe_update_diagonal_attention_boost(
-            diag_metric_value,
-            current_optimizer_step,
-        )
-        boost_summary = (
-            trainer.get_diagonal_attention_boost_state()
-            if hasattr(trainer, 'get_diagonal_attention_boost_state')
-            else {}
-        )
-        results['eval/diag_boost_active'] = 1.0 if boost_summary.get('active') else 0.0
-        results['eval/diag_boost_factor'] = float(boost_summary.get('factor', 1.0))
-        results['eval/diag_boost_weight'] = float(
-            boost_summary.get(
-                'applied_weight',
-                trainer._get_active_diagonal_attention_weight() if hasattr(trainer, '_get_active_diagonal_attention_weight') else 0.0,
-            )
-        )
-        results['eval/diag_boost_until_step'] = float(boost_summary.get('until_step', 0))
-        results['eval/diag_boost_triggered'] = 1.0 if diag_boost_triggered else 0.0
-        results['eval/diag_boost_cooldown_until'] = float(diag_boost_state.get('cooldown_until', 0))
 
         joint_score = None
         length_penalty = None

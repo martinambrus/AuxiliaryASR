@@ -280,27 +280,13 @@ class Trainer(object):
 
     def _configure_diagonal_attention_weight(self, weight_config):
         schedule = None
-        boost_cfg = None
         if isinstance(weight_config, dict):
-            cfg = dict(weight_config)
-            raw_boost = cfg.pop('boost', None)
-            if isinstance(raw_boost, dict) and bool(raw_boost.get('enabled', True)):
-                boost_cfg = {
-                    'factor': float(raw_boost.get('factor', 2.0)),
-                    'hold_steps': int(raw_boost.get('hold_steps', 4000) or 0),
-                    'max_weight': (
-                        float(raw_boost['max_weight'])
-                        if raw_boost.get('max_weight') is not None
-                        else None
-                    ),
-                }
-
-            initial = float(cfg.get('initial', cfg.get('base', cfg.get('start', 0.0))))
-            target = float(cfg.get('target', cfg.get('final', initial)))
-            warmup_epochs = int(cfg.get('warmup_epochs', cfg.get('ramp_epochs', 0)))
-            hold_epochs = int(cfg.get('hold_epochs', 0))
-            warmup_steps = int(cfg.get('warmup_steps', cfg.get('ramp_steps', 0)))
-            hold_steps = int(cfg.get('hold_steps', cfg.get('initial_steps', 0)))
+            initial = float(weight_config.get('initial', weight_config.get('base', weight_config.get('start', 0.0))))
+            target = float(weight_config.get('target', weight_config.get('final', initial)))
+            warmup_epochs = int(weight_config.get('warmup_epochs', weight_config.get('ramp_epochs', 0)))
+            hold_epochs = int(weight_config.get('hold_epochs', 0))
+            warmup_steps = int(weight_config.get('warmup_steps', weight_config.get('ramp_steps', 0)))
+            hold_steps = int(weight_config.get('hold_steps', weight_config.get('initial_steps', 0)))
 
             schedule = {
                 'initial': initial,
@@ -321,15 +307,6 @@ class Trainer(object):
         else:
             base_weight = float(weight_config) if weight_config is not None else 0.0
 
-        self.diagonal_attention_weight_boost_config = boost_cfg
-        self._diag_boost_state = {
-            'active': False,
-            'factor': 1.0,
-            'max_weight': None,
-            'start_step': 0,
-            'until_step': 0,
-            'applied_weight': float(base_weight),
-        }
         self.diagonal_attention_prior_weight = float(base_weight)
         self.diagonal_attention_weight_schedule = schedule
         self._active_diagonal_attention_weight = float(base_weight)
@@ -379,92 +356,16 @@ class Trainer(object):
 
         return float(weight)
 
-    def _refresh_diagonal_attention_boost(self, training: bool) -> None:
-        state = getattr(self, '_diag_boost_state', None)
-        if not state or not state.get('active', False):
-            return
-
-        current_step = self._get_optimizer_step_count()
-        step_index = current_step + 1 if training else max(1, current_step)
-        if step_index >= int(state.get('until_step', 0)):
-            state['active'] = False
-            state['factor'] = 1.0
-            state['max_weight'] = None
-            state['start_step'] = 0
-            state['until_step'] = 0
-
     def _set_active_diagonal_attention_weight(self, training: bool) -> None:
         if not self.use_diagonal_attention_prior:
             self._active_diagonal_attention_weight = 0.0
             return
 
-        self._refresh_diagonal_attention_boost(training=training)
         weight = self._current_diagonal_attention_weight(training=training)
-
-        state = getattr(self, '_diag_boost_state', None)
-        if state and state.get('active', False):
-            factor = max(1.0, float(state.get('factor', 1.0)))
-            boosted = weight * factor
-            max_weight = state.get('max_weight', None)
-            if max_weight is not None:
-                try:
-                    boosted = min(boosted, float(max_weight))
-                except (TypeError, ValueError):
-                    pass
-            weight = boosted
-        if state is not None:
-            state['applied_weight'] = float(weight)
-
         self._active_diagonal_attention_weight = weight
 
     def _get_active_diagonal_attention_weight(self) -> float:
         return float(getattr(self, '_active_diagonal_attention_weight', self.diagonal_attention_prior_weight))
-
-    def activate_diagonal_attention_boost(self, factor: float, hold_steps: int, max_weight=None, current_step: int = None) -> None:
-        if not hasattr(self, '_diag_boost_state') or self._diag_boost_state is None:
-            self._diag_boost_state = {
-                'active': False,
-                'factor': 1.0,
-                'max_weight': None,
-                'start_step': 0,
-                'until_step': 0,
-                'applied_weight': self._active_diagonal_attention_weight,
-            }
-
-        state = self._diag_boost_state
-        if factor is None or factor <= 1.0:
-            state['active'] = False
-            state['factor'] = 1.0
-            state['max_weight'] = None
-            state['start_step'] = 0
-            state['until_step'] = 0
-            return
-
-        if current_step is None:
-            current_step = self._get_optimizer_step_count()
-
-        hold_steps = max(1, int(hold_steps) if hold_steps is not None else 1)
-        state['active'] = True
-        state['factor'] = float(factor)
-        state['max_weight'] = None if max_weight is None else float(max_weight)
-        state['start_step'] = int(max(0, current_step))
-        state['until_step'] = state['start_step'] + hold_steps
-
-    def is_diagonal_attention_boost_active(self) -> bool:
-        state = getattr(self, '_diag_boost_state', None)
-        return bool(state and state.get('active', False))
-
-    def get_diagonal_attention_boost_state(self):
-        state = getattr(self, '_diag_boost_state', None) or {}
-        summary = {
-            'active': bool(state.get('active', False)),
-            'factor': float(state.get('factor', 1.0)),
-            'start_step': int(state.get('start_step', 0)),
-            'until_step': int(state.get('until_step', 0)),
-            'max_weight': state.get('max_weight', None),
-            'applied_weight': float(state.get('applied_weight', self._active_diagonal_attention_weight)),
-        }
-        return summary
 
     def _configure_ctc_blank_scale(self, scale_config) -> None:
         self._ctc_blank_scale_enabled = True
