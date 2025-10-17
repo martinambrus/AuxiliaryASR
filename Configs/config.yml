@@ -164,6 +164,15 @@ diagonal_attention_prior_weight:
   target: 0.02
   hold_steps: 4000  # keep the helper active for ~3-5k optimiser steps
   warmup_steps: 0
+  boost:
+    enabled: true
+    threshold: 0.35
+    patience: 2
+    factor: 3.5
+    max_weight: 0.12
+    hold_steps: 6000
+    cooldown_steps: 12000
+    metric: diag
 diagonal_attention_prior_sigma: 0.25
 
 # stabilizes ASR training for smaller datasets
@@ -207,10 +216,10 @@ ctc_loss:
 alignment_regularization:
   attention_duration:
     enabled: true
-    weight: 0.15
+    weight: 0.18
     min_frames: 2.0
-    tolerance: 0.3
-    warmup_epochs: 8
+    tolerance: 0.2
+    warmup_epochs: 6
 
 dataset_params:
   # SpecAugment parameters applied only on the training split.
