@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 
 import math
+import copy
 import os
 import os.path as osp
 import sys
@@ -549,6 +550,124 @@ class Trainer(object):
                 state[key] = {'violations': 0, 'cooldown': 0}
 
         return state
+
+    def _capture_alignment_state(self):
+        state = {}
+
+        try:
+            duration_boost = float(getattr(self, '_alignment_duration_boost', 0.0))
+        except (TypeError, ValueError):
+            duration_boost = 0.0
+        if duration_boost != 0.0:
+            state['duration_boost'] = duration_boost
+
+        try:
+            diag_boost = float(getattr(self, '_alignment_diag_boost', 0.0))
+        except (TypeError, ValueError):
+            diag_boost = 0.0
+        if diag_boost != 0.0:
+            state['diag_boost'] = diag_boost
+
+        try:
+            diag_sigma = float(getattr(self, 'diagonal_attention_prior_sigma', 0.0))
+        except (TypeError, ValueError):
+            diag_sigma = 0.0
+        if diag_sigma > 0.0:
+            state['diag_sigma'] = diag_sigma
+
+        try:
+            blank_shift = float(getattr(self, '_alignment_blank_target_shift', 0.0))
+        except (TypeError, ValueError):
+            blank_shift = 0.0
+        if blank_shift != 0.0:
+            state['blank_target_shift'] = blank_shift
+
+        blank_min = getattr(self, '_alignment_blank_target_min', None)
+        if blank_min is not None:
+            try:
+                state['blank_target_min'] = float(blank_min)
+            except (TypeError, ValueError):
+                pass
+
+        blank_max = getattr(self, '_alignment_blank_target_max', None)
+        if blank_max is not None:
+            try:
+                state['blank_target_max'] = float(blank_max)
+            except (TypeError, ValueError):
+                pass
+
+        monitor_state = getattr(self, '_alignment_health_state', None)
+        if isinstance(monitor_state, dict) and monitor_state:
+            state['health_state'] = copy.deepcopy(monitor_state)
+
+        return state
+
+    def _restore_alignment_state(self, state):
+        if not isinstance(state, dict) or not state:
+            return
+
+        if 'duration_boost' in state:
+            try:
+                self._alignment_duration_boost = float(state['duration_boost'])
+            except (TypeError, ValueError):
+                self._alignment_duration_boost = 0.0
+
+        if 'diag_boost' in state:
+            try:
+                self._alignment_diag_boost = float(state['diag_boost'])
+            except (TypeError, ValueError):
+                self._alignment_diag_boost = 0.0
+
+        if 'diag_sigma' in state:
+            try:
+                sigma = float(state['diag_sigma'])
+            except (TypeError, ValueError):
+                sigma = None
+            if sigma is not None and sigma > 0.0:
+                self.diagonal_attention_prior_sigma = sigma
+
+        if 'blank_target_shift' in state:
+            try:
+                self._alignment_blank_target_shift = float(state['blank_target_shift'])
+            except (TypeError, ValueError):
+                self._alignment_blank_target_shift = 0.0
+
+        if 'blank_target_min' in state:
+            try:
+                self._alignment_blank_target_min = float(state['blank_target_min'])
+            except (TypeError, ValueError):
+                self._alignment_blank_target_min = None
+
+        if 'blank_target_max' in state:
+            try:
+                self._alignment_blank_target_max = float(state['blank_target_max'])
+            except (TypeError, ValueError):
+                self._alignment_blank_target_max = None
+
+        base_monitor_state = self._init_alignment_health_state()
+        saved_monitor_state = state.get('health_state')
+        if isinstance(saved_monitor_state, dict):
+            for key, section in saved_monitor_state.items():
+                if not isinstance(section, dict):
+                    continue
+                target_section = base_monitor_state.setdefault(key, {})
+                violations = section.get('violations')
+                cooldown = section.get('cooldown')
+                try:
+                    target_section['violations'] = int(violations)
+                except (TypeError, ValueError):
+                    target_section['violations'] = 0
+                try:
+                    target_section['cooldown'] = int(cooldown)
+                except (TypeError, ValueError):
+                    target_section['cooldown'] = 0
+        self._alignment_health_state = base_monitor_state
+
+        # Refresh any cached weights/targets that depend on the restored state.
+        self._get_attention_duration_weight()
+        self._set_active_diagonal_attention_weight(training=False)
+        if self.ctc_blank_rate_regularization_enabled:
+            self._get_ctc_blank_rate_target()
 
     def _current_ctc_blank_rate_weight(self, training: bool) -> float:
         cfg = self.ctc_blank_rate_regularization_config or {}
@@ -1683,6 +1802,10 @@ class Trainer(object):
             model_to_save = self.accelerator.unwrap_model(self.model)
         state_dict["model"] = model_to_save.state_dict()
 
+        alignment_state = self._capture_alignment_state()
+        if alignment_state:
+            state_dict["alignment_state"] = alignment_state
+
         if not os.path.exists(os.path.dirname(checkpoint_path)):
             os.makedirs(os.path.dirname(checkpoint_path))
         torch.save(state_dict, checkpoint_path)
@@ -1711,6 +1834,10 @@ class Trainer(object):
             self.scheduler.load_state_dict(state_dict["scheduler"])
 
         self._optimizer_step_count = self._get_optimizer_step_count()
+
+        alignment_state = state_dict.get("alignment_state")
+        if alignment_state:
+            self._restore_alignment_state(alignment_state)
 
         if not load_only_params:
             self._resumed_from_checkpoint = True
