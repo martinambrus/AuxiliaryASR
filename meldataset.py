@@ -1023,6 +1023,34 @@ class Collater(object):
         self.return_speaker_ids = return_speaker_ids
 
     def __call__(self, batch):
+        # Filter out corrupted or extremely short samples which would break training.
+        filtered_batch = []
+        skipped = 0
+        for item in batch:
+            mel = item[1]
+            text = item[2]
+            mel_size = mel.size(1)
+            text_size = text.size(0)
+            # When audio is missing or truncated we can end up with mel sizes that are
+            # too small compared to the text length. Skip those samples instead of
+            # crashing the training loop.
+            if mel_size == 0 or text_size >= (mel_size // 2):
+                skipped += 1
+                continue
+            filtered_batch.append(item)
+
+        if not filtered_batch:
+            raise ValueError(
+                "All samples in the batch were filtered out due to invalid mel/text lengths."
+            )
+
+        if skipped:
+            logger.warning(
+                "Skipped %d samples in collate_fn because mel length was shorter than expected",
+                skipped,
+            )
+
+        batch = filtered_batch
         batch_size = len(batch)
 
         # sort by mel length
@@ -1034,11 +1062,11 @@ class Collater(object):
         max_mel_length = max([b[1].shape[1] for b in batch])
         max_text_length = max([b[2].shape[0] for b in batch])
 
-        mels = torch.zeros((batch_size, nmels, max_mel_length)).float()
-        texts = torch.zeros((batch_size, max_text_length)).long()
-        input_lengths = torch.zeros(batch_size).long()
-        output_lengths = torch.zeros(batch_size).long()
-        speaker_ids = torch.zeros(batch_size).long()
+        mels = torch.zeros((batch_size, nmels, max_mel_length), dtype=batch[0][1].dtype)
+        texts = torch.zeros((batch_size, max_text_length), dtype=batch[0][2].dtype)
+        input_lengths = torch.zeros(batch_size, dtype=torch.long)
+        output_lengths = torch.zeros(batch_size, dtype=torch.long)
+        speaker_ids = torch.zeros(batch_size, dtype=torch.long)
         for bid, (_, mel, text, speaker_id) in enumerate(batch):
             mel_size = mel.size(1)
             text_size = text.size(0)
@@ -1047,7 +1075,6 @@ class Collater(object):
             input_lengths[bid] = text_size
             output_lengths[bid] = mel_size
             speaker_ids[bid] = int(speaker_id)
-            assert(text_size < (mel_size//2))
 
         outputs = [texts, input_lengths, mels, output_lengths]
 
