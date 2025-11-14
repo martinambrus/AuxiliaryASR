@@ -107,40 +107,45 @@ When the auxiliary ASR is trained on only a few hours of speech, the CTC head ca
 
 ```yaml
 ctc_loss:
-  blank_logit_bias: 0.0      # subtracts a constant from the blank logit before the softmax (kept neutral by default)
+  blank_logit_bias: 0.06     # subtracts a small constant from the blank logit to favour emitting symbols
   logit_temperature: 1.0     # flattens the CTC posterior to discourage over-confidence
   blank_scale:
     enabled: true            # multiply the blank posterior by a scheduled down-weighting factor
-    base: 0.7                # start at 0.7 and ramp downwards while the curriculum stabilises
+    base: 0.6                # keep blanks muted even before the auxiliary losses engage
     schedule:
-      - pct: 0.3             # first, descend to 0.6 by 30% of training
-        value: 0.6
-      - pct: 0.7             # then relax back up to 0.85 by 70% and hold it steady
-        value: 0.85
+      - pct: 0.35            # first, settle near 0.5 by the first third of training
+        value: 0.5
+      - pct: 0.7             # then relax toward a long-term 0.68 factor for stability
+        value: 0.68
   regularization:
     blank_rate:
       enabled: true          # applies a mild hinge penalty when the blank posterior dominates
       weight:
-        initial: 0.75        # start the hinge penalty gently to avoid shocking early training
-        target: 0.85         # settle in the 0.8–0.85 "sweet" zone once alignments stabilise
-        warmup_steps: 10000  # linearly ramp across the first ~10k optimiser steps
-      target: 0.62
-      tolerance: 0.05        # slack before the penalty ramps up
+        initial: 0.68        # start the hinge penalty gently to avoid shocking early training
+        target: 0.84         # settle in the upper band once alignments stabilise
+        warmup_steps: 9500   # linearly ramp across the first ~9.5k optimiser steps
+      target: 0.46           # aim for <50% blanks so extra frames stay available for symbols
+      tolerance: 0.035       # slack before the penalty ramps up
+      warmup_epochs: 4
+      blank_run_weight: 0.26 # slightly stronger penalty for long blank streaks once alignments form
+      blank_run_threshold: 0.45
     coverage:
       enabled: true          # encourages enough non-blank mass to cover the transcript length
-      weight: 0.12
-      tv_weight: 0.3         # stronger temporal smoothing on the non-blank posterior mass
+      weight: 0.16
+      tv_weight: 0.32        # stronger temporal smoothing on the non-blank posterior mass
       margin: 3.0            # allows up to ~3 frames of under-coverage before the loss activates
       locked_weight: 0.25    # gentler overshoot damping once coverage has caught up
       locked_margin: 0.0     # optional extra slack before the overshoot term activates
       locked_softness: 1.0   # smooth the overshoot branch for softer gradients
+      warmup_epochs: 4
 
 alignment_regularization:
   attention_duration:
     enabled: true            # prevents the attention map from collapsing to 1–2 frame spikes
-    weight: 0.15             # average penalty applied when tokens fall below the minimum duration
-    min_frames: 2.0
-    tolerance: 0.3
+    weight: 0.27             # firmer penalty applied when tokens fall below the minimum duration
+    min_frames: 2.35
+    tolerance: 0.25
+    warmup_epochs: 5
 
 regularization:
   entropy:
@@ -149,7 +154,7 @@ regularization:
         weight: 0.02         # maximise entropy to keep non-blank symbols active
 ```
 
-All of the auxiliary losses honour a `warmup_epochs` key (`5` for the CTC penalties and `8` for the duration term in the default config) so you can delay their activation until the alignment has roughly converged.
+All of the auxiliary losses honour a `warmup_epochs` key (`4` for the blank-rate and coverage helpers, `5` for the duration term in the default config) so you can delay their activation until the alignment has roughly converged.
 
 The coverage helper now applies a locally normalised hinge along with a heavier total-variation prior over the non-blank posterior mass. This combination pushes token durations to recover sooner while keeping adjacent timesteps smooth enough to avoid 1-frame spikes.
 
@@ -165,7 +170,7 @@ decoding:
     insertion_bonus: 0.05   # encourages emitting non-blank symbols when hypotheses compete
 ```
 
-Additionally, the diagonal attention prior now masks out padded timesteps, applies a light dropout (configurable through `model_params.attention_dropout`), and uses a tiny guided-attention helper for the first few thousand optimiser steps. By default the helper holds a λ of 0.05 for the first ~4k steps before settling to 0.02 with a narrower σ≈0.25 along the normalised axes. This gentle schedule nudges early monotonicity without undoing the coverage and blank-rate regularisers; if you notice diagonal coherence dropping (e.g., due to a masking bug), simply disable the prior by setting `use_diagonal_attention_prior` to `False`.
+Additionally, the diagonal attention prior now masks out padded timesteps, applies a light dropout (configurable through `model_params.attention_dropout`), and uses a tiny guided-attention helper for the first few thousand optimiser steps. By default the helper holds a λ of 0.035 for the first ~4k steps before settling to 0.012 with a slightly wider σ≈0.36 along the normalised axes. This gentle schedule nudges early monotonicity without undoing the coverage and blank-rate regularisers; if you notice diagonal coherence dropping (e.g., due to a masking bug), simply disable the prior by setting `use_diagonal_attention_prior` to `False`.
 
 To avoid choosing checkpoints that only excel at PER while misaligning attention or dropping symbols, training now logs a joint selection score that blends PER, diagonal coherence, and the normalised CTC length gap. The configuration exposes the coefficients under `checkpoint_selection` and the trainer will keep a `best_joint.pth` symlink pointing at the most alignment-friendly checkpoint observed so far.
 

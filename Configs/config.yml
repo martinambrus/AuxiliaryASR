@@ -160,57 +160,57 @@ sortagrad_switch_to_shuffled_dataset_epoch: 10
 # make ASR learn to read phonemes from left to right, not randomly
 use_diagonal_attention_prior: True
 diagonal_attention_prior_weight:
-  initial: 0.05
-  target: 0.02
+  initial: 0.035
+  target: 0.012
   hold_steps: 4000  # keep the helper active for ~3-5k optimiser steps
   warmup_steps: 0
-diagonal_attention_prior_sigma: 0.25
+diagonal_attention_prior_sigma: 0.36
 
 # stabilizes ASR training for smaller datasets
 entropy_params:
   label_smoothing: 0.05
 
 ctc_loss:
-  blank_logit_bias: 0.0
+  blank_logit_bias: 0.06
   logit_temperature: 1.0
   blank_scale:
     enabled: true
-    base: 0.7
+    base: 0.6
     schedule:
-      - pct: 0.3
-        value: 0.6
+      - pct: 0.35
+        value: 0.5
       - pct: 0.7
-        value: 0.85
+        value: 0.68
   regularization:
     blank_rate:
       enabled: true
       weight:
-        initial: 0.75
-        target: 0.85
-        warmup_steps: 10000
-      target: 0.62
-      tolerance: 0.05
-      warmup_epochs: 5
+        initial: 0.68
+        target: 0.84
+        warmup_steps: 9500
+      target: 0.46
+      tolerance: 0.035
+      warmup_epochs: 4
       penalize_low_blank: false
-      blank_run_weight: 0.2
-      blank_run_threshold: 0.5
+      blank_run_weight: 0.26
+      blank_run_threshold: 0.45
     coverage:
       enabled: true
-      weight: 0.12
-      tv_weight: 0.3
+      weight: 0.16
+      tv_weight: 0.32
       margin: 3.0
       locked_weight: 0.25
       locked_margin: 0.0
       locked_softness: 1.0
-      warmup_epochs: 5
+      warmup_epochs: 4
 
 alignment_regularization:
   attention_duration:
     enabled: true
-    weight: 0.15
-    min_frames: 2.0
-    tolerance: 0.3
-    warmup_epochs: 8
+    weight: 0.27
+    min_frames: 2.35
+    tolerance: 0.25
+    warmup_epochs: 5
 
 dataset_params:
   # SpecAugment parameters applied only on the training split.
