@@ -15,6 +15,8 @@ from torch import amp, nn
 import torch.nn.functional as F
 from PIL import Image
 from tqdm import tqdm
+import nltk
+nltk.download('punkt_tab')
 
 from utils import calc_wer
 
